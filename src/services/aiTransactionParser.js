@@ -1,0 +1,111 @@
+'use strict';
+
+const openaiService = require('./openaiService');
+const { KIKA_SYSTEM_PROMPT, SUPPORTED_LANGUAGES } = require('../config/aiPersona');
+const logger = require('../utils/logger');
+
+const RECORD_TRANSACTION_TOOL = {
+  type: 'function',
+  function: {
+    name: 'record_transaction',
+    description:
+      "Call this ONLY when the merchant's message clearly describes a sale, an expense, a customer debt, or a payment toward an existing debt — including slang, Pidgin, or indirect phrasing like 'I dashed Amaka 5k' or 'wired 10k for fuel'. Do not call this for greetings, questions, or anything that isn't a transaction.",
+    parameters: {
+      type: 'object',
+      properties: {
+        entryType: {
+          type: 'string',
+          enum: ['CREDIT', 'DEBIT', 'DEBT', 'DEBT_SETTLEMENT'],
+          description:
+            'CREDIT = a fully-paid sale (money coming in). DEBIT = an expense (money going out). DEBT = a sale where the customer still owes some or all of it. DEBT_SETTLEMENT = a payment received against an existing prior debt, not a new sale.',
+        },
+        description: { type: 'string', description: 'Short human-readable description of the transaction, e.g. "Fuel purchase" or "Rice x2 bags".' },
+        counterpartyName: { type: ['string', 'null'], description: 'The customer or supplier name mentioned, or null if none.' },
+        counterpartyPhone: { type: ['string', 'null'], description: 'E.164 Nigerian phone number if one was mentioned in the message, else null.' },
+        itemName: { type: ['string', 'null'] },
+        itemQuantity: { type: ['number', 'null'] },
+        itemUnit: { type: ['string', 'null'], description: 'e.g. "bags", "cartons", "pieces" — null if not applicable.' },
+        totalNaira: { type: 'number', description: 'Total value of the transaction, in Naira (not kobo).' },
+        paidNaira: { type: 'number', description: 'Amount actually paid/received right now, in Naira.' },
+        balanceNaira: { type: 'number', description: 'Amount still owed after this transaction, in Naira. 0 if fully settled.' },
+        detectedLanguage: {
+          type: 'string',
+          enum: SUPPORTED_LANGUAGES,
+          description: "The language/dialect the merchant's message was written in.",
+        },
+      },
+      required: ['entryType', 'description', 'totalNaira', 'paidNaira', 'balanceNaira', 'detectedLanguage'],
+    },
+  },
+};
+
+function toKobo(naira) {
+  const n = Number(naira);
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+
+function normalizeToolCallArgs(args) {
+  if (!args) return null;
+
+  const items =
+    args.itemName != null
+      ? [{ name: String(args.itemName), quantity: Number(args.itemQuantity) || 1, unit: args.itemUnit || 'units' }]
+      : [];
+
+  return {
+    entryType: args.entryType,
+    description: args.description || (items[0] ? `${items[0].name} x${items[0].quantity} ${items[0].unit}` : 'Transaction'),
+    counterpartyName: args.counterpartyName || null,
+    counterpartyPhone: args.counterpartyPhone || null,
+    items,
+    totalKobo: toKobo(args.totalNaira),
+    paidKobo: toKobo(args.paidNaira),
+    balanceKobo: toKobo(args.balanceNaira),
+  };
+}
+
+/**
+ * The hybrid fallback: called only when the fast regex parser
+ * (ledgerParser.parseLedgerMessage) has already returned null and the
+ * message isn't a recognized command. Sends the raw text (and, for
+ * multimodal messages, an image) to OpenAI with the record_transaction
+ * tool available.
+ *
+ * Returns one of three shapes:
+ *   { parsed: {...} }                        — a transaction was extracted
+ *   { parsed: null, conversationalReply, detectedLanguage } — in-persona reply
+ *   { parsed: null, error: true }             — the AI call itself failed;
+ *                                                caller must use the fixed
+ *                                                fallback text as a safety net
+ */
+async function parseWithAI(rawText, { imageBase64 } = {}) {
+  if (!process.env.OPENAI_API_KEY) {
+    logger.warn('OPENAI_API_KEY not configured — skipping AI fallback, using fixed fallback reply');
+    return { parsed: null, error: true };
+  }
+
+  try {
+    const { toolCall, text } = await openaiService.chatCompletion({
+      systemPrompt: KIKA_SYSTEM_PROMPT,
+      userText: rawText,
+      imageBase64,
+      tools: [RECORD_TRANSACTION_TOOL],
+    });
+
+    if (toolCall?.name === 'record_transaction') {
+      const parsed = normalizeToolCallArgs(toolCall.arguments);
+      if (parsed && parsed.totalKobo > 0) {
+        return { parsed, detectedLanguage: toolCall.arguments.detectedLanguage };
+      }
+      // Model called the tool but produced unusable data (e.g. zero
+      // amount) — treat as "not a transaction" rather than recording junk.
+    }
+
+    return { parsed: null, conversationalReply: text, detectedLanguage: null };
+  } catch (err) {
+    logger.error({ err: err.message }, 'AI fallback parsing failed');
+    return { parsed: null, error: true };
+  }
+}
+
+module.exports = { parseWithAI, RECORD_TRANSACTION_TOOL };

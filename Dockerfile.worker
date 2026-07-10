@@ -1,0 +1,27 @@
+FROM node:20-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev && npm cache clean --force
+COPY src ./src
+
+FROM node:20-bookworm-slim
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvips42 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN addgroup --system kika && adduser --system --ingroup kika kika
+
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/src ./src
+COPY package.json ./
+
+RUN mkdir -p /data/receipts && chown -R kika:kika /data/receipts /app
+
+USER kika
+
+ENV NODE_ENV=production \
+    RECEIPT_STORAGE_DIR=/data/receipts
+
+CMD ["node", "src/queue/worker.js"]
