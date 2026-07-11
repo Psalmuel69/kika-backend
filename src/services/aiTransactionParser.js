@@ -33,11 +33,22 @@ const RECORD_TRANSACTION_TOOL = {
           enum: SUPPORTED_LANGUAGES,
           description: "The language/dialect the merchant's message was written in.",
         },
+        confidence: {
+          type: 'number',
+          description:
+            'Your own confidence (0.0-1.0) that this message really describes a transaction with the amounts you extracted, rather than an ambiguous or unclear message. Be honest — if the phrasing is vague or the amount is a guess, score it low rather than high.',
+        },
       },
-      required: ['entryType', 'description', 'totalNaira', 'paidNaira', 'balanceNaira', 'detectedLanguage'],
+      required: ['entryType', 'description', 'totalNaira', 'paidNaira', 'balanceNaira', 'detectedLanguage', 'confidence'],
     },
   },
 };
+
+// Below this confidence, Kika treats the message as unclear rather than
+// risking a wrong entry in the merchant's ledger — matching the
+// "graceful fallback" behavior: better to ask the merchant to rephrase
+// than to silently log a guessed amount.
+const MIN_CONFIDENCE_THRESHOLD = Number(process.env.AI_MIN_CONFIDENCE_THRESHOLD || 0.65);
 
 function toKobo(naira) {
   const n = Number(naira);
@@ -94,11 +105,19 @@ async function parseWithAI(rawText, { imageBase64 } = {}) {
 
     if (toolCall?.name === 'record_transaction') {
       const parsed = normalizeToolCallArgs(toolCall.arguments);
-      if (parsed && parsed.totalKobo > 0) {
+      const confidence = Number(toolCall.arguments.confidence);
+      const isConfident = Number.isFinite(confidence) ? confidence >= MIN_CONFIDENCE_THRESHOLD : true;
+
+      if (parsed && parsed.totalKobo > 0 && isConfident) {
         return { parsed, detectedLanguage: toolCall.arguments.detectedLanguage };
       }
-      // Model called the tool but produced unusable data (e.g. zero
-      // amount) — treat as "not a transaction" rather than recording junk.
+      // Model called the tool but either produced unusable data (e.g.
+      // zero amount) or wasn't confident enough — treat as "unclear"
+      // rather than risking a wrong entry in the merchant's ledger.
+      if (!isConfident) {
+        logger.info({ confidence, rawText }, 'AI extraction below confidence threshold — treating as unclear');
+        return { parsed: null, lowConfidence: true, detectedLanguage: toolCall.arguments.detectedLanguage };
+      }
     }
 
     return { parsed: null, conversationalReply: text, detectedLanguage: null };

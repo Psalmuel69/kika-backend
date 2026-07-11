@@ -76,8 +76,15 @@ CREATE TABLE IF NOT EXISTS merchants (
     business_name       VARCHAR(160),
     subscription_tier_id INTEGER NOT NULL DEFAULT 1 REFERENCES subscription_tiers(id), -- 1 = Free
     subscription_expires_at TIMESTAMPTZ,                -- NULL while on the Free tier
-    onboarding_state    VARCHAR(24)  NOT NULL DEFAULT 'NEW'
-                         CHECK (onboarding_state IN ('NEW', 'ACTIVE', 'STANDARD_ACTIVE', 'PREMIUM_ACTIVE')),
+    onboarding_state    VARCHAR(24)  NOT NULL DEFAULT 'PENDING_CONSENT'
+                         CHECK (onboarding_state IN (
+                            'PENDING_CONSENT', 'AWAITING_BUSINESS_NAME', 'NEW', 'ACTIVE',
+                            'STANDARD_ACTIVE', 'PREMIUM_ACTIVE'
+                         )),
+    consent_at          TIMESTAMPTZ,                     -- when the merchant tapped "I AGREE" — compliance record
+    closing_hour_local  SMALLINT NOT NULL DEFAULT 19 CHECK (closing_hour_local BETWEEN 0 AND 23), -- Africa/Lagos hour the Business Sunset ping fires
+    logo_file_path       TEXT,                            -- uploaded business logo, embedded into receipts once set
+    awaiting_logo_until TIMESTAMPTZ,                      -- short window after a fresh premium purchase where the next image is treated as a logo upload, not a transaction scan
     default_currency    VARCHAR(3)   NOT NULL DEFAULT 'NGN',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -85,6 +92,7 @@ CREATE TABLE IF NOT EXISTS merchants (
 
 CREATE INDEX IF NOT EXISTS idx_merchants_whatsapp_number ON merchants (whatsapp_number);
 CREATE INDEX IF NOT EXISTS idx_merchants_subscription_tier ON merchants (subscription_tier_id);
+CREATE INDEX IF NOT EXISTS idx_merchants_closing_hour ON merchants (closing_hour_local);
 
 -- Every sale / expense / debt entry a merchant records via chat.
 -- `total_kobo` is the full value of the transaction; `paid_kobo` is what was
@@ -105,15 +113,17 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     balance_after_kobo  BIGINT,                          -- customer's rolling debt balance snapshot immediately after this entry (DEBT/DEBT_SETTLEMENT only) — computed under row lock, see customer_balances
     currency            VARCHAR(3) NOT NULL DEFAULT 'NGN',
     is_settled          BOOLEAN NOT NULL DEFAULT false,  -- true once balance_kobo hits 0
+    is_voided           BOOLEAN NOT NULL DEFAULT false,  -- true once undone via the UNDO command
+    voided_at           TIMESTAMPTZ,
     raw_message         TEXT,                            -- original WhatsApp text, for audit
     receipt_id          UUID,                             -- set once a receipt card is generated
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_merchant_created
-    ON ledger_entries (merchant_id, created_at DESC);
+    ON ledger_entries (merchant_id, created_at DESC) WHERE is_voided = false;
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_outstanding_debt
-    ON ledger_entries (merchant_id, is_settled) WHERE balance_kobo > 0;
+    ON ledger_entries (merchant_id, is_settled) WHERE balance_kobo > 0 AND is_voided = false;
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_items_gin
     ON ledger_entries USING GIN (items);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_counterparty_phone
@@ -157,13 +167,61 @@ CREATE TRIGGER trg_customer_balances_updated_at
     BEFORE UPDATE ON customer_balances
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- ---------------------------------------------------------------------------
+-- Products / inventory — opt-in stock tracking. A product only exists
+-- here once a merchant explicitly registers it via "ADD STOCK: name, qty".
+-- Sales that mention a matching item name (case-insensitive) decrement
+-- current_stock; crossing below low_stock_threshold fires the Low Stock
+-- Alert appended to that sale's receipt.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS products (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id          UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    name                 VARCHAR(160) NOT NULL,
+    unit                 VARCHAR(40),
+    current_stock        NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
+    low_stock_threshold  NUMERIC(12, 2) NOT NULL DEFAULT 5,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Case-insensitive uniqueness ("Rice" and "rice" are the same product)
+-- via an expression index rather than a plain UNIQUE constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_merchant_name_ci
+    ON products (merchant_id, lower(name));
+
+DROP TRIGGER IF EXISTS trg_products_updated_at ON products;
+CREATE TRIGGER trg_products_updated_at
+    BEFORE UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- Data exports — CSV ledger exports generated for premium merchants,
+-- served the same way as receipts (unguessable token, expiring), and
+-- swept by the same disk-cleanup job once expired.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS data_exports (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id     UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    file_path       TEXT NOT NULL,
+    public_token    VARCHAR(64) NOT NULL UNIQUE,
+    period_label    VARCHAR(40),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    file_deleted_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_data_exports_public_token ON data_exports (public_token);
+CREATE INDEX IF NOT EXISTS idx_data_exports_cleanup_sweep
+    ON data_exports (expires_at) WHERE file_deleted_at IS NULL;
+
 -- Tracks which merchants have already received a given day's Sunset
 -- Report or a given month's Insights report, so a retried/duplicated
 -- scheduler tick can never send the same report twice.
 CREATE TABLE IF NOT EXISTS report_dispatch_log (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     merchant_id         UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-    report_type         VARCHAR(20) NOT NULL CHECK (report_type IN ('DAILY_SUNSET', 'MONTHLY_INSIGHTS', 'MONTHLY_DIGEST')),
+    report_type         VARCHAR(20) NOT NULL CHECK (report_type IN ('DAILY_SUNSET', 'MONTHLY_INSIGHTS', 'MONTHLY_DIGEST', 'FRIDAY_AMNESTY_PROMPT')),
     period_key          VARCHAR(10) NOT NULL,             -- 'YYYY-MM-DD' or 'YYYY-MM'
     sent_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (merchant_id, report_type, period_key)

@@ -53,11 +53,13 @@ async function findOrCreateMerchantByWhatsappNumber(whatsappNumber) {
   ]);
   if (existing.rows[0]) return existing.rows[0];
 
-  // New merchants default to subscription_tier_id 1 (Free) via the
-  // column's DEFAULT — no need to specify it here.
+  // New merchants default to subscription_tier_id 1 (Free) and
+  // onboarding_state 'PENDING_CONSENT' via the columns' own DEFAULTs —
+  // the very first thing they see is the consent prompt, before any
+  // ledger functionality is available to them.
   const created = await query(
-    `INSERT INTO merchants (whatsapp_number, onboarding_state)
-     VALUES ($1, 'NEW')
+    `INSERT INTO merchants (whatsapp_number)
+     VALUES ($1)
      ON CONFLICT (whatsapp_number) DO UPDATE SET whatsapp_number = EXCLUDED.whatsapp_number
      RETURNING id`,
     [whatsappNumber]
@@ -74,6 +76,80 @@ async function setMerchantOnboardingState(merchantId, state) {
   const res = await query(
     'UPDATE merchants SET onboarding_state = $2 WHERE id = $1 RETURNING id',
     [merchantId, state]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/** Records consent (compliance timestamp) and advances to the next onboarding step. */
+async function recordMerchantConsent(merchantId) {
+  const res = await query(
+    `UPDATE merchants
+     SET consent_at = now(), onboarding_state = 'AWAITING_BUSINESS_NAME'
+     WHERE id = $1 RETURNING id`,
+    [merchantId]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+async function setMerchantBusinessName(merchantId, businessName) {
+  const res = await query(
+    `UPDATE merchants
+     SET business_name = $2, onboarding_state = 'ACTIVE'
+     WHERE id = $1 RETURNING id`,
+    [merchantId, businessName]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+async function setMerchantClosingHour(merchantId, hour) {
+  const res = await query(
+    'UPDATE merchants SET closing_hour_local = $2 WHERE id = $1 RETURNING id',
+    [merchantId, hour]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+async function setMerchantLogo(merchantId, filePath) {
+  const res = await query(
+    'UPDATE merchants SET logo_file_path = $2, awaiting_logo_until = NULL WHERE id = $1 RETURNING id',
+    [merchantId, filePath]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+async function setAwaitingLogoWindow(merchantId, minutesFromNow) {
+  await query(
+    `UPDATE merchants SET awaiting_logo_until = now() + ($2 || ' minutes')::interval WHERE id = $1`,
+    [merchantId, minutesFromNow]
+  );
+}
+
+/** Merchants whose Africa/Lagos closing hour matches the given hour (0-23) — for the hourly Business Sunset scheduler tick. */
+async function getMerchantsWithClosingHour(hour) {
+  const res = await query('SELECT * FROM merchants WHERE closing_hour_local = $1', [hour]);
+  return res.rows;
+}
+
+/** Merchants whose paid subscription has lapsed and haven't been downgraded yet. */
+async function getExpiredSubscriptionMerchants() {
+  const res = await query(
+    `SELECT m.*, st.name AS plan FROM merchants m
+     JOIN subscription_tiers st ON st.id = m.subscription_tier_id
+     WHERE m.subscription_expires_at IS NOT NULL
+       AND m.subscription_expires_at < now()
+       AND st.name != 'Free'`
+  );
+  return res.rows;
+}
+
+/** Downgrades a merchant to the Free tier once their paid subscription lapses. */
+async function downgradeMerchantToFreeTier(merchantId) {
+  const freeTier = await getSubscriptionTierByName('Free');
+  const res = await query(
+    `UPDATE merchants
+     SET subscription_tier_id = $2, onboarding_state = 'ACTIVE', subscription_expires_at = NULL
+     WHERE id = $1 RETURNING id`,
+    [merchantId, freeTier.id]
   );
   return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
 }
@@ -156,7 +232,7 @@ async function settleOutstandingDebtForCounterparty(client, merchantId, counterp
   let remaining = amountKobo;
   const { rows: openDebts } = await client.query(
     `SELECT id, balance_kobo FROM ledger_entries
-     WHERE merchant_id = $1 AND counterparty_name = $2 AND balance_kobo > 0
+     WHERE merchant_id = $1 AND counterparty_name = $2 AND balance_kobo > 0 AND is_voided = false
      ORDER BY created_at ASC
      FOR UPDATE`,
     [merchantId, counterpartyName]
@@ -264,7 +340,7 @@ async function getOutstandingDebtTotal(merchantId) {
   const res = await query(
     `SELECT COALESCE(SUM(balance_kobo), 0) AS total_kobo, COUNT(*) AS entry_count
      FROM ledger_entries
-     WHERE merchant_id = $1 AND balance_kobo > 0`,
+     WHERE merchant_id = $1 AND balance_kobo > 0 AND is_voided = false`,
     [merchantId]
   );
   return res.rows[0];
@@ -276,7 +352,7 @@ async function getRunningBalance(merchantId) {
         COALESCE(SUM(CASE WHEN entry_type = 'CREDIT' THEN paid_kobo ELSE 0 END), 0) AS total_in_kobo,
         COALESCE(SUM(CASE WHEN entry_type = 'DEBIT' THEN paid_kobo ELSE 0 END), 0) AS total_out_kobo
      FROM ledger_entries
-     WHERE merchant_id = $1`,
+     WHERE merchant_id = $1 AND is_voided = false`,
     [merchantId]
   );
   return res.rows[0];
@@ -285,12 +361,67 @@ async function getRunningBalance(merchantId) {
 async function listRecentEntries(merchantId, limit = 10) {
   const res = await query(
     `SELECT * FROM ledger_entries
-     WHERE merchant_id = $1
+     WHERE merchant_id = $1 AND is_voided = false
      ORDER BY created_at DESC
      LIMIT $2`,
     [merchantId, limit]
   );
   return res.rows;
+}
+
+/** The single most recent non-voided entry — used by the UNDO command. */
+async function getMostRecentLedgerEntry(merchantId) {
+  const res = await query(
+    `SELECT * FROM ledger_entries
+     WHERE merchant_id = $1 AND is_voided = false
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [merchantId]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * "UNDO" / "Delete last sale" — flags the merchant's most recent entry as
+ * VOID rather than deleting the row outright, preserving a full audit
+ * trail. Reverses the rolling customer-balance impact under the same
+ * row lock used everywhere else a balance is mutated (see
+ * lockCustomerBalance), so this can never race with a concurrent sale
+ * or settlement for the same customer.
+ *
+ * Deliberately scoped to CREDIT/DEBIT/DEBT entries only — a
+ * DEBT_SETTLEMENT already redistributed its payment FIFO across
+ * possibly several other ledger rows, and cleanly reversing that would
+ * mean restoring each of those rows' balance_kobo/paid_kobo individually.
+ * Rather than risk a partial/incorrect reversal, settlements are
+ * excluded from UNDO — a merchant needing to correct one should use
+ * DISPUTE instead, which routes to a human for a considered fix.
+ */
+async function voidMostRecentLedgerEntry(merchantId) {
+  return withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM ledger_entries
+       WHERE merchant_id = $1 AND is_voided = false
+       ORDER BY created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [merchantId]
+    );
+    const entry = rows[0];
+    if (!entry) return { voided: false, reason: 'NO_ENTRY', entry: null };
+    if (entry.entry_type === 'DEBT_SETTLEMENT') {
+      return { voided: false, reason: 'SETTLEMENT_NOT_UNDOABLE', entry };
+    }
+
+    if (entry.entry_type === 'DEBT' && entry.counterparty_name && Number(entry.balance_kobo) > 0) {
+      await lockCustomerBalance(client, merchantId, entry.counterparty_name);
+      await applyCustomerBalanceDelta(client, merchantId, entry.counterparty_name, -Number(entry.balance_kobo));
+    }
+
+    await client.query('UPDATE ledger_entries SET is_voided = true, voided_at = now() WHERE id = $1', [entry.id]);
+
+    return { voided: true, reason: null, entry };
+  });
 }
 
 // --- Reporting: Daily Sunset Report & Monthly Insights --------------------
@@ -310,14 +441,14 @@ async function getPeriodSummary(merchantId, startTime, endTime) {
                  FILTER (WHERE created_at >= $2 AND created_at < $3), 0) AS new_debt_kobo,
         COUNT(*) FILTER (WHERE created_at >= $2 AND created_at < $3) AS entry_count
      FROM ledger_entries
-     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3`,
+     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3 AND is_voided = false`,
     [merchantId, startTime, endTime]
   );
 
   const topItemsRes = await query(
     `SELECT item->>'name' AS name, SUM((item->>'quantity')::numeric) AS total_quantity
      FROM ledger_entries, jsonb_array_elements(items) AS item
-     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3
+     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3 AND is_voided = false
      GROUP BY item->>'name'
      ORDER BY total_quantity DESC
      LIMIT 3`,
@@ -327,7 +458,7 @@ async function getPeriodSummary(merchantId, startTime, endTime) {
   const topCustomersRes = await query(
     `SELECT counterparty_name, SUM(paid_kobo + balance_kobo) AS total_value_kobo
      FROM ledger_entries
-     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3
+     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3 AND is_voided = false
        AND counterparty_name IS NOT NULL AND entry_type IN ('CREDIT', 'DEBT')
      GROUP BY counterparty_name
      ORDER BY total_value_kobo DESC
@@ -386,7 +517,7 @@ async function getWeeklyRevenue(merchantId, monthStart, monthEnd) {
         FLOOR(EXTRACT(DAY FROM created_at - $2::timestamptz) / 7)::int AS week_index,
         SUM(paid_kobo) AS revenue_kobo
      FROM ledger_entries
-     WHERE merchant_id = $1 AND entry_type = 'CREDIT'
+     WHERE merchant_id = $1 AND entry_type = 'CREDIT' AND is_voided = false
        AND created_at >= $2 AND created_at < $3
      GROUP BY week_index
      ORDER BY week_index ASC`,
@@ -405,7 +536,7 @@ async function getDebtorBreakdown(merchantId) {
     `WITH debts AS (
        SELECT counterparty_name, SUM(balance_kobo) AS balance_kobo
        FROM ledger_entries
-       WHERE merchant_id = $1 AND balance_kobo > 0 AND counterparty_name IS NOT NULL
+       WHERE merchant_id = $1 AND balance_kobo > 0 AND counterparty_name IS NOT NULL AND is_voided = false
        GROUP BY counterparty_name
      ), total AS (
        SELECT COALESCE(SUM(balance_kobo), 0) AS grand_total FROM debts
@@ -431,7 +562,7 @@ async function getTopProductsByRevenue(merchantId, startTime, endTime, limit = 4
             SUM(total_kobo) AS revenue_kobo,
             SUM((item->>'quantity')::numeric) AS total_quantity
      FROM ledger_entries, jsonb_array_elements(items) AS item
-     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3
+     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3 AND is_voided = false
        AND entry_type IN ('CREDIT', 'DEBT')
      GROUP BY item->>'name'
      ORDER BY revenue_kobo DESC
@@ -450,7 +581,7 @@ async function getTopDebtor(merchantId) {
   const res = await query(
     `SELECT counterparty_name, SUM(balance_kobo) AS balance_kobo
      FROM ledger_entries
-     WHERE merchant_id = $1 AND balance_kobo > 0 AND counterparty_name IS NOT NULL
+     WHERE merchant_id = $1 AND balance_kobo > 0 AND counterparty_name IS NOT NULL AND is_voided = false
      GROUP BY counterparty_name
      ORDER BY balance_kobo DESC
      LIMIT 1`,
@@ -464,10 +595,87 @@ async function getTradeDaysCount(merchantId, startTime, endTime) {
   const res = await query(
     `SELECT COUNT(DISTINCT created_at::date) AS trade_days
      FROM ledger_entries
-     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3`,
+     WHERE merchant_id = $1 AND created_at >= $2 AND created_at < $3 AND is_voided = false`,
     [merchantId, startTime, endTime]
   );
   return Number(res.rows[0].trade_days);
+}
+
+// --- Products / inventory --------------------------------------------------
+
+/** "ADD STOCK: rice, 50" — creates the product if new, otherwise increments existing stock. */
+async function addProductStock(merchantId, name, quantity, unit) {
+  const res = await query(
+    `INSERT INTO products (merchant_id, name, unit, current_stock)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (merchant_id, (lower(name)))
+     DO UPDATE SET current_stock = products.current_stock + EXCLUDED.current_stock,
+                   unit = COALESCE(products.unit, EXCLUDED.unit)
+     RETURNING *`,
+    [merchantId, name, unit || null, quantity]
+  );
+  return res.rows[0];
+}
+
+async function getProductByName(merchantId, name) {
+  const res = await query(
+    'SELECT * FROM products WHERE merchant_id = $1 AND lower(name) = lower($2)',
+    [merchantId, name]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * Decrements stock for a product matching an item name sold (case-
+ * insensitive). Silently does nothing if the merchant never registered
+ * that product via ADD STOCK — inventory tracking is opt-in per item.
+ * Returns the updated row (so the caller can check the low-stock
+ * threshold) or null if there was nothing to decrement.
+ */
+async function decrementProductStock(merchantId, name, quantity) {
+  const res = await query(
+    `UPDATE products
+     SET current_stock = GREATEST(current_stock - $3, 0)
+     WHERE merchant_id = $1 AND lower(name) = lower($2)
+     RETURNING *`,
+    [merchantId, name, quantity]
+  );
+  return res.rows[0] || null;
+}
+
+// --- Data exports -----------------------------------------------------------
+
+async function createDataExport({ merchantId, filePath, publicToken, periodLabel, expiresAt }) {
+  const res = await query(
+    `INSERT INTO data_exports (merchant_id, file_path, public_token, period_label, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [merchantId, filePath, publicToken, periodLabel || null, expiresAt]
+  );
+  return res.rows[0];
+}
+
+async function getDataExportByToken(publicToken) {
+  const res = await query(
+    'SELECT * FROM data_exports WHERE public_token = $1 AND expires_at > now()',
+    [publicToken]
+  );
+  return res.rows[0] || null;
+}
+
+async function getExpiredUncleanedDataExports(limit = 500) {
+  const res = await query(
+    `SELECT id, file_path FROM data_exports
+     WHERE expires_at < now() AND file_deleted_at IS NULL
+     ORDER BY expires_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return res.rows;
+}
+
+async function markDataExportFileDeleted(id) {
+  await query('UPDATE data_exports SET file_deleted_at = now() WHERE id = $1', [id]);
 }
 
 // --- Digest cards & full monthly reports ----------------------------------
@@ -894,12 +1102,29 @@ module.exports = {
   findOrCreateMerchantByWhatsappNumber,
   getMerchantById,
   setMerchantOnboardingState,
+  recordMerchantConsent,
+  setMerchantBusinessName,
+  setMerchantClosingHour,
+  setMerchantLogo,
+  setAwaitingLogoWindow,
+  getMerchantsWithClosingHour,
+  getExpiredSubscriptionMerchants,
+  downgradeMerchantToFreeTier,
   extendMerchantSubscription,
   createLedgerEntry,
   settleOutstandingDebtForCounterparty,
   lockCustomerBalance,
   applyCustomerBalanceDelta,
   getCustomerBalance,
+  getMostRecentLedgerEntry,
+  voidMostRecentLedgerEntry,
+  addProductStock,
+  getProductByName,
+  decrementProductStock,
+  createDataExport,
+  getDataExportByToken,
+  getExpiredUncleanedDataExports,
+  markDataExportFileDeleted,
   attachReceiptToLedgerEntry,
   getOutstandingDebtTotal,
   getRunningBalance,

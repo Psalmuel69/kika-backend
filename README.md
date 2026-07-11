@@ -413,28 +413,49 @@ tables (`payment_transactions`, `payment_links`).
 - **Rate limiting**: per-endpoint limits on both public webhook routes
   and the receipt-fetch route.
 
-## Local setup
+## Deployment — Cloud (Render + Neon + Upstash) or Docker
 
+Kika runs identically in either environment — only how it connects to
+Postgres and Redis differs, and that's auto-detected (see
+`src/config/db.js` and `src/config/redis.js`):
+
+### Cloud (current deployment target)
+1. Provision a [Neon](https://neon.tech) Postgres database and an
+   [Upstash](https://upstash.com) Redis database.
+2. On [Render](https://render.com), create a **Web Service** (the API,
+   `node src/server.js`) and a **Background Worker** (`node src/queue/worker.js`)
+   from the same repo/image.
+3. Set environment variables on both services — `DATABASE_URL` (Neon's
+   pooled connection string, includes `sslmode=require`) and `REDIS_URL`
+   (Upstash's `rediss://` URL) are the two that matter most; see
+   `.env.example` for the full list.
+4. Run the migration once against the Neon database:
+   ```bash
+   DATABASE_URL="<your neon connection string>" node src/db/migrate.js
+   ```
+5. Deploy. `db.js` logs `mode: "cloud (DATABASE_URL)"` on startup —
+   check the Render logs to confirm it picked up the right path.
+
+### Docker (self-hosted alternative)
 ```bash
-cp .env.example .env      # fill in real WhatsApp/Paystack credentials
+cp .env.example .env
+# In .env: comment out DATABASE_URL and REDIS_URL, uncomment the
+# PGHOST/PGPORT/... and REDIS_URL=redis://redis:6379 lines instead
+# (both are pre-written in .env.example, just swapped in/out).
 docker compose up --build
-```
-
-This starts Postgres, Redis, the API, and 2 worker replicas. Run the
-schema migration once:
-
-```bash
 docker compose exec api node src/db/migrate.js
 ```
+This starts Postgres, Redis, the API, and 2 worker replicas locally —
+useful for development or a fully self-hosted deployment.
 
-## Running without Docker
+### Running without Docker (local Node, either DB target)
 
 ```bash
 npm install
-cp .env.example .env
-npm run migrate     # applies schema.sql
-npm run dev          # API on :8080
-npm run worker        # in a second terminal
+cp .env.example .env        # point DATABASE_URL/REDIS_URL at cloud or local
+npm run migrate               # applies schema.sql
+npm run dev                    # API on :8080
+npm run worker                  # in a second terminal
 ```
 
 ## Environment variables
@@ -443,12 +464,16 @@ See `.env.example` for the full list. Key ones:
 
 | Variable | Purpose |
 |---|---|
+| `DATABASE_URL` | Cloud Postgres connection string (Neon). Unset → falls back to `PGHOST`/`PGPORT`/etc. for Docker. |
+| `REDIS_URL` | Redis connection string — `rediss://...` (Upstash, TLS) or `redis://...` (Docker/local) |
 | `PG_POOL_MAX` | Max concurrent Postgres connections in the pool |
 | `WHATSAPP_APP_SECRET` | Used to verify inbound webhook signatures |
 | `PAYSTACK_SECRET_KEY` | Used both to call Paystack and verify its webhooks |
 | `SUBSCRIPTION_DURATION_DAYS` | Defaults to `30`, applies to every tier |
 | `LOYALTY_MILESTONE_INTERVAL` | Defaults to `5` — ping every Nth purchase |
 | `OPENAI_API_KEY` | Required for the hybrid AI fallback parser and multimodal (image/audio) support. Without it, unparseable messages get the fixed fallback reply instead of crashing. |
+| `OPENAI_BASE_URL` | Unset = OpenAI direct. Set to `https://openrouter.ai/api/v1` to route through OpenRouter instead (note: Whisper transcription isn't proxied by OpenRouter — see `.env.example`). |
+| `AI_MIN_CONFIDENCE_THRESHOLD` | Defaults to `0.65` — below this, an AI-extracted transaction is treated as unclear rather than recorded |
 | `SKIP_BOT_LABELS` | Comma-separated conversation labels that pause the bot for human handoff |
 | `WHITELIST_MODE_ENABLED` | `true` restricts the bot to explicitly whitelisted numbers only |
 | `ADMIN_API_KEY` | Shared secret for the admin endpoints (`X-Admin-Key` header) |

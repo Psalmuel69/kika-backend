@@ -245,6 +245,9 @@ const COMMAND_KEYWORDS = {
   HELP: ['help', 'start', 'menu'],
   INSIGHTS: ['insights', 'monthly', 'monthly insights', 'monthly report'],
   SUNSET: ['sunset', 'today', "today's report", 'daily report'],
+  UNDO: ['undo', 'delete last sale', 'delete last entry', 'cancel last sale'],
+  EXPORT: ['export', 'my data', 'excel', 'csv'],
+  REVIEW_SCAN: ['review scan', 'review'],
 };
 
 function detectCommand(rawMessage) {
@@ -256,4 +259,38 @@ function detectCommand(rawMessage) {
   return null;
 }
 
-module.exports = { parseLedgerMessage, detectCommand, parseInvoiceCommand };
+// "ADD STOCK: rice, 50" or "ADD STOCK rice 50 bags"
+const ADD_STOCK_RE = /^add\s*stock\s*:?\s*([a-zA-Z][a-zA-Z\s]{0,60}?)\s*[,]?\s*(\d+(?:\.\d{1,2})?)\s*([a-zA-Z]+)?\s*$/i;
+
+function parseAddStockCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return null;
+  const match = rawMessage.trim().match(ADD_STOCK_RE);
+  if (!match) return null;
+  const [, name, quantityStr, unit] = match;
+  const quantity = Number(quantityStr);
+  if (!name?.trim() || !Number.isFinite(quantity) || quantity <= 0) return null;
+  return { productName: name.trim(), quantity, unit: unit?.trim() || null };
+}
+
+// "CLOSING HOUR 20" or "CLOSING HOUR: 7PM" (24hr or simple AM/PM)
+const CLOSING_HOUR_RE = /^closing\s*hour\s*:?\s*(\d{1,2})\s*(am|pm)?\s*$/i;
+
+function parseClosingHourCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return null;
+  const match = rawMessage.trim().match(CLOSING_HOUR_RE);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const meridiem = match[2]?.toLowerCase();
+  if (meridiem === 'pm' && hour < 12) hour += 12;
+  if (meridiem === 'am' && hour === 12) hour = 0;
+  if (hour < 0 || hour > 23) return null;
+  return { hour };
+}
+
+module.exports = {
+  parseLedgerMessage,
+  detectCommand,
+  parseInvoiceCommand,
+  parseAddStockCommand,
+  parseClosingHourCommand,
+};

@@ -59,11 +59,11 @@ const KIKA_SYSTEM_PROMPT = `You are Kika, a WhatsApp assistant that helps inform
  * legible, with translations layered on top where we're confident.
  */
 const FALLBACK_REPLY_BY_LANGUAGE = {
-  English: "I didn't quite catch that. Are you trying to record a sale or check your balance? Type HELP for a list of commands.",
-  'Nigerian Pidgin': "I no too catch am o. You wan record sale abi check your balance? Type HELP make I show you wetin I fit do.",
-  Yoruba: "Mi ò gbọ́ ohun tí o sọ dáadáa. Ṣé o fẹ́ ṣàkọsílẹ̀ títà tàbí ṣàyẹ̀wò ìwọ̀ntúnwọ̀nsì rẹ? Tẹ HELP láti rí àwọn àṣẹ tí mo lè ṣe.",
-  Igbo: "Aghọtaghị m nke ọma. Ị chọrọ ka m dekọọ ahịa ma ọ bụ lelee ego gị? Pịa HELP ka ị hụ ihe m nwere ike ime.",
-  Hausa: "Ban gane sosai ba. Kana son yin rikodin siyarwa ko duba ma'aunin ku? Danna HELP don ganin abin da zan iya yi.",
+  English: "Ah, Kika didn't catch that one clearly! 🧐 Please make sure you include the item name, quantity, and amount. Type it simple, just the way you tell your shop boy:\n✅ 'Mama Tunde buy 3 loaves of bread, 3k cash'\n✅ 'Sold lace material to Blessing for 50k, she owe balance 20k'\n\nTry typing the entry again below 👇 or type HELP for more examples.",
+  'Nigerian Pidgin': "Ah, Kika no too catch that one o! 🧐 Abeg make sure you include the item name, how many, and the amount. Type am simple, just like how you go tell your shop boy:\n✅ 'Mama Tunde buy 3 loaves of bread, 3k cash'\n✅ 'Sold lace material to Blessing for 50k, she owe balance 20k'\n\nTry am again below 👇 or type HELP make I show you more examples.",
+  Yoruba: "Kika kò gbọ́ ohun tí o sọ́ dáadáá! 🧐 Jọwọ́ rí i dájú pé o fi orúkú ohun naáá, iye rẹ̀, àti owó sí i. Kọ́ ọ́ ní ọna tí ó rọrùn, gẹgẹ́ bí o ṣe máa sọ́ fún ọmọó èhín rẹ:\n✅ 'Mama Tunde ra búrẹ́dì mẹ́ta, 3k cash'\n✅ 'Tà aṣọ́ ọ̀fẹ́ fún Blessing fún 50k, ó jẹ 20k'\n\nGbérí ìwọlè rẹ padà sí ìsalẹ̀ 👇 tàbí tẹ́ HELP.",
+  Igbo: "Ah, Kika aghọtaghị nke ọma! 🧐 Biko gosi aha ihe, ole, na ego. Dee ya nfe, dị ka ị ga-agwa nwa ọrụ gị:\n✅ 'Mama Tunde zụrụ achicha 3, 3k cash'\n✅ 'Reere akwa Blessing maka 50k, ọ fọdụrụ 20k'\n\nNwaa ọzọ n'okpuru 👇 ma ọ bụ pịa HELP.",
+  Hausa: "Ah, Kika bai gane sosai ba! 🧐 Don Allah tabbatar ka sanya sunan kaya, adadi, da kudi. Rubuta shi kamar yadda za ka gaya wa yaronka:\n✅ 'Mama Tunde ya sayi burodi 3, 3k cash'\n✅ 'An sayar da lace ga Blessing akan 50k, ya rage 20k'\n\nGwada sake a kasa 👇 ko danna HELP.",
 };
 
 function getFallbackReply(detectedLanguage) {
