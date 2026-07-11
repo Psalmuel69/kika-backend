@@ -100,6 +100,7 @@ const DISPUTE_PREFIX_RE = /^dispute\b[:\s]*(.*)$/i;
 const ledgerWorker = new Worker(
   'kika-ledger-processing',
   async (job) => {
+    logger.info({ jobId: job.id, data: job.data }, "WORKER_RECEIVED_JOB");
     const { merchantId, whatsappNumber } = job.data;
     const merchant = await queries.getMerchantById(merchantId);
     if (!merchant) return;
@@ -220,6 +221,7 @@ const ledgerWorker = new Worker(
     let aiConversationalReply = null;
     let aiDetectedLanguage = null;
     if (!parsed) {
+      logger.info({ jobId: job.id }, "WORKER_STARTING_AI_CALL");
       const aiResult = await aiTransactionParser.parseWithAI(rawMessage, { imageBase64 });
       if (aiResult.parsed) {
         parsed = aiResult.parsed;
