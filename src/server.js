@@ -1,6 +1,7 @@
 'use strict';
 
 require('dotenv').config();
+require('./queue/worker');
 const app = require('./app');
 const logger = require('./utils/logger');
 const { pool } = require('./config/db');
