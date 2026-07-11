@@ -3,97 +3,59 @@
 const OpenAI = require('openai');
 const logger = require('../utils/logger');
 
-/**
- * ---------------------------------------------------------------------
- * PROVIDER CONFIG — OpenAI directly, or an OpenAI-compatible proxy
- * (e.g. OpenRouter)
- * ---------------------------------------------------------------------
- * Setting OPENAI_BASE_URL routes chat/vision calls through any
- * OpenAI-compatible endpoint — this is what lets Kika run against
- * OpenRouter (https://openrouter.ai/api/v1) using an "sk-or-v1-..." key
- * instead of a real OpenAI key. Leave OPENAI_BASE_URL unset to use
- * OpenAI directly.
- *
- * IMPORTANT — Whisper transcription is NOT proxied by OpenRouter.
- * OpenRouter only proxies chat completions; it does not expose an
- * /audio/transcriptions endpoint. If you're running Kika against
- * OpenRouter, voice-note transcription needs a real OpenAI key.
- * Configure that independently via OPENAI_TRANSCRIBE_API_KEY /
- * OPENAI_TRANSCRIBE_BASE_URL (both default to the main OPENAI_API_KEY /
- * OPENAI_BASE_URL if unset — fine when using OpenAI directly, but must
- * be overridden when the main key is an OpenRouter key).
- * ---------------------------------------------------------------------
- */
-const CHAT_BASE_URL = process.env.OPENAI_BASE_URL || undefined; // undefined = OpenAI's own default
-const CHAT_API_KEY = process.env.OPENAI_API_KEY;
+// --- 1. GEMINI CONFIGURATION (For Chat and Vision) ---
+const CHAT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const CHAT_API_KEY = process.env.GEMINI_API_KEY;
 
-const TRANSCRIBE_BASE_URL = process.env.OPENAI_TRANSCRIBE_BASE_URL || CHAT_BASE_URL;
-const TRANSCRIBE_API_KEY = process.env.OPENAI_TRANSCRIBE_API_KEY || CHAT_API_KEY;
+// --- 2. OPENAI CONFIGURATION (Strictly for Voice Notes) ---
+// If you want to transcribe WhatsApp voice notes, you MUST provide a real OpenAI API key.
+// Gemini's OpenAI-compatible proxy does not support the audio/transcriptions endpoint.
+const TRANSCRIBE_API_KEY = process.env.OPENAI_TRANSCRIBE_API_KEY || null;
 
-const usingOpenRouterForChat = (CHAT_BASE_URL || '').includes('openrouter.ai');
-const usingOpenRouterForTranscription = (TRANSCRIBE_BASE_URL || '').includes('openrouter.ai');
-
-// OpenRouter attributes usage to your app via these optional headers.
-// Harmless to send even against plain OpenAI (it just ignores them).
-const OPENROUTER_HEADERS = {
-  ...(process.env.OPENROUTER_SITE_URL ? { 'HTTP-Referer': process.env.OPENROUTER_SITE_URL } : {}),
-  ...(process.env.OPENROUTER_APP_NAME ? { 'X-Title': process.env.OPENROUTER_APP_NAME } : {}),
-};
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gemini-1.5-flash';
+const VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gemini-1.5-flash';
+const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
 
 let chatClient = null;
 function getChatClient() {
-  if (!CHAT_API_KEY) throw new Error('OPENAI_API_KEY is not configured');
+  if (!CHAT_API_KEY) throw new Error('GEMINI_API_KEY is not configured in Environment Variables');
   if (!chatClient) {
     chatClient = new OpenAI({
       apiKey: CHAT_API_KEY,
       baseURL: CHAT_BASE_URL,
-      defaultHeaders: usingOpenRouterForChat ? OPENROUTER_HEADERS : undefined,
-      timeout: 20000,
+      timeout: 30000, 
     });
-    logger.info({ baseURL: CHAT_BASE_URL || 'api.openai.com (default)' }, 'OpenAI chat client initialized');
+    logger.info({ model: CHAT_MODEL }, 'Gemini (OpenAI-compatible) chat client initialized');
   }
   return chatClient;
 }
 
 let transcribeClient = null;
 function getTranscribeClient() {
-  if (!TRANSCRIBE_API_KEY) throw new Error('OPENAI_API_KEY (or OPENAI_TRANSCRIBE_API_KEY) is not configured');
-  if (usingOpenRouterForTranscription) {
-    logger.warn(
-      'OPENAI_TRANSCRIBE_BASE_URL resolves to OpenRouter, which does not support audio transcription — ' +
-        'this call will fail. Set OPENAI_TRANSCRIBE_API_KEY/OPENAI_TRANSCRIBE_BASE_URL to a real OpenAI key to enable voice notes.'
-    );
+  if (!TRANSCRIBE_API_KEY) {
+    throw new Error('OPENAI_TRANSCRIBE_API_KEY is missing. Voice notes cannot be processed using a Gemini key.');
   }
   if (!transcribeClient) {
-    transcribeClient = new OpenAI({ apiKey: TRANSCRIBE_API_KEY, baseURL: TRANSCRIBE_BASE_URL, timeout: 20000 });
+    // This points to the real OpenAI endpoint, strictly for Whisper
+    transcribeClient = new OpenAI({ 
+      apiKey: TRANSCRIBE_API_KEY, 
+      timeout: 20000 
+    });
+    logger.info('OpenAI transcription client initialized for voice notes');
   }
   return transcribeClient;
 }
 
-// Model identifiers differ by provider — OpenRouter namespaces models by
-// vendor (e.g. "openai/gpt-4o-mini"), while OpenAI direct uses the bare
-// name ("gpt-4o-mini"). Always configurable via env so switching
-// providers never requires a code change.
-const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini';
-const VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-4o-mini';
-const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
-
 /**
- * A single chat completion call with an optional tool (function-calling)
- * schema. Used by aiTransactionParser for the hybrid regex→AI fallback:
- * the model either calls the `record_transaction` tool with structured
- * fields, or replies in plain text (an in-persona conversational reply
- * or a polite decline), per the system prompt's rules.
- *
- * `imageBase64` allows passing a photo (receipt, handwritten note) as a
- * vision input alongside the text prompt for multimodal messages.
+ * Executes the Chat/Vision call using Google Gemini via the OpenAI SDK
  */
 async function chatCompletion({ systemPrompt, userText, imageBase64, tools }) {
   const openai = getChatClient();
 
   const userContent = imageBase64
     ? [
-        { type: 'text', text: userText || 'Please read this image and extract any sale, expense, or debt described in it.' },
+        { type: 'text', text: userText || 'Extract the sale, expense, or debt described in this image.' },
+        // Ensure the base64 format perfectly matches what Gemini expects
         { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
       ]
     : userText;
@@ -103,35 +65,42 @@ async function chatCompletion({ systemPrompt, userText, imageBase64, tools }) {
     { role: 'user', content: userContent },
   ];
 
-  const res = await openai.chat.completions.create({
-    model: imageBase64 ? VISION_MODEL : CHAT_MODEL,
-    messages,
-    tools,
-    tool_choice: tools ? 'auto' : undefined,
-    temperature: 0.2,
-    max_tokens: 400,
-  });
+  try {
+    // CRITICAL FIX: Only pass tools and tool_choice to Gemini if tools actually exist in the array
+    const hasTools = Array.isArray(tools) && tools.length > 0;
+    
+    const res = await openai.chat.completions.create({
+      model: imageBase64 ? VISION_MODEL : CHAT_MODEL,
+      messages,
+      ...(hasTools && { tools: tools }),
+      ...(hasTools && { tool_choice: 'auto' }),
+      temperature: 0.2,
+      max_tokens: 400,
+    });
 
-  const choice = res.choices?.[0];
-  const toolCall = choice?.message?.tool_calls?.[0];
+    const choice = res.choices?.[0];
+    const toolCall = choice?.message?.tool_calls?.[0];
 
-  return {
-    toolCall: toolCall
-      ? { name: toolCall.function.name, arguments: safeJsonParse(toolCall.function.arguments) }
-      : null,
-    text: choice?.message?.content || null,
-    raw: res,
-  };
+    return {
+      toolCall: toolCall
+        ? { name: toolCall.function.name, arguments: safeJsonParse(toolCall.function.arguments) }
+        : null,
+      text: choice?.message?.content || null,
+      raw: res,
+    };
+  } catch (err) {
+    // This will force the detailed error to appear in your Render logs
+    logger.error({ err: err.message, stack: err.stack }, 'Gemini API Call Failed');
+    throw err; 
+  }
 }
 
 /**
- * Transcribes a WhatsApp voice note / audio file to text via Whisper.
- * `audioBuffer` is the raw downloaded media bytes; `filename` just needs
- * a plausible extension (e.g. 'voice.ogg') since the API infers format
- * from it. Uses the (possibly separate) transcription client/key — see
- * the provider-config note at the top of this file.
+ * Transcribes a WhatsApp voice note via OpenAI Whisper
  */
 async function transcribeAudio(audioBuffer, filename = 'voice.ogg') {
+  // If voice notes are sent but no OpenAI key exists, this will throw the
+  // clear error defined in getTranscribeClient(), allowing the worker to fail gracefully.
   const openai = getTranscribeClient();
   const { toFile } = require('openai');
   const res = await openai.audio.transcriptions.create({
