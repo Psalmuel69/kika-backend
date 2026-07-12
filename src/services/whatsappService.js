@@ -186,7 +186,6 @@ async function safeSend(payload) {
 
 module.exports = {
   verifyWebhookSignature,
-  sendTextMessage,
   sendReceiptImage,
   sendDocument,
   sendPaymentLink,
