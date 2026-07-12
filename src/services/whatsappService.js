@@ -34,6 +34,20 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
 }
 
 /**
+ * Sends a plain text message. The most basic and most-used send path —
+ * every command reply, fallback message, and confirmation that isn't an
+ * image/document/button flows through this.
+ */
+async function sendTextMessage(toWhatsappNumber, body) {
+  return safeSend({
+    messaging_product: 'whatsapp',
+    to: toWhatsappNumber,
+    type: 'text',
+    text: { preview_url: true, body },
+  });
+}
+
+/**
  * Generic WhatsApp quick-reply button message — up to 3 buttons, 20-char
  * title limit per WhatsApp's own constraints. Every other "pick one of a
  * few options" flow (plan selection, consent, Friday debt amnesty)
@@ -186,6 +200,7 @@ async function safeSend(payload) {
 
 module.exports = {
   verifyWebhookSignature,
+  sendTextMessage,
   sendReceiptImage,
   sendDocument,
   sendPaymentLink,
