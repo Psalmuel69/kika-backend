@@ -33,12 +33,76 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
   return crypto.timingSafeEqual(expectedBuf, providedBuf);
 }
 
-async function sendTextMessage(toWhatsappNumber, body) {
+/**
+ * Generic WhatsApp quick-reply button message — up to 3 buttons, 20-char
+ * title limit per WhatsApp's own constraints. Every other "pick one of a
+ * few options" flow (plan selection, consent, Friday debt amnesty)
+ * routes through this single function.
+ */
+async function sendButtonMessage(toWhatsappNumber, { bodyText, footerText, buttons }) {
   return safeSend({
     messaging_product: 'whatsapp',
     to: toWhatsappNumber,
-    type: 'text',
-    text: { preview_url: true, body },
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: bodyText },
+      footer: footerText ? { text: footerText } : undefined,
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({
+          type: 'reply',
+          reply: { id: b.id, title: b.title.slice(0, 20) },
+        })),
+      },
+    },
+  });
+}
+
+/**
+ * Presents pricing tiers as tappable WhatsApp reply buttons in response to
+ * the generic UPGRADE keyword, so the merchant picks a plan instead of
+ * guessing which keyword to type.
+ */
+async function sendPlanSelectionButtons(toWhatsappNumber, buttons) {
+  return sendButtonMessage(toWhatsappNumber, {
+    bodyText: '\ud83d\ude80 *Upgrade Kika*\n\nChoose a plan to continue:',
+    buttons,
+  });
+}
+
+/**
+ * First-contact consent prompt. WhatsApp's "button" interactive type only
+ * supports quick-reply buttons — it can't mix in a URL button alongside
+ * them in the same message (that's the separate `cta_url` type, which
+ * only supports a single button and nothing else). So the Terms link is
+ * placed as plain text in the body (WhatsApp auto-links URLs) alongside
+ * one quick-reply button for "I AGREE" — both asks satisfied within the
+ * platform's actual constraints, in a single message.
+ */
+async function sendConsentPrompt(toWhatsappNumber) {
+  const termsUrl = process.env.TERMS_URL || 'https://kika-book.example.com/terms';
+  return sendButtonMessage(toWhatsappNumber, {
+    bodyText:
+      'Welcome to *Kika-Book*! Your automatic business notebook inside WhatsApp. No more lost paper, forgotten customer debts, or manual calculations. Kika records your sales, tracks inventory, and types customer receipts instantly \u2014 just from a normal chat text.\n\n\ud83d\udd12 *Before we start, our security agreement:*\nWe encrypt your customer records and *never* share your shop details with tax collectors or external parties. By using Kika, you agree to our Terms & Privacy Policy:\n' +
+      termsUrl,
+    footerText: 'Tap I AGREE to activate your free business notebook',
+    buttons: [{ id: 'AGREE_TERMS', title: 'I AGREE \ud83d\udc47' }],
+  });
+}
+
+/**
+ * Friday afternoon "Polite Mode" prompt — the merchant opts in per week
+ * rather than Kika messaging debtors automatically, since we can't be
+ * sure every captured phone number is one WhatsApp is happy for us to
+ * message unprompted.
+ */
+async function sendFridayAmnestyPrompt(toWhatsappNumber, { debtorCount, totalOwedLabel }) {
+  return sendButtonMessage(toWhatsappNumber, {
+    bodyText: `\ud83d\udc4b Happy Friday! You have *${debtorCount}* customer${debtorCount === 1 ? '' : 's'} with an outstanding balance, totalling *${totalOwedLabel}*.\n\nWant Kika to send them a polite, friendly reminder before the weekend?`,
+    buttons: [
+      { id: 'AMNESTY_SEND', title: 'Send Reminders \ud83d\udc4d' },
+      { id: 'AMNESTY_SKIP', title: 'Not Now' },
+    ],
   });
 }
 
@@ -56,6 +120,19 @@ async function sendReceiptImage(toWhatsappNumber, imageUrl, caption) {
 }
 
 /**
+ * Sends a document (e.g. the CSV ledger export) by URL, WhatsApp's
+ * equivalent of an email attachment.
+ */
+async function sendDocument(toWhatsappNumber, { link, filename, caption }) {
+  return safeSend({
+    messaging_product: 'whatsapp',
+    to: toWhatsappNumber,
+    type: 'document',
+    document: { link, filename, caption },
+  });
+}
+
+/**
  * Sends the Paystack checkout link inline as a plain text message with
  * a preview so WhatsApp renders a rich link card.
  */
@@ -66,31 +143,7 @@ async function sendPaymentLink(toWhatsappNumber, paymentUrl, amountLabel) {
     type: 'text',
     text: {
       preview_url: true,
-      body: `🚀 *Kika Premium Upgrade*\n\nAmount: ${amountLabel}\nComplete your payment securely here:\n${paymentUrl}\n\nYour premium window activates automatically the moment payment clears.`,
-    },
-  });
-}
-
-/**
- * Presents pricing tiers as tappable WhatsApp reply buttons in response to
- * the generic UPGRADE keyword, so the merchant picks a plan instead of
- * guessing which keyword to type. WhatsApp allows a maximum of 3 reply
- * buttons per message and a 20-character title limit per button.
- */
-async function sendPlanSelectionButtons(toWhatsappNumber, buttons) {
-  return safeSend({
-    messaging_product: 'whatsapp',
-    to: toWhatsappNumber,
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: '\ud83d\ude80 *Upgrade Kika*\n\nChoose a plan to continue:' },
-      action: {
-        buttons: buttons.slice(0, 3).map((b) => ({
-          type: 'reply',
-          reply: { id: b.id, title: b.title.slice(0, 20) },
-        })),
-      },
+      body: `🚀 *Kika Upgrade*\n\nAmount: ${amountLabel}\nComplete your payment securely here:\n${paymentUrl}\n\nYour new features activate instantly the second your payment is verified!`,
     },
   });
 }
@@ -135,7 +188,11 @@ module.exports = {
   verifyWebhookSignature,
   sendTextMessage,
   sendReceiptImage,
+  sendDocument,
   sendPaymentLink,
+  sendButtonMessage,
   sendPlanSelectionButtons,
+  sendConsentPrompt,
+  sendFridayAmnestyPrompt,
   sendMonthlyDigestCard,
 };

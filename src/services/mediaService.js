@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs/promises');
+const path = require('path');
 const axios = require('axios');
 const openaiService = require('./openaiService');
 const logger = require('../utils/logger');
@@ -38,11 +40,42 @@ async function transcribeWhatsappAudio(mediaId) {
 
 /**
  * Downloads an image (receipt photo, handwritten note) and returns it
- * as base64 for the vision-capable chat completion call.
+ * as base64 for the vision-capable chat completion call. Transient —
+ * not persisted to disk, unlike saveWhatsappImageAsMerchantLogo below.
  */
 async function downloadWhatsappImageAsBase64(mediaId) {
   const { buffer } = await downloadWhatsappMedia(mediaId);
   return buffer.toString('base64');
 }
 
-module.exports = { downloadWhatsappMedia, transcribeWhatsappAudio, downloadWhatsappImageAsBase64 };
+/**
+ * Downloads a business logo image and persists it to disk under a
+ * dedicated `logos/` subfolder of RECEIPT_STORAGE_DIR (separate from the
+ * time-limited receipt/digest PNGs — a logo is long-lived and explicitly
+ * NOT touched by diskCleanupService's expiry sweep). Returns the file
+ * path to store on merchants.logo_file_path.
+ */
+async function saveWhatsappImageAsMerchantLogo(mediaId, merchantId) {
+  const { buffer, mimeType } = await downloadWhatsappMedia(mediaId);
+  const extension = mimeType?.includes('png') ? 'png' : 'jpg';
+
+  const logosDir = path.join(process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts'), 'logos');
+  await fs.mkdir(logosDir, { recursive: true });
+
+  // Deterministic per-merchant filename (not a random token — logos
+  // aren't served over an unguessable public URL, they're read directly
+  // off disk by receiptService when compositing a receipt) so a re-upload
+  // cleanly overwrites the previous logo rather than accumulating files.
+  const filePath = path.join(logosDir, `${merchantId}.${extension}`);
+  await fs.writeFile(filePath, buffer);
+
+  logger.info({ merchantId, filePath }, 'Merchant logo saved');
+  return filePath;
+}
+
+module.exports = {
+  downloadWhatsappMedia,
+  transcribeWhatsappAudio,
+  downloadWhatsappImageAsBase64,
+  saveWhatsappImageAsMerchantLogo,
+};

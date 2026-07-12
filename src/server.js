@@ -1,6 +1,10 @@
 'use strict';
 
 require('dotenv').config();
+// Runs the queue worker in the same process as the API server. This
+// starts the ledger/webhook-alert/scheduled-report workers and calls
+// registerSchedules() as a side effect of requiring the module — see
+// src/queue/worker.js. Confirmed working in this deployment.
 require('./queue/worker');
 const app = require('./app');
 const logger = require('./utils/logger');

@@ -37,9 +37,10 @@ async function safeUnlink(filePath) {
  * regardless of how large the historical row count grows.
  */
 async function pruneExpiredAssets() {
-  const [expiredReceipts, expiredDigestCards] = await Promise.all([
+  const [expiredReceipts, expiredDigestCards, expiredDataExports] = await Promise.all([
     queries.getExpiredUncleanedReceipts(),
     queries.getExpiredUncleanedDigestCards(),
+    queries.getExpiredUncleanedDataExports(),
   ]);
 
   let deletedCount = 0;
@@ -64,6 +65,17 @@ async function pruneExpiredAssets() {
     } else {
       errorCount++;
       logger.error({ err: result.error.message, digestCardId: row.id, filePath: row.file_path }, 'Failed to prune expired digest card file');
+    }
+  }
+
+  for (const row of expiredDataExports) {
+    const result = await safeUnlink(row.file_path);
+    if (result.deleted) {
+      await queries.markDataExportFileDeleted(row.id);
+      deletedCount++;
+    } else {
+      errorCount++;
+      logger.error({ err: result.error.message, exportId: row.id, filePath: row.file_path }, 'Failed to prune expired data export file');
     }
   }
 

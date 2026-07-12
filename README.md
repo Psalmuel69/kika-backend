@@ -350,6 +350,106 @@ tables (`payment_transactions`, `payment_links`).
   changes, dispute resolutions, payment link creation, parsed-vs-AI
   ledger entries, blocked messages) via `auditLogService.logEvent`.
 
+### 15. Onboarding & consent (gates everything else)
+A merchant can only log entries once they've accepted terms **and**
+provided a business name — existing merchants (already `ACTIVE`+) skip
+straight past this on every future message.
+
+1. **First contact** — any message from a brand-new number gets the
+   Kika-Book welcome + consent prompt (`whatsappService.sendConsentPrompt`),
+   with a single "I AGREE" quick-reply button. (WhatsApp's `button` type
+   can't mix a URL button in with quick-replies — so the Terms link is
+   plain text in the body, which WhatsApp auto-links, alongside the
+   button; both asks from the original spec are satisfied within the
+   platform's real constraints.) State: `PENDING_CONSENT`.
+2. **Not accepted?** Up to 3 total prompts are sent (tracked via
+   `consent_prompt_count`); after the 3rd with no accept, Kika sends one
+   polite decline and goes silent (`CONSENT_DECLINED`) — no further
+   auto-replies unless the merchant re-engages with a greeting ("Hi",
+   "Hello", "Start"...), which resets the flow from scratch.
+3. **Accepted** — `consent_at` recorded, state moves to
+   `AWAITING_BUSINESS_NAME`, Kika asks for the shop name.
+4. **Business name provided** — saved, state moves to `ACTIVE`, and
+   *only now* does the merchant unlock ledger recording, commands, etc.
+
+**Verified end-to-end**, not just at the query layer: real BullMQ jobs
+pushed through the actual worker (mocked WhatsApp send, real Postgres +
+Redis) confirmed the full conversation — first contact → consent →
+business name → a real sale getting recorded — all transition correctly,
+and that an already-`ACTIVE` merchant re-contacting Kika never gets
+routed back through onboarding.
+
+### 16. Currency slang & Nigerian greetings
+- **Money shorthand**: `5k`/`5 thousand`, `2m`/`2 million`, `5h`/`5
+  hundred` all resolve correctly, on top of the existing comma/decimal
+  handling (`100,000`, `1,000,000`) — see `MONEY_SUFFIX_MULTIPLIER` in
+  `ledgerParser.js`. Boundary-anchored regex, so `"5 heavy bags"` or
+  `"2 mangoes"` never get misread as `500` or `2,000,000`.
+- **Greetings** ("Hi", "Hey", "Hello", "Howfar", "Wassup", "Hi Kika"...)
+  are matched deterministically (`GREETING` command, zero AI cost) and
+  get a fixed in-persona intro — never routed through the AI fallback.
+
+### 17. AI provider flexibility — Gemini, OpenRouter, or OpenAI
+`openaiService.js` resolves providers in order: **`GEMINI_API_KEY`** (if
+set, routes through Gemini's OpenAI-compatible endpoint, model defaults
+to `gemini-1.5-flash` — the current deployment target) → **`OPENAI_BASE_URL`**
++ `OPENAI_API_KEY` (any other OpenAI-compatible proxy, e.g. OpenRouter) →
+plain OpenAI directly. **Neither Gemini nor OpenRouter proxy audio
+transcription** — only chat completions — so voice notes need a real
+OpenAI key configured separately via `OPENAI_TRANSCRIBE_API_KEY` if
+you're on either of those providers; the service logs a clear warning
+rather than failing silently.
+
+The system prompt (`aiPersona.js`) follows a strict **"tool is king, but
+only when earned"** rule: the AI calls `record_transaction` only when it
+has a confident entry type, amount, and description; if a message is
+transaction-shaped but missing a detail (*"I sold rice today"*), it
+returns a short in-persona clarifying question instead of guessing —
+*"Nice one! How much you sell the rice for?"* — rather than either
+inventing a number or bailing out to the generic fallback. Three
+distinct reply paths are separated on purpose:
+- **AI extracted a transaction** → recorded normally.
+- **AI understood but something's missing/off-topic** → its own
+  conversational reply is forwarded verbatim.
+- **The AI call itself failed** (timeout, provider outage) → a distinct
+  hardcoded message (`AI_ERROR_FALLBACK_REPLY`) — never the generic
+  "didn't catch that" text, since this is a different failure mode and
+  deserves different wording. A merchant is never left on read.
+
+### 18. Inventory & low-stock alerts
+Opt-in, per product: `ADD STOCK: rice, 50` registers/tops up a product
+in **`products`**. Any sale mentioning a matching item name
+(case-insensitive) decrements `current_stock`; crossing at or below
+`low_stock_threshold` (default 5) appends a Low Stock Alert right after
+that sale's receipt. **Verified**: a real sale through the worker
+correctly took stock from 10 → 2 units and fired the alert in the same
+job — caught and fixed a real regex bug along the way (see below).
+
+### 19. Business logo & Premium logbook scanning
+- After a successful Premium/Standard payment, Kika opens a 10-minute
+  window (`awaiting_logo_until`) where the next image sent is saved as
+  the merchant's logo (`mediaService.saveWhatsappImageAsMerchantLogo`)
+  instead of being parsed as a transaction — it's then embedded directly
+  into every receipt (`receiptService.js`), which shifts the "KIKA
+  RECEIPT" wordmark left to make room rather than replacing it.
+- **Premium logbook photo scan**: any other image from a Premium
+  merchant goes through a *batch* OCR pipeline (`parseMultiTransactionImage`)
+  that extracts every visible line as a separate transaction in one AI
+  call, records them all, and replies with a summary + `REVIEW SCAN` to
+  see the itemized breakdown (cached in Redis for 1h). Non-Premium
+  merchants still get the existing single-transaction image fallback.
+
+### 20. Subscription expiry & Friday Debt Amnesty
+- A 15-minute sweep (`subscription-expiry-tick`) finds merchants whose
+  paid plan has lapsed, downgrades them to Free, and sends the
+  "what changes now" notice — **verified** end-to-end against real
+  Postgres (forced an expiry into the past, ran the sweep, confirmed the
+  downgrade and the notification).
+- Every Friday afternoon, merchants with outstanding debt get an opt-in
+  prompt (`sendFridayAmnestyPrompt`) — tapping "Send Reminders" messages
+  only debtors we actually have a phone number for with one polite,
+  pre-written line; "Not Now" just... does nothing. Never automatic.
+
 ## Safety & reliability properties
 
 - **SQL injection**: every query in the codebase is parameterized
@@ -496,6 +596,7 @@ redeploy.
 | GET | `/api/v1/digest-cards/:token.png` | Serves a generated Monthly Digest card |
 | GET | `/api/v1/reports/:token` | Serves the full Monthly Report web page |
 | GET | `/api/v1/pricing` | Public list of active subscription tiers |
+| GET | `/api/v1/exports/:token.csv` | Serves a CSV ledger export (via the `EXPORT` command) |
 | GET | `/l/:code` | Resolves a short payment link and redirects to the gateway checkout |
 | POST/DELETE | `/api/v1/admin/access-control/*` | Blacklist/whitelist management (requires `X-Admin-Key`) |
 | POST/DELETE | `/api/v1/admin/merchants/:id/labels*` | Conversation label management (requires `X-Admin-Key`) |
@@ -506,14 +607,19 @@ redeploy.
 | Command | Behavior |
 |---|---|
 | *(free text, voice note, or photo)* | Parsed as a ledger entry — regex first, AI fallback second |
+| *(greeting: "Hi", "Hello", "Howfar"...)* | Deterministic in-persona intro, no AI call |
 | `BALANCE` | Live in/out/net + outstanding debt snapshot |
 | `SUNSET` | Today's recap, on demand |
 | `INSIGHTS` | This month's trends, on demand (text summary) |
-| `UPGRADE` | Shows Standard / Premium as tappable buttons |
-| `STANDARD` | Sends the Standard tier's Paystack checkout link |
-| `PREMIUM` | Sends the Premium tier's Paystack checkout link |
+| `UPGRADE` | Shows tier features + tappable plan-selection buttons |
+| `STANDARD` / `PREMIUM` | Sends that tier's Paystack checkout link |
 | `INVOICE <amount> [description]` | Generates a trackable customer payment link |
 | `DISPUTE <reason>` | Flags a ledger balance issue for review |
+| `UNDO` | Voids the most recent entry (not available for debt settlements) |
+| `ADD STOCK: <item>, <qty>` | Registers/tops up inventory for a product |
+| `CLOSING HOUR <hour>` | Sets this merchant's personal Business Sunset time |
+| `EXPORT` | Emails a CSV ledger export (Standard/Premium only) |
+| `REVIEW SCAN` | Shows the itemized breakdown of the last logbook photo scan |
 | `HELP` | Usage examples |
 
 ## Testing notes

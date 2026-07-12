@@ -16,6 +16,7 @@ const reportsRoutes = require('./routes/reports.routes');
 const pricingRoutes = require('./routes/pricing.routes');
 const shortlinkRoutes = require('./routes/shortlink.routes');
 const adminRoutes = require('./routes/admin.routes');
+const exportsRoutes = require('./routes/exports.routes');
 const healthRoutes = require('./routes/health.routes');
 
 const app = express();
@@ -56,6 +57,7 @@ app.use('/api/v1/payments', paystackRoutes);
 app.use('/api/v1', receiptsRoutes);
 app.use('/api/v1', reportsRoutes);
 app.use('/api/v1', pricingRoutes);
+app.use('/api/v1', exportsRoutes);
 app.use('/', shortlinkRoutes); // short.link/l/:code — kept off /api/v1 for a shorter customer-facing URL
 app.use('/api/v1', adminRoutes);
 

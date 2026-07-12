@@ -23,19 +23,30 @@ const DEBIT_VERBS = ['bought', 'paid for', 'spent', 'expense', 'purchase', 'i pa
 const DEBT_SETTLE_VERBS = ['pay off', 'clear debt', 'settle debt', 'paid off', 'paid up', 'cleared'];
 const DEBT_VERBS = ['owes', 'owe', 'debt', 'credit sale', 'on credit'];
 
-// Matches "15k", "15,000", "₦15,000.50", "N15000", "15000 naira" — the `k`
-// suffix (very common in Nigerian chat shorthand) multiplies by 1,000.
+// Matches "15k", "15,000", "₦15,000.50", "N15000", "15000 naira", "2m",
+// "2 million", "5h", "5 hundred" — Nigerian chat shorthand for
+// thousand/million/hundred multipliers, spelled out or abbreviated.
 // The bare "n" prefix only matches when glued directly to a digit
 // (lookahead \d, no space) — otherwise it would greedily swallow the
 // trailing "n" of ordinary words like "remain" or "in" as a false
 // currency marker.
-const MONEY_TOKEN = /\b(?:₦\s*|ngn\s*|n(?=\d))?([\d,]+(?:\.\d{1,2})?)\s*(k)?\b(?!\w)/i;
+const MONEY_TOKEN = /\b(?:₦\s*|ngn\s*|n(?=\d))?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|hundred)?\b(?!\w)/i;
+
+const MONEY_SUFFIX_MULTIPLIER = {
+  k: 1000,
+  thousand: 1000,
+  m: 1000000,
+  million: 1000000,
+  h: 100,
+  hundred: 100,
+};
 
 function parseMoneyToken(matchGroups) {
-  const [, numberPart, kSuffix] = matchGroups;
+  const [, numberPart, suffixRaw] = matchGroups;
   let value = parseFloat(numberPart.replace(/,/g, ''));
   if (Number.isNaN(value)) return null;
-  if (kSuffix) value *= 1000;
+  const multiplier = MONEY_SUFFIX_MULTIPLIER[(suffixRaw || '').toLowerCase()];
+  if (multiplier) value *= multiplier;
   return Math.round(value * 100); // -> kobo
 }
 
@@ -62,7 +73,7 @@ function extractMoneyMentions(text) {
 }
 
 // "3 carton of indomie", "2 bags rice", "5 packs of sugar"
-const ITEM_RE = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to )/i;
+const ITEM_RE = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to | for )/i;
 
 function extractItem(text) {
   const match = text.match(ITEM_RE);
@@ -248,6 +259,13 @@ const COMMAND_KEYWORDS = {
   UNDO: ['undo', 'delete last sale', 'delete last entry', 'cancel last sale'],
   EXPORT: ['export', 'my data', 'excel', 'csv'],
   REVIEW_SCAN: ['review scan', 'review'],
+  GREETING: [
+    'hi', 'hey', 'hello', 'howdy', 'yo',
+    'hi kika', 'hey kika', 'hello kika', 'yo kika',
+    'whatsup', 'wassup', "what's up", 'wetin dey happen', 'wetin dey',
+    'howfa', 'howfar', 'how far', 'how far kika',
+    'good morning', 'good afternoon', 'good evening',
+  ],
 };
 
 function detectCommand(rawMessage) {

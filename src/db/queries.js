@@ -84,8 +84,35 @@ async function setMerchantOnboardingState(merchantId, state) {
 async function recordMerchantConsent(merchantId) {
   const res = await query(
     `UPDATE merchants
-     SET consent_at = now(), onboarding_state = 'AWAITING_BUSINESS_NAME'
+     SET consent_at = now(), onboarding_state = 'AWAITING_BUSINESS_NAME', consent_prompt_count = 0
      WHERE id = $1 RETURNING id`,
+    [merchantId]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/** Increments the consent-nudge counter and returns the updated merchant. */
+async function incrementConsentPromptCount(merchantId) {
+  const res = await query(
+    `UPDATE merchants SET consent_prompt_count = consent_prompt_count + 1 WHERE id = $1 RETURNING id`,
+    [merchantId]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/** After 3 unsuccessful nudges — stop auto-prompting until the merchant re-engages. */
+async function markConsentDeclined(merchantId) {
+  const res = await query(
+    `UPDATE merchants SET onboarding_state = 'CONSENT_DECLINED' WHERE id = $1 RETURNING id`,
+    [merchantId]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/** A merchant who previously declined re-engages (e.g. types "hi") — restart the consent flow fresh. */
+async function restartConsentFlow(merchantId) {
+  const res = await query(
+    `UPDATE merchants SET onboarding_state = 'PENDING_CONSENT', consent_prompt_count = 0 WHERE id = $1 RETURNING id`,
     [merchantId]
   );
   return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
@@ -547,6 +574,30 @@ async function getDebtorBreakdown(merchantId) {
                  ELSE 0 END AS percentage
      FROM debts d, total t
      ORDER BY d.balance_kobo DESC`,
+    [merchantId]
+  );
+  return res.rows;
+}
+
+/**
+ * Outstanding debtors WITH a phone number attached (most recently
+ * mentioned one, if the merchant included it on more than one entry) —
+ * powers the Friday Debt Amnesty "send reminders" flow, which can only
+ * message debtors we actually have a number for.
+ */
+async function getOutstandingDebtorsWithPhones(merchantId) {
+  const res = await query(
+    `WITH debts AS (
+       SELECT counterparty_name, counterparty_phone, balance_kobo, created_at
+       FROM ledger_entries
+       WHERE merchant_id = $1 AND balance_kobo > 0 AND counterparty_name IS NOT NULL AND is_voided = false
+     )
+     SELECT counterparty_name,
+            (ARRAY_AGG(counterparty_phone ORDER BY created_at DESC) FILTER (WHERE counterparty_phone IS NOT NULL))[1] AS counterparty_phone,
+            SUM(balance_kobo) AS balance_kobo
+     FROM debts
+     GROUP BY counterparty_name
+     ORDER BY balance_kobo DESC`,
     [merchantId]
   );
   return res.rows;
@@ -1103,6 +1154,9 @@ module.exports = {
   getMerchantById,
   setMerchantOnboardingState,
   recordMerchantConsent,
+  incrementConsentPromptCount,
+  markConsentDeclined,
+  restartConsentFlow,
   setMerchantBusinessName,
   setMerchantClosingHour,
   setMerchantLogo,
@@ -1135,6 +1189,7 @@ module.exports = {
   markReportSent,
   getWeeklyRevenue,
   getDebtorBreakdown,
+  getOutstandingDebtorsWithPhones,
   getTopProductsByRevenue,
   getTopDebtor,
   getTradeDaysCount,

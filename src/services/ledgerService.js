@@ -64,22 +64,50 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage }
 
   // Smart Customer Loyalty Flags — a CREDIT or DEBT entry represents an
   // actual purchase by this counterparty, so it counts toward their
-  // milestone streak. Fire-and-continue: a loyalty ping failure should
-  // never block the merchant's own receipt flow.
+  // milestone streak. Awaited (not fire-and-forget) because the result,
+  // when a milestone is hit, gets appended to the merchant's own receipt
+  // caption — see loyaltyService.js for why this no longer messages the
+  // customer directly. A failure here must never block the receipt itself.
+  let loyaltyMilestoneText = null;
   if (['CREDIT', 'DEBT'].includes(parsedEntry.entryType)) {
-    loyaltyService
-      .trackPurchaseAndMaybeNotify({
+    try {
+      const loyaltyResult = await loyaltyService.trackPurchaseAndMaybeNotify({
         merchant,
         counterpartyName: parsedEntry.counterpartyName,
         counterpartyPhone: parsedEntry.counterpartyPhone,
-      })
-      .catch((err) => logger.error({ err: err.message }, 'Loyalty tracking failed'));
+      });
+      loyaltyMilestoneText = loyaltyResult.milestoneText || null;
+    } catch (err) {
+      logger.error({ err: err.message }, 'Loyalty tracking failed');
+    }
+  }
+
+  // Smart Low-Stock Inventory Alerts — opt-in per product (only fires
+  // for items the merchant has explicitly registered via ADD STOCK).
+  // Runs after the sale is committed so a stock-tracking hiccup can
+  // never block the sale itself from being recorded.
+  const lowStockAlerts = [];
+  if (['CREDIT', 'DEBT'].includes(parsedEntry.entryType) && parsedEntry.items?.length) {
+    for (const item of parsedEntry.items) {
+      try {
+        const updatedProduct = await queries.decrementProductStock(merchant.id, item.name, item.quantity);
+        if (updatedProduct && Number(updatedProduct.current_stock) <= Number(updatedProduct.low_stock_threshold)) {
+          lowStockAlerts.push(
+            `\u26a0\ufe0f *LOW STOCK ALERT* \u26a0\ufe0f\nYour inventory for *${updatedProduct.name}* dropped to just *${updatedProduct.current_stock} ${updatedProduct.unit || 'units'}* left.\n\nWhen you restock, just text: *ADD STOCK: ${updatedProduct.name}, 50*`
+          );
+        }
+      } catch (err) {
+        logger.error({ err: err.message, item: item.name }, 'Inventory decrement failed');
+      }
+    }
   }
 
   return {
     ledgerEntry,
     receipt,
     outstandingDebtKobo: ledgerEntry.balance_after_kobo != null ? Number(ledgerEntry.balance_after_kobo) : parsedEntry.balanceKobo,
+    loyaltyMilestoneText,
+    lowStockAlerts,
   };
 }
 

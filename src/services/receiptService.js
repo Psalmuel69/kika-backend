@@ -59,6 +59,7 @@ function buildReceiptSvg({
   balanceLabel,
   timestampLabel,
   reference,
+  logoDataUri,
 }) {
   const rows = [
     { label: 'Customer', value: counterpartyName || 'Walk-in customer' },
@@ -95,6 +96,17 @@ function buildReceiptSvg({
   const dividerY = y + balanceBlockHeight + 20;
   const footerY = dividerY + 40;
 
+  // A premium merchant's uploaded logo renders as a small rounded square
+  // in the header's top-right corner — the brand wordmark shifts left to
+  // make room rather than being replaced, so it's always clear the
+  // receipt still came from Kika.
+  const logoSvg = logoDataUri
+    ? `
+  <clipPath id="logoClip"><rect x="${CARD_WIDTH - 104}" y="32" width="64" height="64" rx="12" /></clipPath>
+  <rect x="${CARD_WIDTH - 104}" y="32" width="64" height="64" rx="12" fill="#FFFFFF" opacity="0.06" />
+  <image href="${logoDataUri}" x="${CARD_WIDTH - 104}" y="32" width="64" height="64" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice" />`
+    : '';
+
   return `
 <svg width="${CARD_WIDTH}" height="${height}" viewBox="0 0 ${CARD_WIDTH} ${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
@@ -115,6 +127,7 @@ function buildReceiptSvg({
 
   <text x="40" y="70" class="brand">KIKA RECEIPT</text>
   <text x="40" y="98" class="muted">${escapeXml(businessName || 'Merchant')} &#183; ${escapeXml(entryTypeLabel)}</text>
+  ${logoSvg}
 
   <line x1="40" y1="120" x2="${CARD_WIDTH - 40}" y2="120" stroke="${THEME.accent}" stroke-width="2" stroke-opacity="0.5" />
   ${rowSvgs}
@@ -137,6 +150,24 @@ const ENTRY_TYPE_LABELS = {
 };
 
 /**
+ * Reads a merchant's logo file (if set) and returns it as a data: URI
+ * ready to embed directly in the SVG. Never throws — a missing or
+ * unreadable logo file just means the receipt renders without one,
+ * which is always safe to fall back to.
+ */
+async function loadLogoDataUri(logoFilePath) {
+  if (!logoFilePath) return null;
+  try {
+    const buffer = await fs.readFile(logoFilePath);
+    const mimeType = logoFilePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    return `data:${mimeType};base64,${buffer.toString('base64')}`;
+  } catch (err) {
+    logger.warn({ err: err.message, logoFilePath }, 'Could not load merchant logo, rendering receipt without it');
+    return null;
+  }
+}
+
+/**
  * Renders a receipt PNG for a ledger entry, stores it, and returns a
  * safe, unguessable, expiring URL suitable for handing straight to the
  * WhatsApp message broker as a media attachment.
@@ -144,6 +175,8 @@ const ENTRY_TYPE_LABELS = {
 async function generateReceipt({ merchant, ledgerEntry }) {
   const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
+
+  const logoDataUri = await loadLogoDataUri(merchant.logo_file_path);
 
   const svg = buildReceiptSvg({
     businessName: merchant.business_name || merchant.display_name,
@@ -166,6 +199,7 @@ async function generateReceipt({ merchant, ledgerEntry }) {
       timeStyle: 'short',
     }),
     reference: ledgerEntry.id.slice(0, 8).toUpperCase(),
+    logoDataUri,
   });
 
   const publicToken = crypto.randomBytes(24).toString('hex');

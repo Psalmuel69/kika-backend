@@ -128,3 +128,84 @@ async function parseWithAI(rawText, { imageBase64 } = {}) {
 }
 
 module.exports = { parseWithAI, RECORD_TRANSACTION_TOOL };
+
+// ---------------------------------------------------------------------------
+// Premium Image/Photo Scan Capture — a handwritten logbook page usually has
+// MANY transactions on it, not one. This is a deliberately separate tool
+// schema (an array, each entry shaped like record_transaction) and system
+// prompt from the single-message hybrid fallback above.
+// ---------------------------------------------------------------------------
+
+const RECORD_MULTIPLE_TRANSACTIONS_TOOL = {
+  type: 'function',
+  function: {
+    name: 'record_multiple_transactions',
+    description:
+      'Call this with EVERY distinct transaction line visible in the photographed logbook page — each row or entry the merchant wrote down is a separate item in the array.',
+    parameters: {
+      type: 'object',
+      properties: {
+        transactions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              entryType: { type: 'string', enum: ['CREDIT', 'DEBIT', 'DEBT', 'DEBT_SETTLEMENT'] },
+              description: { type: 'string' },
+              counterpartyName: { type: ['string', 'null'] },
+              itemName: { type: ['string', 'null'] },
+              itemQuantity: { type: ['number', 'null'] },
+              itemUnit: { type: ['string', 'null'] },
+              totalNaira: { type: 'number' },
+              paidNaira: { type: 'number' },
+              balanceNaira: { type: 'number' },
+            },
+            required: ['entryType', 'description', 'totalNaira', 'paidNaira', 'balanceNaira'],
+          },
+        },
+      },
+      required: ['transactions'],
+    },
+  },
+};
+
+const SCAN_SYSTEM_PROMPT = `${KIKA_SYSTEM_PROMPT}
+
+## Special mode: logbook page scan
+You are looking at a photo of a merchant's handwritten paper ledger page. Read every line and call record_multiple_transactions ONCE with the full list of transactions you can identify. Skip lines you genuinely can't read rather than guessing amounts. If you can't confidently read ANY transaction on the page, call the tool with an empty transactions array.`;
+
+/**
+ * Extracts every transaction from a photographed logbook page in a
+ * single AI call. Premium-only feature (gated by the caller, not here).
+ *
+ * @returns {{ transactions: Array, error: boolean }}
+ */
+async function parseMultiTransactionImage(imageBase64) {
+  if (!process.env.OPENAI_API_KEY) {
+    return { transactions: [], error: true };
+  }
+
+  try {
+    const { toolCall } = await openaiService.chatCompletion({
+      systemPrompt: SCAN_SYSTEM_PROMPT,
+      userText: 'Read every transaction line on this logbook page.',
+      imageBase64,
+      tools: [RECORD_MULTIPLE_TRANSACTIONS_TOOL],
+    });
+
+    if (toolCall?.name !== 'record_multiple_transactions' || !Array.isArray(toolCall.arguments?.transactions)) {
+      return { transactions: [], error: false };
+    }
+
+    const transactions = toolCall.arguments.transactions
+      .map((t) => normalizeToolCallArgs({ ...t, detectedLanguage: 'English' }))
+      .filter((t) => t && t.totalKobo > 0);
+
+    return { transactions, error: false };
+  } catch (err) {
+    logger.error({ err: err.message }, 'Multi-transaction scan failed');
+    return { transactions: [], error: true };
+  }
+}
+
+module.exports.parseMultiTransactionImage = parseMultiTransactionImage;

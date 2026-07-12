@@ -78,10 +78,11 @@ CREATE TABLE IF NOT EXISTS merchants (
     subscription_expires_at TIMESTAMPTZ,                -- NULL while on the Free tier
     onboarding_state    VARCHAR(24)  NOT NULL DEFAULT 'PENDING_CONSENT'
                          CHECK (onboarding_state IN (
-                            'PENDING_CONSENT', 'AWAITING_BUSINESS_NAME', 'NEW', 'ACTIVE',
+                            'PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'NEW', 'ACTIVE',
                             'STANDARD_ACTIVE', 'PREMIUM_ACTIVE'
                          )),
     consent_at          TIMESTAMPTZ,                     -- when the merchant tapped "I AGREE" — compliance record
+    consent_prompt_count SMALLINT NOT NULL DEFAULT 0,     -- how many times we've (re)sent the consent prompt without an accept; capped at 3 before we stop nudging
     closing_hour_local  SMALLINT NOT NULL DEFAULT 19 CHECK (closing_hour_local BETWEEN 0 AND 23), -- Africa/Lagos hour the Business Sunset ping fires
     logo_file_path       TEXT,                            -- uploaded business logo, embedded into receipts once set
     awaiting_logo_until TIMESTAMPTZ,                      -- short window after a fresh premium purchase where the next image is treated as a logo upload, not a transaction scan
