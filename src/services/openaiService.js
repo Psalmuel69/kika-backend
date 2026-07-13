@@ -1,7 +1,16 @@
 'use strict';
 
+logger.warn({
+    gemini: !!process.env.GEMINI_API_KEY,
+    openai: !!process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_CHAT_MODEL,
+    geminiPrefix: process.env.GEMINI_API_KEY?.substring(0,8)
+}, "Runtime AI Environment");
+
+
 const OpenAI = require('openai');
 const logger = require('../utils/logger');
+
 
 /**
  * ---------------------------------------------------------------------
