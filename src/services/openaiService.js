@@ -31,8 +31,8 @@ function getTranscribeClient() {
   return transcribeClient;
 }
 
-const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash';
-const VISION_MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-2.5-flash';
+const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || 'gemini-3.1-flash-lite';
+const VISION_MODEL = process.env.GEMINI_VISION_MODEL || 'gemini-3.1-flash-lite';
 const TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
 
 /**
