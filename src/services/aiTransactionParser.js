@@ -91,7 +91,7 @@ function normalizeToolCallArgs(args) {
  */
 async function parseWithAI(rawText, { imageBase64 } = {}) {
   if (!process.env.OPENAI_API_KEY) {
-    logger.warn('OPENAI_API_KEY not configured — skipping AI fallback, using fixed fallback reply');
+    logger.warn('Neither OPENAI_API_KEY nor GEMINI_API_KEY configured — skipping AI fallback, using fixed fallback reply');
     return { parsed: null, error: true };
   }
 
@@ -181,7 +181,7 @@ You are looking at a photo of a merchant's handwritten paper ledger page. Read e
  * @returns {{ transactions: Array, error: boolean }}
  */
 async function parseMultiTransactionImage(imageBase64) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) {
     return { transactions: [], error: true };
   }
 

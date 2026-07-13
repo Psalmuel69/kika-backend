@@ -11,7 +11,7 @@ const logger = require('../utils/logger');
 // Fixed brand palette — do not derive these from user input.
 const THEME = {
   background: '#0B0F19',
-  accent: '#10B981',
+  accent: '#E85555',
   mint: '#34D399',
   textPrimary: '#F9FAFB',
   textMuted: '#9CA3AF',
@@ -115,7 +115,7 @@ function buildReceiptSvg({
       .value   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 600; }
       .mint    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 28px; font-weight: 700; }
       .balance { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.debtAmber}; font-size: 28px; font-weight: 700; }
-      .brand   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.accent}; font-size: 30px; font-weight: 800; letter-spacing: 1px; }
+      .brand   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.accent}; font-size: 34px; font-weight: 800; letter-spacing: 1px; }
       .muted   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 18px; }
       .confirm { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 20px; font-weight: 600; }
       .type    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 18px; font-weight: 600; }
@@ -125,9 +125,14 @@ function buildReceiptSvg({
   <rect x="0" y="0" width="${CARD_WIDTH}" height="${height}" fill="${THEME.background}" rx="24" />
   <rect x="0" y="0" width="${CARD_WIDTH}" height="8" fill="${THEME.accent}" rx="4" />
 
-  <text x="40" y="70" class="brand">KIKA RECEIPT</text>
-  <text x="40" y="98" class="muted">${escapeXml(businessName || 'Merchant')} &#183; ${escapeXml(entryTypeLabel)}</text>
-  ${logoSvg}
+  <text x="40" y="68" class="business">
+    ${escapeXml(businessName || 'Merchant')}
+</text>
+
+<text x="40" y="100" class="subtitle">
+    Kika Receipt for Sales Record
+</text>
+${logoSvg}
 
   <line x1="40" y1="120" x2="${CARD_WIDTH - 40}" y2="120" stroke="${THEME.accent}" stroke-width="2" stroke-opacity="0.5" />
   ${rowSvgs}
