@@ -90,7 +90,7 @@ function normalizeToolCallArgs(args) {
  *                                                fallback text as a safety net
  */
 async function parseWithAI(rawText, { imageBase64 } = {}) {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) {
     logger.warn('Neither OPENAI_API_KEY nor GEMINI_API_KEY configured — skipping AI fallback, using fixed fallback reply');
     return { parsed: null, error: true };
   }
