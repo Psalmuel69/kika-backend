@@ -122,7 +122,7 @@ async function parseWithAI(rawText, { imageBase64 } = {}) {
 
     return { parsed: null, conversationalReply: text, detectedLanguage: null };
   } catch (err) {
-    logger.error({ err: err.message }, 'AI fallback parsing failed');
+    logger.error({ err, details: err.response?.data || err.error }, 'AI fallback parsing failed');
     return { parsed: null, error: true };
   }
 }
@@ -203,7 +203,7 @@ async function parseMultiTransactionImage(imageBase64) {
 
     return { transactions, error: false };
   } catch (err) {
-    logger.error({ err: err.message }, 'Multi-transaction scan failed');
+    logger.error({ err, details: err.response?.data || err.error }, 'Multi-transaction scan failed');
     return { transactions: [], error: true };
   }
 }
