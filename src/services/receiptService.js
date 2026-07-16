@@ -305,6 +305,7 @@ function buildReceiptSvg({
   timestampLabel,
   reference,
   logoDataUri,
+  kikaLogoDataUri,
   isFreeTier,
 }) {
   let y = 80;
@@ -429,7 +430,7 @@ function buildReceiptSvg({
   `;
   y += 80; // Final padding bottom ensures no awkward empty space
 
-  const height = y;
+  const height = Math.max(MIN_CARD_HEIGHT, y);
 
   // Watermark for free tier using the Kika logo image
   let watermarkSvg = '';
