@@ -245,7 +245,7 @@ const queries = require('../db/queries');
 const logger = require('../utils/logger');
 
 // Theme matches the light, minimal receipt template provided
-const THEME = 
+const THEME = {
   background: '#FFFFFF',
   textPrimary: '#262A56',     // Deep Navy Blue for text and dashed lines
   textPaid: '#10B981',        // Emerald Green for paid amounts
@@ -305,7 +305,6 @@ function buildReceiptSvg({
   timestampLabel,
   reference,
   logoDataUri,
-  kikaLogoDataUri,
   isFreeTier,
 }) {
   let y = 80;
@@ -430,7 +429,7 @@ function buildReceiptSvg({
   `;
   y += 80; // Final padding bottom ensures no awkward empty space
 
-  const height = Math.max(MIN_CARD_HEIGHT, y);
+  const height = y;
 
   // Watermark for free tier using the Kika logo image
   let watermarkSvg = '';
