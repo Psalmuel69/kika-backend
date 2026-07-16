@@ -1,6 +1,8 @@
 'use strict';
 
 const openaiService = require('./openaiService');
+const businessContextService = require('./businessContextService');
+const conversationMemory = require('./conversationMemory');
 const { KIKA_SYSTEM_PROMPT, SUPPORTED_LANGUAGES } = require('../config/aiPersona');
 const logger = require('../utils/logger');
 
@@ -50,6 +52,10 @@ const RECORD_TRANSACTION_TOOL = {
 // than to silently log a guessed amount.
 const MIN_CONFIDENCE_THRESHOLD = Number(process.env.AI_MIN_CONFIDENCE_THRESHOLD || 0.65);
 
+function hasAiProviderConfigured() {
+  return Boolean(process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY);
+}
+
 function toKobo(naira) {
   const n = Number(naira);
   return Number.isFinite(n) ? Math.round(n * 100) : 0;
@@ -79,8 +85,14 @@ function normalizeToolCallArgs(args) {
  * The hybrid fallback: called only when the fast regex parser
  * (ledgerParser.parseLedgerMessage) has already returned null and the
  * message isn't a recognized command. Sends the raw text (and, for
- * multimodal messages, an image) to OpenAI with the record_transaction
- * tool available.
+ * multimodal messages, an image) to the configured AI provider with the
+ * record_transaction tool available — plus, now, real business context
+ * (see businessContextService.js) and short-term conversation memory
+ * (see conversationMemory.js), so the model can ask sharper follow-up
+ * questions and never has to guess at numbers it hasn't actually seen.
+ *
+ * Requires the merchant record (not just their id) since the caller
+ * already has it loaded — avoids a redundant DB round-trip here.
  *
  * Returns one of three shapes:
  *   { parsed: {...} }                        — a transaction was extracted
@@ -89,18 +101,26 @@ function normalizeToolCallArgs(args) {
  *                                                caller must use the fixed
  *                                                fallback text as a safety net
  */
-async function parseWithAI(rawText, { imageBase64 } = {}) {
-  if (!process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) {
+async function parseWithAI(merchant, rawText, { imageBase64 } = {}) {
+  if (!hasAiProviderConfigured()) {
     logger.warn('Neither OPENAI_API_KEY nor GEMINI_API_KEY configured — skipping AI fallback, using fixed fallback reply');
     return { parsed: null, error: true };
   }
 
   try {
+    const [businessContext, history] = await Promise.all([
+      businessContextService.buildBusinessContextBlock(merchant),
+      conversationMemory.getHistory(merchant.id),
+    ]);
+
+    const systemPrompt = `${KIKA_SYSTEM_PROMPT}\n\n${businessContext}`;
+
     const { toolCall, text } = await openaiService.chatCompletion({
-      systemPrompt: KIKA_SYSTEM_PROMPT,
+      systemPrompt,
       userText: rawText,
       imageBase64,
       tools: [RECORD_TRANSACTION_TOOL],
+      conversationHistory: history,
     });
 
     if (toolCall?.name === 'record_transaction') {
@@ -109,6 +129,11 @@ async function parseWithAI(rawText, { imageBase64 } = {}) {
       const isConfident = Number.isFinite(confidence) ? confidence >= MIN_CONFIDENCE_THRESHOLD : true;
 
       if (parsed && parsed.totalKobo > 0 && isConfident) {
+        // A confirmed transaction is NOT stored in conversation memory —
+        // Postgres is the source of truth for it, and re-stating it here
+        // would only bloat future prompts for no benefit (see the note
+        // on conversationMemory.js). The conversation thread effectively
+        // "resets" to a clean slate after a successful recording.
         return { parsed, detectedLanguage: toolCall.arguments.detectedLanguage };
       }
       // Model called the tool but either produced unusable data (e.g.
@@ -120,9 +145,21 @@ async function parseWithAI(rawText, { imageBase64 } = {}) {
       }
     }
 
+    // No tool call — this is a genuine conversational turn: either the
+    // model is asking a clarifying question ("How much did you sell the
+    // rice for?") because the message was transaction-shaped but
+    // incomplete, or it's answering a general question, or declining
+    // something out of scope. This is exactly the "unfinished
+    // conversation" that's worth remembering, so both sides of the
+    // exchange get stored for the next message to pick up naturally.
+    if (text) {
+      await conversationMemory.addMessage(merchant.id, 'user', rawText);
+      await conversationMemory.addMessage(merchant.id, 'assistant', text);
+    }
+
     return { parsed: null, conversationalReply: text, detectedLanguage: null };
   } catch (err) {
-    logger.error({ err, details: err.response?.data || err.error }, 'AI fallback parsing failed');
+    logger.error({ err: err.message }, 'AI fallback parsing failed');
     return { parsed: null, error: true };
   }
 }
@@ -133,7 +170,8 @@ module.exports = { parseWithAI, RECORD_TRANSACTION_TOOL };
 // Premium Image/Photo Scan Capture — a handwritten logbook page usually has
 // MANY transactions on it, not one. This is a deliberately separate tool
 // schema (an array, each entry shaped like record_transaction) and system
-// prompt from the single-message hybrid fallback above.
+// prompt from the single-message hybrid fallback above. Not conversational
+// (each scan is self-contained), so no conversation memory threading here.
 // ---------------------------------------------------------------------------
 
 const RECORD_MULTIPLE_TRANSACTIONS_TOOL = {
@@ -181,7 +219,7 @@ You are looking at a photo of a merchant's handwritten paper ledger page. Read e
  * @returns {{ transactions: Array, error: boolean }}
  */
 async function parseMultiTransactionImage(imageBase64) {
-  if (!process.env.OPENAI_API_KEY && !process.env.GEMINI_API_KEY) {
+  if (!hasAiProviderConfigured()) {
     return { transactions: [], error: true };
   }
 
@@ -203,7 +241,7 @@ async function parseMultiTransactionImage(imageBase64) {
 
     return { transactions, error: false };
   } catch (err) {
-    logger.error({ err, details: err.response?.data || err.error }, 'Multi-transaction scan failed');
+    logger.error({ err: err.message }, 'Multi-transaction scan failed');
     return { transactions: [], error: true };
   }
 }

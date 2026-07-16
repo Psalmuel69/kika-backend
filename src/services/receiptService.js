@@ -11,8 +11,9 @@ const logger = require('../utils/logger');
 // Fixed brand palette — do not derive these from user input.
 const THEME = {
   background: '#0B0F19',
-  accent: '#E85555',
+  accent: '#10B981',
   mint: '#34D399',
+  coral: '#E85555', // business name + "Powered by Kika AI" watermark — amounts stay green/mint
   textPrimary: '#F9FAFB',
   textMuted: '#9CA3AF',
   debtAmber: '#FBBF24', // outstanding balance still owed — matches the app's amber marker
@@ -73,7 +74,7 @@ function buildReceiptSvg({
   const balanceBlockHeight = showBalance ? 90 : 0;
   const height = 260 + bodyRowsHeight + balanceBlockHeight + 90; // header + rows + balance card + footer
 
-  let y = 210;
+  let y = 225;
   const rowSvgs = rows
     .map((row) => {
       const labelY = y;
@@ -97,14 +98,12 @@ function buildReceiptSvg({
   const footerY = dividerY + 40;
 
   // A premium merchant's uploaded logo renders as a small rounded square
-  // in the header's top-right corner — the brand wordmark shifts left to
-  // make room rather than being replaced, so it's always clear the
-  // receipt still came from Kika.
+  // in the header's top-right corner, alongside the business name.
   const logoSvg = logoDataUri
     ? `
-  <clipPath id="logoClip"><rect x="${CARD_WIDTH - 104}" y="32" width="64" height="64" rx="12" /></clipPath>
-  <rect x="${CARD_WIDTH - 104}" y="32" width="64" height="64" rx="12" fill="#FFFFFF" opacity="0.06" />
-  <image href="${logoDataUri}" x="${CARD_WIDTH - 104}" y="32" width="64" height="64" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice" />`
+  <clipPath id="logoClip"><rect x="${CARD_WIDTH - 104}" y="24" width="64" height="64" rx="12" /></clipPath>
+  <rect x="${CARD_WIDTH - 104}" y="24" width="64" height="64" rx="12" fill="#FFFFFF" opacity="0.06" />
+  <image href="${logoDataUri}" x="${CARD_WIDTH - 104}" y="24" width="64" height="64" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice" />`
     : '';
 
   return `
@@ -115,31 +114,26 @@ function buildReceiptSvg({
       .value   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 600; }
       .mint    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 28px; font-weight: 700; }
       .balance { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.debtAmber}; font-size: 28px; font-weight: 700; }
-      .brand   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.accent}; font-size: 34px; font-weight: 800; letter-spacing: 1px; }
+      .bizname { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.coral}; font-size: 34px; font-weight: 800; }
       .muted   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 18px; }
-      .confirm { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 20px; font-weight: 600; }
-      .type    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 18px; font-weight: 600; }
+      .watermark { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.coral}; font-size: 18px; font-weight: 600; }
+      .type    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; font-weight: 600; }
     </style>
   </defs>
 
   <rect x="0" y="0" width="${CARD_WIDTH}" height="${height}" fill="${THEME.background}" rx="24" />
   <rect x="0" y="0" width="${CARD_WIDTH}" height="8" fill="${THEME.accent}" rx="4" />
 
-  <text x="40" y="68" class="business">
-    ${escapeXml(businessName || 'Merchant')}
-</text>
-
-<text x="40" y="100" class="subtitle">
-    Kika Receipt for Sales Record
-</text>
-${logoSvg}
+  <text x="40" y="70" class="bizname">${escapeXml(businessName || 'Merchant')}</text>
+  <text x="40" y="98" class="type">${escapeXml(entryTypeLabel)}</text>
+  ${logoSvg}
 
   <line x1="40" y1="120" x2="${CARD_WIDTH - 40}" y2="120" stroke="${THEME.accent}" stroke-width="2" stroke-opacity="0.5" />
   ${rowSvgs}
   ${balanceBlockSvg}
 
   <line x1="40" y1="${dividerY}" x2="${CARD_WIDTH - 40}" y2="${dividerY}" stroke="${THEME.accent}" stroke-width="1" stroke-opacity="0.3" stroke-dasharray="6,6" />
-  <text x="40" y="${footerY}" class="confirm">&#10003; Recorded in your Kika Book</text>
+  <text x="40" y="${footerY}" class="watermark">Powered by Kika AI</text>
 
   <line x1="40" y1="${height - 55}" x2="${CARD_WIDTH - 40}" y2="${height - 55}" stroke="${THEME.accent}" stroke-width="1" stroke-opacity="0.3" />
   <text x="40" y="${height - 25}" class="muted">${escapeXml(timestampLabel)}</text>

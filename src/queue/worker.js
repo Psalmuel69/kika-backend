@@ -51,6 +51,39 @@ function currentLagosHour() {
   return Number(parts.find((p) => p.type === 'hour').value);
 }
 
+function formatNairaShort(kobo) {
+  return `\u20a6${(Number(kobo) / 100).toLocaleString('en-NG')}`;
+}
+
+/**
+ * Warm, specific confirmation copy instead of a robotic "Transaction
+ * recorded." — names the actual customer and actual figures, since
+ * that's what makes it feel like Kika actually understood what happened,
+ * not just logged a row.
+ */
+function buildTransactionConfirmationCaption(parsed, outstandingDebtKobo) {
+  const amountLabel = formatNairaShort(parsed.totalKobo);
+
+  if (parsed.entryType === 'DEBIT') {
+    return `Got it! I've logged your ${amountLabel} expense for ${parsed.description}.`;
+  }
+
+  if (parsed.entryType === 'DEBT_SETTLEMENT') {
+    const who = parsed.counterpartyName || 'Your customer';
+    return Number(outstandingDebtKobo) > 0
+      ? `Nice one! ${who} just paid ${formatNairaShort(parsed.paidKobo)}. Outstanding balance is now ${formatNairaShort(outstandingDebtKobo)}.`
+      : `Nice one! ${who} just paid ${formatNairaShort(parsed.paidKobo)} \u2014 fully settled, no balance left. \ud83c\udf89`;
+  }
+
+  const who = parsed.counterpartyName ? ` from ${parsed.counterpartyName}` : '';
+  let caption = `Great! I've recorded the sale of ${amountLabel}${who}.`;
+  if (Number(outstandingDebtKobo) > 0) {
+    const possessive = parsed.counterpartyName ? `${parsed.counterpartyName}'s` : 'Their';
+    caption += ` ${possessive} outstanding balance is now ${formatNairaShort(outstandingDebtKobo)}.`;
+  }
+  return caption;
+}
+
 async function handleTierPurchase(merchant, whatsappNumber, tierName) {
   const invoice = await paystackService.createUpgradeInvoice(merchant, tierName);
   await whatsappService.sendPaymentLink(
@@ -231,8 +264,17 @@ const ledgerWorker = new Worker(
     }
 
     if (command === 'UPGRADE') {
+      const highestTier = await queries.getHighestActiveSubscriptionTier();
+      if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `You're already on *${merchant.plan}* \u2014 the full Kika experience! \ud83c\udf1f There's no higher tier to upgrade to right now. Type BALANCE or HELP if you need anything.`
+        );
+        return;
+      }
+
       const tiers = await queries.listActiveSubscriptionTiers();
-      const paidTiers = tiers.filter((t) => Number(t.price) > 0);
+      const paidTiers = tiers.filter((t) => Number(t.price) > 0 && t.name.toLowerCase() !== merchant.plan.toLowerCase());
       const featureLines = paidTiers
         .map((t) => `\n*${t.name}* (${t.currency} ${Number(t.price).toLocaleString('en-NG')}/mo):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`)
         .join('\n');
@@ -248,18 +290,57 @@ const ledgerWorker = new Worker(
     }
 
     if (command === 'STANDARD' || command === 'PREMIUM') {
+      const highestTier = await queries.getHighestActiveSubscriptionTier();
+      if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `You're already on *${merchant.plan}* \u2014 the full Kika experience! \ud83c\udf1f There's no higher tier to upgrade to right now.`
+        );
+        return;
+      }
       await handleTierPurchase(merchant, whatsappNumber, command);
       return;
     }
 
     if (command === 'UNDO') {
-      const result = await queries.voidMostRecentLedgerEntry(merchantId);
-      if (result.reason === 'NO_ENTRY') {
+      const entry = await queries.getMostRecentLedgerEntry(merchantId);
+      if (!entry) {
         await whatsappService.sendTextMessage(whatsappNumber, "You don't have any recent entries to undo yet.");
-      } else if (result.reason === 'SETTLEMENT_NOT_UNDOABLE') {
+        return;
+      }
+      if (entry.entry_type === 'DEBT_SETTLEMENT') {
         await whatsappService.sendTextMessage(
           whatsappNumber,
           "Your most recent entry was a debt payment, which touches multiple records — I can't auto-undo that safely. Type DISPUTE <reason> and our team will help fix it."
+        );
+        return;
+      }
+
+      const amountLabel = `\u20a6${(Number(entry.total_kobo) / 100).toLocaleString('en-NG')}`;
+      await whatsappService.sendButtonMessage(whatsappNumber, {
+        bodyText: `Just to confirm \u2014 you want to undo this entry?\n\n*${entry.description}*${entry.counterparty_name ? ` (${entry.counterparty_name})` : ''}\nAmount: ${amountLabel}\nRecorded: ${new Date(entry.created_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`,
+        buttons: [
+          { id: `UNDO_CONFIRM:${entry.id}`, title: 'Yes, Undo' },
+          { id: 'UNDO_CANCEL', title: 'Cancel' },
+        ],
+      });
+      return;
+    }
+
+    if (rawMessage === 'UNDO_CANCEL') {
+      await whatsappService.sendTextMessage(whatsappNumber, "Got it \u2014 your last entry is still untouched.");
+      return;
+    }
+
+    if (rawMessage.startsWith('UNDO_CONFIRM:')) {
+      const entryId = rawMessage.slice('UNDO_CONFIRM:'.length);
+      const result = await queries.voidLedgerEntryById(merchantId, entryId);
+      if (result.reason === 'NO_ENTRY') {
+        await whatsappService.sendTextMessage(whatsappNumber, "That entry is no longer available to undo \u2014 it may have already been changed.");
+      } else if (result.reason === 'SETTLEMENT_NOT_UNDOABLE') {
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          "That entry was a debt payment, which touches multiple records — I can't auto-undo that safely. Type DISPUTE <reason> and our team will help fix it."
         );
       } else {
         await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'ledger_entry.void', metadata: { ledgerEntryId: result.entry.id } });
@@ -436,7 +517,7 @@ const ledgerWorker = new Worker(
     let aiCallFailed = false;
     if (!parsed) {
       logger.info({ jobId: job.id }, 'WORKER_STARTING_AI_CALL');
-      const aiResult = await aiTransactionParser.parseWithAI(rawMessage, { imageBase64 });
+      const aiResult = await aiTransactionParser.parseWithAI(merchant, rawMessage, { imageBase64 });
       if (aiResult.parsed) {
         parsed = aiResult.parsed;
         source = 'ai';
@@ -471,7 +552,7 @@ const ledgerWorker = new Worker(
     });
 
     const debtNote = Number(outstandingDebtKobo) > 0 ? '\n\nSend BALANCE anytime for a full summary.' : '';
-    let caption = `\u2705 Recorded: ${parsed.description}${debtNote}`;
+    let caption = buildTransactionConfirmationCaption(parsed, outstandingDebtKobo) + debtNote;
     if (loyaltyMilestoneText) caption += loyaltyMilestoneText;
 
     logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');

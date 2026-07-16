@@ -32,6 +32,15 @@ async function listActiveSubscriptionTiers() {
   return res.rows;
 }
 
+/** The single highest-ranked active tier (by display_order) — used to tell
+ * a merchant "you're already on the top plan" instead of showing UPGRADE options. */
+async function getHighestActiveSubscriptionTier() {
+  const res = await query(
+    'SELECT * FROM subscription_tiers WHERE is_active = true ORDER BY display_order DESC LIMIT 1'
+  );
+  return res.rows[0] || null;
+}
+
 async function getSubscriptionTierByName(name) {
   const res = await query(
     'SELECT * FROM subscription_tiers WHERE name ILIKE $1 AND is_active = true',
@@ -451,6 +460,40 @@ async function voidMostRecentLedgerEntry(merchantId) {
   });
 }
 
+/**
+ * Same voiding logic as voidMostRecentLedgerEntry, but targets a specific
+ * entry id rather than "whatever is most recent right now" — used by the
+ * UNDO confirmation flow, where the entry to void was already identified
+ * (and shown to the merchant) at prompt time, potentially a few seconds
+ * before they tap "Yes, Undo". Re-verifies merchant ownership and
+ * not-already-voided under the same row lock, so a confirm tap can never
+ * void the wrong row even if other activity happened in between.
+ */
+async function voidLedgerEntryById(merchantId, entryId) {
+  return withTransaction(async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM ledger_entries
+       WHERE id = $1 AND merchant_id = $2 AND is_voided = false
+       FOR UPDATE`,
+      [entryId, merchantId]
+    );
+    const entry = rows[0];
+    if (!entry) return { voided: false, reason: 'NO_ENTRY', entry: null };
+    if (entry.entry_type === 'DEBT_SETTLEMENT') {
+      return { voided: false, reason: 'SETTLEMENT_NOT_UNDOABLE', entry };
+    }
+
+    if (entry.entry_type === 'DEBT' && entry.counterparty_name && Number(entry.balance_kobo) > 0) {
+      await lockCustomerBalance(client, merchantId, entry.counterparty_name);
+      await applyCustomerBalanceDelta(client, merchantId, entry.counterparty_name, -Number(entry.balance_kobo));
+    }
+
+    await client.query('UPDATE ledger_entries SET is_voided = true, voided_at = now() WHERE id = $1', [entry.id]);
+
+    return { voided: true, reason: null, entry };
+  });
+}
+
 // --- Reporting: Daily Sunset Report & Monthly Insights --------------------
 
 /**
@@ -692,6 +735,15 @@ async function decrementProductStock(merchantId, name, quantity) {
     [merchantId, name, quantity]
   );
   return res.rows[0] || null;
+}
+
+/** Full inventory snapshot for a merchant — powers the Business Context Engine. */
+async function listProductsForMerchant(merchantId, limit = 30) {
+  const res = await query(
+    'SELECT * FROM products WHERE merchant_id = $1 ORDER BY current_stock ASC LIMIT $2',
+    [merchantId, limit]
+  );
+  return res.rows;
 }
 
 // --- Data exports -----------------------------------------------------------
@@ -1148,6 +1200,7 @@ async function writeAuditLog({
 
 module.exports = {
   listActiveSubscriptionTiers,
+  getHighestActiveSubscriptionTier,
   getSubscriptionTierByName,
   getSubscriptionTierById,
   findOrCreateMerchantByWhatsappNumber,
@@ -1172,9 +1225,11 @@ module.exports = {
   getCustomerBalance,
   getMostRecentLedgerEntry,
   voidMostRecentLedgerEntry,
+  voidLedgerEntryById,
   addProductStock,
   getProductByName,
   decrementProductStock,
+  listProductsForMerchant,
   createDataExport,
   getDataExportByToken,
   getExpiredUncleanedDataExports,
