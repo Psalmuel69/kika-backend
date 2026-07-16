@@ -252,8 +252,8 @@ const THEME = {
   textOutstanding: '#EF4444', // Red for outstanding debt
 };
 
-const CARD_WIDTH = 640;
-const PADDING = 40;
+const CARD_WIDTH = 1080;
+const PADDING = 80;
 
 function escapeXml(unsafe) {
   return String(unsafe)
@@ -270,8 +270,27 @@ function formatNaira(kobo) {
 }
 
 /**
- * Builds a KIKA RECEIPT matching the white "print" template design.
- * Features a circular logo, 2-column meta info, itemized list, and bold totals.
+ * Splits a long string into multiple lines to prevent SVG text clipping.
+ */
+function splitTextIntoLines(text, maxChars) {
+  if (!text) return [];
+  const words = String(text).split(' ');
+  const lines = [];
+  let currentLine = '';
+  for (const word of words) {
+    if ((currentLine + word).length > maxChars) {
+      if (currentLine) lines.push(currentLine.trim());
+      currentLine = word + ' ';
+    } else {
+      currentLine += word + ' ';
+    }
+  }
+  if (currentLine) lines.push(currentLine.trim());
+  return lines;
+}
+
+/**
+ * Builds a KIKA RECEIPT SVG dynamically adjusting height based on items.
  */
 function buildReceiptSvg({
   businessName,
@@ -285,140 +304,177 @@ function buildReceiptSvg({
   timestampLabel,
   reference,
   logoDataUri,
+  isFreeTier,
 }) {
-  let y = 50;
+  let y = 80;
   let svgContent = '';
 
   // 1. Logo (Circular Mask)
   if (logoDataUri) {
     svgContent += `
       <clipPath id="logoClip">
-        <circle cx="${CARD_WIDTH / 2}" cy="${y + 45}" r="45" />
+        <circle cx="${CARD_WIDTH / 2}" cy="${y + 75}" r="75" />
       </clipPath>
-      <image href="${logoDataUri}" x="${CARD_WIDTH / 2 - 45}" y="${y}" width="90" height="90" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice" />
+      <image href="${logoDataUri}" x="${CARD_WIDTH / 2 - 75}" y="${y}" width="150" height="150" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice" />
     `;
-    y += 110;
+    y += 180;
   } else {
-    y += 20; // Extra breathing room if no logo is present
+    y += 40; // Breathing room if no logo
   }
 
-  // 2. Business Name
-  y += 40;
-  svgContent += `<text x="${CARD_WIDTH / 2}" y="${y}" class="bizname" text-anchor="middle">${escapeXml(businessName || 'Merchant')}</text>`;
-  y += 40;
+  // 2. Business Name (Agrandir, Wrapping)
+  y += 60;
+  const bizNameLines = splitTextIntoLines(businessName || 'Merchant', 26);
+  bizNameLines.forEach(line => {
+    svgContent += `<text x="${CARD_WIDTH / 2}" y="${y}" class="bizname" text-anchor="middle">${escapeXml(line)}</text>`;
+    y += 75;
+  });
+  y += 10;
 
   // 3. Dashed line
   svgContent += `<line x1="${PADDING}" y1="${y}" x2="${CARD_WIDTH - PADDING}" y2="${y}" class="dash" />`;
-  y += 35;
+  y += 50;
 
-  // 4. Meta Info (2 Columns)
-  const custName = counterpartyName ? counterpartyName.substring(0, 16) : 'Walk-in';
-  const lblStr = entryTypeLabel.substring(0, 18);
+  // 4. Meta Info (2 Columns, Fira Code)
+  svgContent += `<text x="${PADDING}" y="${y}" class="meta-label">DATE: <tspan class="meta-value">${escapeXml(timestampLabel)}</tspan></text>`;
+  svgContent += `<text x="${CARD_WIDTH / 2}" y="${y}" class="meta-label">LABEL: <tspan class="meta-value">${escapeXml(entryTypeLabel)}</tspan></text>`;
+  y += 45;
 
-  svgContent += `
-    <text x="${PADDING}" y="${y}" class="meta-label">DATE:</text>
-    <text x="${PADDING + 60}" y="${y}" class="meta-value">${escapeXml(timestampLabel)}</text>
-    <text x="${CARD_WIDTH / 2}" y="${y}" class="meta-label">LABEL:</text>
-    <text x="${CARD_WIDTH / 2 + 75}" y="${y}" class="meta-value">${escapeXml(lblStr)}</text>
-  `;
-  y += 30;
-
-  svgContent += `
-    <text x="${PADDING}" y="${y}" class="meta-label">REF:</text>
-    <text x="${PADDING + 50}" y="${y}" class="meta-value">${escapeXml(reference)}</text>
-    <text x="${CARD_WIDTH / 2}" y="${y}" class="meta-label">CUSTOMER:</text>
-    <text x="${CARD_WIDTH / 2 + 105}" y="${y}" class="meta-value">${escapeXml(custName)}</text>
-  `;
-  y += 35;
+  svgContent += `<text x="${PADDING}" y="${y}" class="meta-label">REF: <tspan class="meta-value">${escapeXml(reference)}</tspan></text>`;
+  
+  const custLines = splitTextIntoLines(counterpartyName || 'Walk-in', 22);
+  svgContent += `<text x="${CARD_WIDTH / 2}" y="${y}" class="meta-label">CUSTOMER: <tspan class="meta-value">${escapeXml(custLines[0])}</tspan></text>`;
+  y += 45;
+  
+  // Wrap customer name if it's too long
+  for (let i = 1; i < custLines.length; i++) {
+      svgContent += `<text x="${CARD_WIDTH / 2 + 160}" y="${y}" class="meta-value">${escapeXml(custLines[i])}</text>`;
+      y += 45;
+  }
+  y += 15;
 
   // 5. Dashed line
   svgContent += `<line x1="${PADDING}" y1="${y}" x2="${CARD_WIDTH - PADDING}" y2="${y}" class="dash" />`;
-  y += 45;
+  y += 65;
 
-  // 6. Items
+  // 6. Items (Fira Code)
   if (items && items.length > 0) {
     items.forEach((it) => {
       const unitStr = it.unit && it.unit !== 'units' ? ` ${it.unit}` : '';
       const itemName = `${it.name.charAt(0).toUpperCase()}${it.name.slice(1)} x${it.quantity}${unitStr}`;
-      svgContent += `<text x="${PADDING}" y="${y}" class="item">${escapeXml(itemName.substring(0, 35))}</text>`;
-      y += 40;
+      
+      // Calculate if we need to wrap the item name
+      // Leaving ~250px on the right for potential price string
+      const nameLines = splitTextIntoLines(itemName, 38); 
+      
+      svgContent += `<text x="${PADDING}" y="${y}" class="item">${escapeXml(nameLines[0])}</text>`;
+      
+      // If item has a specific total_kobo mapped, render it on the right
+      if (it.total_kobo) {
+        svgContent += `<text x="${CARD_WIDTH - PADDING}" y="${y}" class="item" text-anchor="end">${escapeXml(formatNaira(it.total_kobo))}</text>`;
+      }
+      y += 50;
+
+      for (let i = 1; i < nameLines.length; i++) {
+          svgContent += `<text x="${PADDING}" y="${y}" class="item">${escapeXml(nameLines[i])}</text>`;
+          y += 50;
+      }
+      y += 15;
     });
   } else if (description) {
-      svgContent += `<text x="${PADDING}" y="${y}" class="item">${escapeXml(description.substring(0, 35))}</text>`;
-      y += 40;
+      const descLines = splitTextIntoLines(description, 50);
+      descLines.forEach(line => {
+        svgContent += `<text x="${PADDING}" y="${y}" class="item">${escapeXml(line)}</text>`;
+        y += 50;
+      });
+      y += 15;
   } else {
       svgContent += `<text x="${PADDING}" y="${y}" class="item">General Transaction</text>`;
-      y += 40;
+      y += 65;
   }
 
   // 7. Dashed line
   y += 5;
   svgContent += `<line x1="${PADDING}" y1="${y}" x2="${CARD_WIDTH - PADDING}" y2="${y}" class="dash" />`;
-  y += 45;
+  y += 75;
 
-  // 8. Totals
+  // 8. Totals (Fira Code Bold)
   svgContent += `
     <text x="${PADDING}" y="${y}" class="total-label">TOTAL</text>
     <text x="${CARD_WIDTH - PADDING}" y="${y}" class="total-val" text-anchor="end">${escapeXml(totalLabel)}</text>
   `;
-  y += 40;
+  y += 60;
 
   svgContent += `
     <text x="${PADDING}" y="${y}" class="paid-label">PAID</text>
     <text x="${CARD_WIDTH - PADDING}" y="${y}" class="paid-val" text-anchor="end">${escapeXml(paidLabel)}</text>
   `;
-  y += 40;
+  y += 60;
 
   if (balanceLabel) {
     svgContent += `
       <text x="${PADDING}" y="${y}" class="out-label">OUTSTANDING</text>
       <text x="${CARD_WIDTH - PADDING}" y="${y}" class="out-val" text-anchor="end">${escapeXml(balanceLabel)}</text>
     `;
-    y += 40;
+    y += 60;
   }
 
   // 9. Footer
-  y += 30;
+  y += 50;
   svgContent += `
-    <line x1="${PADDING}" y1="${y-6}" x2="${CARD_WIDTH/2 - 110}" y2="${y-6}" class="dash" />
-    <text x="${CARD_WIDTH / 2}" y="${y}" class="footer" text-anchor="middle">Powered by Kika AI</text>
-    <line x1="${CARD_WIDTH/2 + 110}" y1="${y-6}" x2="${CARD_WIDTH - PADDING}" y2="${y-6}" class="dash" />
+    <line x1="${PADDING}" y1="${y-8}" x2="${CARD_WIDTH/2 - 200}" y2="${y-8}" class="dash" />
+    <text x="${CARD_WIDTH / 2}" y="${y}" class="footer" text-anchor="middle">Generated securely by Kika AI</text>
+    <line x1="${CARD_WIDTH/2 + 200}" y1="${y-8}" x2="${CARD_WIDTH - PADDING}" y2="${y-8}" class="dash" />
   `;
-  y += 40; // Final padding bottom
+  y += 80; // Final padding bottom ensures no awkward empty space
 
   const height = y;
+
+  // Watermark for free tier
+  const watermarkSvg = isFreeTier ? `
+    <g transform="rotate(-30, ${CARD_WIDTH / 2}, ${height / 2})" opacity="0.04" fill="${THEME.textPrimary}" font-family="'Agrandir', 'Helvetica Neue', sans-serif" font-weight="900" text-anchor="middle">
+        <text x="${CARD_WIDTH / 2}" y="${height / 2 - 80}" font-size="280">KIKA</text>
+        <text x="${CARD_WIDTH / 2}" y="${height / 2 + 160}" font-size="220">AI</text>
+    </g>
+  ` : '';
 
   return `
 <svg width="${CARD_WIDTH}" height="${height}" viewBox="0 0 ${CARD_WIDTH} ${height}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <style>
-      .bizname { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 44px; font-weight: 700; letter-spacing: -1.5px; }
-      .meta-label { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPrimary}; font-size: 18px; font-weight: 600; }
-      .meta-value { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPrimary}; font-size: 18px; }
-      .item { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPrimary}; font-size: 24px; }
+      @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&amp;display=swap');
       
-      .total-label { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 800; }
-      .total-val { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 700; }
+      .bizname { font-family: 'Agrandir', 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 64px; font-weight: 700; letter-spacing: -2px; }
       
-      .paid-label { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: ${THEME.textPaid}; font-size: 26px; font-weight: 800; }
-      .paid-val { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPaid}; font-size: 26px; font-weight: 700; }
+      .meta-label { font-family: 'Fira Code', 'Courier New', monospace; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 600; }
+      .meta-value { font-family: 'Fira Code', 'Courier New', monospace; fill: ${THEME.textPrimary}; font-size: 26px; font-weight: 400; }
       
-      .out-label { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: ${THEME.textOutstanding}; font-size: 26px; font-weight: 800; }
-      .out-val { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textOutstanding}; font-size: 26px; font-weight: 700; }
+      .item { font-family: 'Fira Code', 'Courier New', monospace; fill: ${THEME.textPrimary}; font-size: 34px; font-weight: 500; }
       
-      .dash { stroke: ${THEME.textPrimary}; stroke-width: 1.5; stroke-dasharray: 6,6; }
-      .footer { font-family: 'Courier New', Courier, monospace; fill: ${THEME.textPrimary}; font-size: 18px; }
+      .total-label { font-family: 'Fira Code', monospace; fill: ${THEME.textPrimary}; font-size: 42px; font-weight: 800; }
+      .total-val { font-family: 'Fira Code', monospace; fill: ${THEME.textPrimary}; font-size: 42px; font-weight: 700; }
+      
+      .paid-label { font-family: 'Fira Code', monospace; fill: ${THEME.textPaid}; font-size: 42px; font-weight: 800; }
+      .paid-val { font-family: 'Fira Code', monospace; fill: ${THEME.textPaid}; font-size: 42px; font-weight: 700; }
+      
+      .out-label { font-family: 'Fira Code', monospace; fill: ${THEME.textOutstanding}; font-size: 42px; font-weight: 800; }
+      .out-val { font-family: 'Fira Code', monospace; fill: ${THEME.textOutstanding}; font-size: 42px; font-weight: 700; }
+      
+      .dash { stroke: ${THEME.textPrimary}; stroke-width: 2.5; stroke-dasharray: 10,10; }
+      .footer { font-family: 'Fira Code', monospace; fill: ${THEME.textPrimary}; font-size: 24px; }
     </style>
   </defs>
   <rect x="0" y="0" width="${CARD_WIDTH}" height="${height}" fill="${THEME.background}" />
+  ${watermarkSvg}
   ${svgContent}
 </svg>`.trim();
 }
 
+// Shortened Entry Type Labels based on user request
 const ENTRY_TYPE_LABELS = {
-  CREDIT: 'Sale Recorded',
-  DEBIT: 'Expense Recorded',
-  DEBT: 'Credit Sale (Debt)',
+  CREDIT: 'Sale',
+  DEBIT: 'Expense',
+  DEBT: 'Credit Sale',
   DEBT_SETTLEMENT: 'Debt Payment',
 };
 
@@ -445,6 +501,9 @@ async function generateReceipt({ merchant, ledgerEntry }) {
   await fs.mkdir(storageDir, { recursive: true });
 
   const logoDataUri = await loadLogoDataUri(merchant.logo_file_path);
+  
+  // Assume free tier if not explicitly marked premium or on a paid plan
+  const isFreeTier = !(merchant.is_premium === true || merchant.subscription_plan === 'PREMIUM');
 
   const svg = buildReceiptSvg({
     businessName: merchant.business_name || merchant.display_name,
@@ -466,6 +525,7 @@ async function generateReceipt({ merchant, ledgerEntry }) {
     }),
     reference: ledgerEntry.id.slice(0, 8).toUpperCase(),
     logoDataUri,
+    isFreeTier,
   });
 
   const publicToken = crypto.randomBytes(24).toString('hex');
