@@ -245,7 +245,7 @@ const queries = require('../db/queries');
 const logger = require('../utils/logger');
 
 // Theme matches the light, minimal receipt template provided
-const THEME = {
+const THEME = 
   background: '#FFFFFF',
   textPrimary: '#262A56',     // Deep Navy Blue for text and dashed lines
   textPaid: '#10B981',        // Emerald Green for paid amounts
@@ -253,6 +253,7 @@ const THEME = {
 };
 
 const CARD_WIDTH = 1080;
+const MIN_CARD_HEIGHT = 1350;
 const PADDING = 80;
 
 function escapeXml(unsafe) {
@@ -304,6 +305,7 @@ function buildReceiptSvg({
   timestampLabel,
   reference,
   logoDataUri,
+  kikaLogoDataUri,
   isFreeTier,
 }) {
   let y = 80;
@@ -428,15 +430,23 @@ function buildReceiptSvg({
   `;
   y += 80; // Final padding bottom ensures no awkward empty space
 
-  const height = y;
+  const height = Math.max(MIN_CARD_HEIGHT, y);
 
-  // Watermark for free tier
-  const watermarkSvg = isFreeTier ? `
-    <g transform="rotate(-30, ${CARD_WIDTH / 2}, ${height / 2})" opacity="0.04" fill="${THEME.textPrimary}" font-family="'Agrandir', 'Helvetica Neue', sans-serif" font-weight="900" text-anchor="middle">
-        <text x="${CARD_WIDTH / 2}" y="${height / 2 - 80}" font-size="280">KIKA</text>
-        <text x="${CARD_WIDTH / 2}" y="${height / 2 + 160}" font-size="220">AI</text>
-    </g>
-  ` : '';
+  // Watermark for free tier using the Kika logo image
+  let watermarkSvg = '';
+  if (isFreeTier && kikaLogoDataUri) {
+      // Scale and position the logo in the center of the receipt
+      const watermarkWidth = 600;
+      const watermarkHeight = 600;
+      const watermarkX = (CARD_WIDTH - watermarkWidth) / 2;
+      const watermarkY = (height - watermarkHeight) / 2;
+      
+      watermarkSvg = `
+        <g opacity="0.05" transform="rotate(-30, ${CARD_WIDTH / 2}, ${height / 2})">
+          <image href="${kikaLogoDataUri}" x="${watermarkX}" y="${watermarkY}" width="${watermarkWidth}" height="${watermarkHeight}" preserveAspectRatio="xMidYMid meet" />
+        </g>
+      `;
+  }
 
   return `
 <svg width="${CARD_WIDTH}" height="${height}" viewBox="0 0 ${CARD_WIDTH} ${height}" xmlns="http://www.w3.org/2000/svg">
@@ -479,16 +489,47 @@ const ENTRY_TYPE_LABELS = {
 };
 
 /**
- * Reads a merchant's logo file (if set) and returns it as a data: URI
+ * Reads an image file and returns it as a data: URI.
+ * Handles removing the background via sharp for PNG/JPEG formats if requested.
  */
-async function loadLogoDataUri(logoFilePath) {
-  if (!logoFilePath) return null;
+async function loadImageAsDataUri(filePath, removeBackground = false) {
+  if (!filePath) return null;
   try {
-    const buffer = await fs.readFile(logoFilePath);
-    const mimeType = logoFilePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    let buffer = await fs.readFile(filePath);
+    let mimeType = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    
+    // If we need to remove the background (make white pixels transparent)
+    // This is a basic background removal, assuming a mostly white background like the logo provided.
+    if (removeBackground) {
+        buffer = await sharp(buffer)
+            .ensureAlpha()
+            // Make near-white pixels transparent (tolerance can be adjusted)
+            .raw()
+            .toBuffer({ resolveWithObject: true })
+            .then(({ data, info }) => {
+                for (let i = 0; i < data.length; i += info.channels) {
+                    const r = data[i];
+                    const g = data[i + 1];
+                    const b = data[i + 2];
+                    // If pixel is very close to white, set alpha to 0
+                    if (r > 240 && g > 240 && b > 240) {
+                        data[i + 3] = 0;
+                    }
+                }
+                return sharp(data, {
+                    raw: {
+                        width: info.width,
+                        height: info.height,
+                        channels: info.channels
+                    }
+                }).png().toBuffer();
+            });
+        mimeType = 'image/png'; // Ensure it's treated as a PNG since it now has alpha
+    }
+
     return `data:${mimeType};base64,${buffer.toString('base64')}`;
   } catch (err) {
-    logger.warn({ err: err.message, logoFilePath }, 'Could not load merchant logo, rendering receipt without it');
+    logger.warn({ err: err.message, filePath }, 'Could not load image, returning null');
     return null;
   }
 }
@@ -500,10 +541,16 @@ async function generateReceipt({ merchant, ledgerEntry }) {
   const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
 
-  const logoDataUri = await loadLogoDataUri(merchant.logo_file_path);
+  const logoDataUri = await loadImageAsDataUri(merchant.logo_file_path);
   
   // Assume free tier if not explicitly marked premium or on a paid plan
   const isFreeTier = !(merchant.is_premium === true || merchant.subscription_plan === 'PREMIUM');
+  
+  // Load the Kika logo for the watermark (assuming it's stored locally)
+  // In a real scenario, this path would point to the actual Kika logo file in your assets directory.
+  // For this implementation, we attempt to load it, and apply the background removal logic.
+  const kikaLogoPath = process.env.KIKA_LOGO_PATH || path.join(process.cwd(), 'assets', 'kika-logo.png');
+  const kikaLogoDataUri = isFreeTier ? await loadImageAsDataUri(kikaLogoPath, true) : null;
 
   const svg = buildReceiptSvg({
     businessName: merchant.business_name || merchant.display_name,
@@ -525,6 +572,7 @@ async function generateReceipt({ merchant, ledgerEntry }) {
     }),
     reference: ledgerEntry.id.slice(0, 8).toUpperCase(),
     logoDataUri,
+    kikaLogoDataUri,
     isFreeTier,
   });
 
