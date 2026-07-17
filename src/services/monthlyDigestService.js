@@ -8,21 +8,34 @@ const { v4: uuidv4 } = require('uuid');
 const queries = require('../db/queries');
 const logger = require('../utils/logger');
 
-// Same base palette as receipts, plus a coral brand accent for this
-// card's icon badge and header — matching the product's Monthly Digest UI.
+// -------------------------------------------------------------------
+// Theme – dark background, coral accent (matches the existing UI)
+// -------------------------------------------------------------------
 const THEME = {
-  background: '#0B0F19',
-  cardBg: '#161B26',
-  accent: '#10B981',
-  mint: '#34D399',
-  coral: '#F0655A',
-  amber: '#FBBF24',
-  textPrimary: '#F9FAFB',
-  textMuted: '#9CA3AF',
+  background: '#0B0F19',   // page background
+  cardBg: '#161B26',        // inner card background
+  accent: '#10B981',        // mint accent (growth arrows)
+  mint: '#34D399',          // same as accent – kept for compatibility
+  coral: '#F0655A',         // brand accent for header badge & link
+  amber: '#FBBF24',         // amber for “Top Debtor” label
+  textPrimary: '#F9FAFB',   // main text
+  textMuted: '#9CA3AF',     // secondary/placeholder text
 };
 
-const CARD_WIDTH = 720;
+// -------------------------------------------------------------------
+// Dashboard URL – the full‑report page you supplied.
+// -------------------------------------------------------------------
+const DASHBOARD_URL = 'https://khhugmmuuu7w4.kimi.page';
 
+// -------------------------------------------------------------------
+// SVG dimensions – a little slimmer for chat embeds.
+// -------------------------------------------------------------------
+const CARD_WIDTH = 720;
+const CARD_HEIGHT = 700;
+
+// -------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------
 function escapeXml(unsafe) {
   return String(unsafe)
     .replace(/&/g, '&amp;')
@@ -32,115 +45,197 @@ function escapeXml(unsafe) {
     .replace(/'/g, '&apos;');
 }
 
+// Format a Naira amount (kobo → Naira) with the ₦ symbol.
 function formatNaira(kobo) {
   const naira = Number(kobo) / 100;
   return `\u20a6${Math.round(naira).toLocaleString('en-NG')}`;
 }
 
-/**
- * Builds the Monthly Digest SVG: a coral "Monthly Digest" header badge,
- * a Money Inflow stat card with a growth-vs-last-month line, an
- * Outstanding Credit stat card, and a two-column Trade Days / Top Debtor
- * row — matching the product's WhatsApp digest card.
- */
-function buildDigestSvg({ moneyInflowLabel, growthLabel, outstandingLabel, tradeDays, topDebtorName, topDebtorLabel }) {
-  const height = 700;
-
+// -------------------------------------------------------------------
+// Build the SVG for the Monthly Digest.
+// -------------------------------------------------------------------
+function buildDigestSvg({
+  merchantName,
+  monthYear,
+  moneyInflowLabel,
+  growthLabel,
+  outstandingLabel,
+  tradeDays,
+  topDebtorName,
+  topDebtorLabel,
+  reportUrl,
+}) {
+  // The <a> element makes the whole “View Full Report” text clickable.
+  // SVG 1.1 supports <a href="…"> – most chat clients render it as a link.
   return `
-<svg width="${CARD_WIDTH}" height="${height}" viewBox="0 0 ${CARD_WIDTH} ${height}" xmlns="http://www.w3.org/2000/svg">
+<svg width="${CARD_WIDTH}" height="${CARD_HEIGHT}" viewBox="0 0 ${CARD_WIDTH} ${CARD_HEIGHT}"
+     xmlns="http://www.w3.org/2000/svg">
   <defs>
     <style>
-      .badge-label { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 30px; font-weight: 700; }
-      .badge-sub   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
-      .stat-label  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 22px; }
-      .stat-value  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 42px; font-weight: 700; }
-      .stat-growth { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 22px; font-weight: 600; }
-      .mini-label  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
-      .mini-value  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 28px; font-weight: 700; }
-      .mini-amber  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.amber}; font-size: 24px; font-weight: 700; }
-      .footer-muted{ font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
-      .footer-link { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.coral}; font-size: 20px; font-weight: 600; }
+      .badge-label   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 30px; font-weight: 700; }
+      .badge-sub     { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
+      .stat-label    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 22px; }
+      .stat-value    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 42px; font-weight: 700; }
+      .stat-growth   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.mint}; font-size: 22px; font-weight: 600; }
+      .mini-label    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
+      .mini-value    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textPrimary}; font-size: 28px; font-weight: 700; }
+      .mini-amber    { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.amber}; font-size: 24px; font-weight: 700; }
+      .footer-link   { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.coral}; font-size: 20px; font-weight: 600; cursor: pointer; }
+      .footer-muted  { font-family: 'Helvetica Neue', Arial, sans-serif; fill: ${THEME.textMuted}; font-size: 20px; }
     </style>
   </defs>
 
-  <rect x="0" y="0" width="${CARD_WIDTH}" height="${height}" fill="${THEME.background}" rx="24" />
+  <!-- Page background -->
+  <rect width="${CARD_WIDTH}" height="${CARD_HEIGHT}" fill="${THEME.background}" rx="24"/>
 
-  <!-- header badge -->
-  <circle cx="76" cy="90" r="34" fill="${THEME.coral}" />
-  <rect x="62" y="80" width="6" height="20" fill="${THEME.background}" rx="2" />
-  <rect x="73" y="72" width="6" height="28" fill="${THEME.background}" rx="2" />
-  <rect x="84" y="78" width="6" height="22" fill="${THEME.background}" rx="2" />
+  <!-- Header badge -->
+  <circle cx="76" cy="90" r="34" fill="${THEME.coral}"/>
+  <rect x="62" y="80" width="6" height="20" fill="${THEME.background}" rx="2"/>
+  <rect x="73" y="72" width="6" height="28" fill="${THEME.background}" rx="2"/>
+  <rect x="84" y="78" width="6" height="22" fill="${THEME.background}" rx="2"/>
   <text x="126" y="82" class="badge-label">Monthly Digest</text>
   <text x="126" y="110" class="badge-sub">Powered by Kika AI</text>
 
-  <line x1="40" y1="150" x2="${CARD_WIDTH - 40}" y2="150" stroke="${THEME.textMuted}" stroke-opacity="0.2" stroke-width="1" />
+  <line x1="40" y1="150" x2="${CARD_WIDTH - 40}" y2="150"
+        stroke="${THEME.textMuted}" stroke-opacity="0.2" stroke-width="1"/>
 
   <!-- Money Inflow card -->
-  <rect x="40" y="180" width="${CARD_WIDTH - 80}" height="150" rx="16" fill="${THEME.cardBg}" />
-  <path d="M64 218 l14 -14 l14 14 M78 205 v22" stroke="${THEME.mint}" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(0,-2)" />
+  <rect x="40" y="180" width="${CARD_WIDTH - 80}" height="150"
+        rx="16" fill="${THEME.cardBg}"/>
+  <path d="M64 218 l14 -14 l14 14 M78 205 v22"
+        stroke="${THEME.mint}" stroke-width="3" fill="none"
+        stroke-linecap="round" stroke-linejoin="round" transform="translate(0,-2)"/>
   <text x="100" y="222" class="stat-label">Money Inflow</text>
   <text x="64" y="278" class="stat-value">${escapeXml(moneyInflowLabel)}</text>
   <text x="64" y="312" class="stat-growth">${escapeXml(growthLabel)}</text>
 
   <!-- Outstanding Credit card -->
-  <rect x="40" y="350" width="${CARD_WIDTH - 80}" height="130" rx="16" fill="${THEME.cardBg}" />
-  <path d="M64 378 l14 14 l14 -14 M78 405 v-22" stroke="${THEME.coral}" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(0,-8)" />
+  <rect x="40" y="350" width="${CARD_WIDTH - 80}" height="130"
+        rx="16" fill="${THEME.cardBg}"/>
+  <path d="M64 378 l14 14 l14 -14 M78 405 v-22"
+        stroke="${THEME.coral}" stroke-width="3" fill="none"
+        stroke-linecap="round" stroke-linejoin="round" transform="translate(0,-8)"/>
   <text x="100" y="392" class="stat-label">Outstanding Credit</text>
   <text x="64" y="448" class="stat-value">${escapeXml(outstandingLabel)}</text>
 
-  <!-- Trade Days / Top Debtor mini cards -->
-  <rect x="40" y="500" width="300" height="140" rx="16" fill="${THEME.cardBg}" />
+  <!-- Trade Days mini card -->
+  <rect x="40" y="500" width="300" height="140" rx="16" fill="${THEME.cardBg}"/>
   <text x="64" y="536" class="mini-label">\ud83d\udcc5 Trade Days</text>
   <text x="64" y="596" class="mini-value">${tradeDays}</text>
 
-  <rect x="360" y="500" width="${CARD_WIDTH - 400}" height="140" rx="16" fill="${THEME.cardBg}" />
+  <!-- Top Debtor mini card -->
+  <rect x="360" y="500" width="${CARD_WIDTH - 400}" height="140" rx="16" fill="${THEME.cardBg}"/>
   <text x="384" y="536" class="mini-label">\ud83d\udc64 Top Debtor</text>
   <text x="384" y="580" class="mini-value">${escapeXml(topDebtorName || '\u2014')}</text>
   <text x="384" y="612" class="mini-amber">${escapeXml(topDebtorLabel)}</text>
 
-  <line x1="40" y1="660" x2="${CARD_WIDTH - 40}" y2="660" stroke="${THEME.textMuted}" stroke-opacity="0.2" stroke-width="1" />
-  <text x="40" y="${height - 20}" class="footer-muted">Generated by AI</text>
-  <text x="${CARD_WIDTH - 40}" y="${height - 20}" class="footer-link" text-anchor="end">View Full Report &#8250;</text>
+  <line x1="40" y1="660" x2="${CARD_WIDTH - 40}" y2="660"
+        stroke="${THEME.textMuted}" stroke-opacity="0.2" stroke-width="1"/>
+
+  <!-- Footer – clickable link -->
+  <text x="40" y="${CARD_HEIGHT - 20}" class="footer-muted">Generated by AI</text>
+  <a href="${reportUrl}" target="_blank" rel="noopener">
+    <text x="${CARD_WIDTH - 40}" y="${CARD_HEIGHT - 20}"
+          class="footer-link" text-anchor="end">View Full Report &#8250;</text>
+  </a>
 </svg>`.trim();
 }
 
-/**
- * Renders the Monthly Digest PNG for a merchant/period and returns a
- * safe, unguessable, expiring URL — the same security model as receipts.
- */
-async function generateDigestCard({ merchant, periodKey, moneyInflowKobo, growthPct, outstandingKobo, tradeDays, topDebtor }) {
-  const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
+// -------------------------------------------------------------------
+// Generate the PNG + HTML snippet for a merchant/period.
+// -------------------------------------------------------------------
+async function generateDigestCard({
+  merchant,
+  periodKey,
+  moneyInflowKobo,
+  growthPct,
+  outstandingKobo,
+  tradeDays,
+  topDebtor,
+}) {
+  // -----------------------------------------------------------------
+  // 1️⃣  Prepare storage folder (public/receipts) – same as receipts.
+  // -----------------------------------------------------------------
+  const storageDir = process.env.RECEIPT_STORAGE_DIR ||
+    path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
 
-  const growthLabel =
-    growthPct == null ? 'No prior month to compare' : `${growthPct >= 0 ? '+' : ''}${growthPct.toFixed(0)}% vs last month`;
+  // -----------------------------------------------------------------
+  // 2️⃣  Build human‑readable labels.
+  // -----------------------------------------------------------------
+  const growthLabel = growthPct == null
+    ? 'No prior month to compare'
+    : `${growthPct >= 0 ? '+' : ''}${growthPct.toFixed(0)}% vs last month`;
+
+  // -----------------------------------------------------------------
+  // 3️⃣  Build the SVG – note the `reportUrl` includes query params so the
+  //     dashboard can know which merchant/period to display.
+  // -----------------------------------------------------------------
+  const reportUrl = `${DASHBOARD_URL}?merchant=${merchant.id}&period=${periodKey}`;
 
   const svg = buildDigestSvg({
+    merchantName: merchant.name,
+    monthYear: periodKey, // e.g. "2024-07"
     moneyInflowLabel: formatNaira(moneyInflowKobo),
     growthLabel,
     outstandingLabel: formatNaira(outstandingKobo),
     tradeDays,
-    topDebtorName: topDebtor?.counterparty_name || null,
+    topDebtorName: topDebtor?.counterparty_name,
     topDebtorLabel: topDebtor ? formatNaira(topDebtor.balance_kobo) : '\u20a60',
+    reportUrl,
   });
 
+  // -----------------------------------------------------------------
+  // 4️⃣  Convert SVG → PNG (Sharp) and store it with a random public token.
+  // -----------------------------------------------------------------
   const publicToken = crypto.randomBytes(24).toString('hex');
   const fileName = `${uuidv4()}.png`;
   const filePath = path.join(storageDir, fileName);
-
   await sharp(Buffer.from(svg)).png({ quality: 92 }).toFile(filePath);
 
+  // -----------------------------------------------------------------
+  // 5️⃣  Persist the card metadata (same model you already have for receipts).
+  // -----------------------------------------------------------------
   const ttlHours = Number(process.env.RECEIPT_URL_TTL_HOURS || 72);
   const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
+  await queries.createDigestCard({
+    merchantId: merchant.id,
+    periodKey,
+    filePath,
+    publicToken,
+    expiresAt,
+  });
 
-  await queries.createDigestCard({ merchantId: merchant.id, periodKey, filePath, publicToken, expiresAt });
-
+  // -----------------------------------------------------------------
+  // 6️⃣  Build the public URL that the chat client will load.
+  // -----------------------------------------------------------------
   const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-  const safeUrl = `${baseUrl}/api/v1/digest-cards/${publicToken}.png`;
+  const pngUrl = `${baseUrl}/api/v1/digest-cards/${publicToken}.png`;
 
+  // -----------------------------------------------------------------
+  // 7️⃣  Build an **HTML snippet** that can be posted directly into a chat.
+  //     The snippet contains the PNG image and a styled button that also
+  //     points to the full‑report dashboard.
+  // -----------------------------------------------------------------
+  const htmlSnippet = `
+<div style="font-family:Inter,sans-serif;max-width:720px;background:${THEME.background};color:${THEME.textPrimary};padding:16px;border-radius:12px;">
+  <img src="${pngUrl}" alt="Monthly Digest" style="width:100%;border-radius:8px;">
+  <div style="margin-top:12px;text-align:center;">
+    <a href="${reportUrl}" target="_blank" rel="noopener"
+       style="display:inline-block;background:${THEME.coral};color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;">
+      View Full Report
+    </a>
+  </div>
+</div>`.trim();
+
+  // -----------------------------------------------------------------
+  // 8️⃣  Log & return both the PNG URL and the HTML snippet.
+  // -----------------------------------------------------------------
   logger.info({ merchantId: merchant.id, periodKey }, 'Monthly digest card generated');
-
-  return { url: safeUrl, expiresAt };
+  return { url: pngUrl, expiresAt, html: htmlSnippet };
 }
 
+// -------------------------------------------------------------------
+// Exported helpers – keep the original `formatNaira` for external use.
+// -------------------------------------------------------------------
 module.exports = { generateDigestCard, formatNaira };
