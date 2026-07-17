@@ -31,4 +31,24 @@ router.get(
   })
 );
 
+// Example route – src/routes/digest.js
+router.get('/:merchantId/:periodKey', async (req, res) => {
+  const { merchantId, periodKey } = req.params;
+  const merchant = await queries.getMerchantById(merchantId); // your DB call
+  const stats   = await queries.getMonthlyStats(merchantId, periodKey); // your DB call
+
+  const { url, html, expiresAt } = await generateDigestCard({
+    merchant,
+    periodKey,
+    moneyInflowKobo: stats.moneyInflowKobo,
+    growthPct: stats.growthPct,
+    outstandingKobo: stats.outstandingKobo,
+    tradeDays: stats.tradeDays,
+    topDebtor: stats.topDebtor,
+  });
+
+  // Example for a chat platform that expects `{html: "..."}`
+  res.json({ type: 'rich', html });
+});
+
 module.exports = router;

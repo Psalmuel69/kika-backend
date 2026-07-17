@@ -2,7 +2,7 @@
 
 const { pool } = require('../config/db');
 const queries = require('../db/queries');
-const { generateReceipt, formatNaira } = require('./receiptService');
+const { generateReceipt, formatNaira } = require('./receiptService__');
 const loyaltyService = require('./loyaltyService');
 const logger = require('../utils/logger');
 
