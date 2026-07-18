@@ -359,7 +359,13 @@ async function getLedgerEntryByWhatsappMessageId(merchantId, whatsappMessageId) 
 async function settleOutstandingDebtForCounterparty(client, merchantId, counterpartyName, amountKobo) {
   // Lock the customer's rolling-balance row first — see lockCustomerBalance
   // for why this is what actually prevents lost updates under concurrency.
-  await lockCustomerBalance(client, merchantId, counterpartyName);
+  // Its return value is the transaction-visible row (fetched via `client`,
+  // not the plain pool) — reused below instead of a second lookup, since
+  // a lookup via the plain pool can't see this row if it was JUST
+  // inserted by lockCustomerBalance and this transaction hasn't
+  // committed yet (that mismatch used to crash this function whenever a
+  // payment came in with nothing left open to apply it to).
+  const lockedBalanceRow = await lockCustomerBalance(client, merchantId, counterpartyName);
 
   let remaining = amountKobo;
   const { rows: openDebts } = await client.query(
@@ -389,7 +395,7 @@ async function settleOutstandingDebtForCounterparty(client, merchantId, counterp
   const updatedBalance =
     appliedTotalKobo > 0
       ? await applyCustomerBalanceDelta(client, merchantId, counterpartyName, -appliedTotalKobo)
-      : await getCustomerBalance(merchantId, counterpartyName);
+      : lockedBalanceRow;
 
   return { settled, unallocatedKobo: remaining, appliedTotalKobo, rollingBalanceKobo: Number(updatedBalance.rolling_balance_kobo) };
 }

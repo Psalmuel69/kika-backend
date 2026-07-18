@@ -105,7 +105,7 @@ async function buildReportSnapshot({ merchant, periodKey, monthStart, monthEnd, 
 
   return {
     periodKey,
-    businessName: merchant.business_name || merchant.display_name || 'Merchant',
+    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name || 'Merchant',
     totalRevenueKobo,
     growthPct,
     totalOutstandingKobo,

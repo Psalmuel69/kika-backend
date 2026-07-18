@@ -136,6 +136,31 @@ function formatItemLabel(item) {
 }
 
 /**
+ * When there's no structured {name, quantity, unit} item (the common
+ * case — see the comment in generateReceipt), the entry's own
+ * `description` is used as the item line instead. For a regex-parsed
+ * entry that description is the raw merchant message verbatim (e.g.
+ * "sold rice 5000"), which reads oddly sitting next to its own price
+ * ("sold rice 5000 — ₦5,000"). This strips the leading transaction verb
+ * and the trailing amount (already shown in the price column) so it
+ * reads as a normal item name ("Rice"). AI-parsed / invoice descriptions
+ * are already clean prose ("Fuel purchase") and pass through unchanged
+ * — the strips below are no-ops on text that doesn't match them.
+ */
+const DESCRIPTION_LEADING_VERB_RE =
+  /^(sold|bought|buy|sell|selling|sale of|purchase of|paid for|spent on|gave|received)\s+/i;
+const DESCRIPTION_TRAILING_AMOUNT_RE = /\s*(?:\u20a6|ngn)?\s*[\d][\d,.]*\s*(?:k|m)?\.?\s*$/i;
+
+function cleanDescriptionForDisplay(description) {
+  let text = String(description || '').trim();
+  text = text.replace(DESCRIPTION_LEADING_VERB_RE, '');
+  text = text.replace(DESCRIPTION_TRAILING_AMOUNT_RE, '');
+  text = text.trim();
+  if (!text) return 'Transaction';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/**
  * Very cheap width estimator (no headless canvas / font-metrics library
  * available in this environment). Fira Code is monospace, so per-glyph
  * width is a fixed fraction of font-size and this estimate is exact.
@@ -606,15 +631,46 @@ async function generateReceipt({ merchant, ledgerEntry }) {
   const logoDataUri = await loadDataUri(merchant.logo_file_path);
   const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
 
-  const items = (ledgerEntry.items || []).map((it) => ({
-    ...it,
-    priceLabel:
-      it.total_kobo != null
-        ? formatNaira(it.total_kobo)
-        : it.unit_price_kobo != null && it.quantity != null
-          ? formatNaira(Number(it.unit_price_kobo) * Number(it.quantity))
-          : null,
-  }));
+  // The upstream parsers (regex and AI) only ever extract AT MOST one
+  // structured {name, quantity, unit} item, and never a per-item price
+  // (there's no concept of itemized pricing yet — the whole message is
+  // one total). Two things follow from that:
+  //   1. A lone structured item's price is that whole entry total —
+  //      it's the only line, so it IS the total.
+  //   2. Most real merchant messages have no quantity+unit at all
+  //      ("sold rice 5000" — no "bags"/"cartons"/etc for the regex
+  //      parser to latch onto), so ledgerEntry.items is simply [].
+  //      Previously that meant the items section of the receipt just...
+  //      didn't render anything, which reads as broken even though it
+  //      was "working as designed" — the fix is to fall back to a
+  //      single display line built from the entry's own description
+  //      (already a merchant-readable summary like "Rice") priced at
+  //      the entry total, so there's always a legible items section.
+  // DEBT_SETTLEMENT entries are the one exception: "Payment from John"
+  // isn't an item being sold, so no synthetic line is added for them —
+  // the Total/Paid summary already says everything there is to say.
+  const structuredItems = ledgerEntry.items || [];
+  let items;
+  if (structuredItems.length > 0) {
+    items = structuredItems.map((it) => ({
+      ...it,
+      priceLabel:
+        it.total_kobo != null
+          ? formatNaira(it.total_kobo)
+          : it.unit_price_kobo != null && it.quantity != null
+            ? formatNaira(Number(it.unit_price_kobo) * Number(it.quantity))
+            : formatNaira(ledgerEntry.total_kobo),
+    }));
+  } else if (ledgerEntry.entry_type !== 'DEBT_SETTLEMENT') {
+    items = [
+      {
+        name: cleanDescriptionForDisplay(ledgerEntry.description),
+        priceLabel: formatNaira(ledgerEntry.total_kobo),
+      },
+    ];
+  } else {
+    items = [];
+  }
 
   const outstandingKobo = (() => {
     // Prefer the customer's rolling total (balance_after_kobo, computed
@@ -627,7 +683,7 @@ async function generateReceipt({ merchant, ledgerEntry }) {
   })();
 
   const svg = buildReceiptSvg({
-    businessName: merchant.business_name || merchant.display_name,
+    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name,
     entryTypeLabel: ENTRY_TYPE_LABELS[ledgerEntry.entry_type] || 'Transaction',
     counterpartyName: ledgerEntry.counterparty_name,
     reference: ledgerEntry.id.slice(0, 8).toUpperCase(),

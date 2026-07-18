@@ -72,14 +72,18 @@ CREATE TRIGGER trg_subscription_tiers_updated_at
 CREATE TABLE IF NOT EXISTS merchants (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     whatsapp_number     VARCHAR(20)  NOT NULL UNIQUE,   -- E.164, e.g. +2348012345678
-    display_name        VARCHAR(120),
+    display_name        VARCHAR(120),                   -- legacy/unused free-text field, kept for compatibility; superseded by whatsapp_display_name + merchant_name below
     business_name       VARCHAR(160),
+    whatsapp_display_name VARCHAR(160),                 -- the contact's WhatsApp profile name, captured automatically from `contacts[0].profile.name` on every webhook delivery — not something the merchant told us, just Meta's own metadata
+    merchant_name        VARCHAR(120),                  -- the merchant's OWN name, only ever set when they actually introduce themselves ("I'm Samuel") or answer a direct name prompt — deliberately separate from whatsapp_display_name and business_name
+    business_type        VARCHAR(160),                  -- the merchant's own free-text answer to "what type of business is it?", asked immediately after business_name during onboarding
+    business_category    VARCHAR(60),                   -- Kika's classification of business_type into one fixed category (e.g. "Retail", "Wholesale") — see categorizationService.js
     subscription_tier_id INTEGER NOT NULL DEFAULT 1 REFERENCES subscription_tiers(id), -- 1 = Free
     subscription_expires_at TIMESTAMPTZ,                -- NULL while on the Free tier
     onboarding_state    VARCHAR(24)  NOT NULL DEFAULT 'PENDING_CONSENT'
                          CHECK (onboarding_state IN (
-                            'PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'NEW', 'ACTIVE',
-                            'STANDARD_ACTIVE', 'PREMIUM_ACTIVE'
+                            'PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'AWAITING_BUSINESS_TYPE',
+                            'NEW', 'ACTIVE', 'STANDARD_ACTIVE', 'PREMIUM_ACTIVE'
                          )),
     consent_at          TIMESTAMPTZ,                     -- when the merchant tapped "I AGREE" — compliance record
     consent_prompt_count SMALLINT NOT NULL DEFAULT 0,     -- how many times we've (re)sent the consent prompt without an accept; capped at 3 before we stop nudging
@@ -490,6 +494,19 @@ CREATE TRIGGER trg_customer_loyalty_updated_at
 -- re-running this whole schema.sql (migrate.js's only migration
 -- mechanism — see that file) against an already-migrated database is a
 -- no-op, exactly like every other table above.
+--
+-- whatsapp_display_name, merchant_name, business_type, and
+-- business_category now live INLINE in the CREATE TABLE merchants
+-- statement above, positioned right after business_name — that's what
+-- controls physical column order for a FRESH database. The ADD COLUMN
+-- statements below are kept purely as a backward-compatible safety net
+-- for a database that was already migrated before this reordering (they
+-- no-op there, since the columns already exist): Postgres has no
+-- non-destructive way to reorder existing columns, so an
+-- already-migrated database will keep them at the end. That's a
+-- cosmetic-only difference (SELECT * column order) with no functional
+-- impact — every query in this codebase reads columns by name, never by
+-- position.
 -- ---------------------------------------------------------------------------
 
 -- whatsapp_display_name: the contact's profile name as reported by
@@ -515,6 +532,7 @@ ALTER TABLE merchants ADD COLUMN IF NOT EXISTS merchant_name VARCHAR(120);
 -- future analytics, support tooling) can group and filter on.
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS business_type VARCHAR(160);
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS business_category VARCHAR(60);
+
 
 -- New onboarding step: business type is collected immediately after
 -- business name, before a merchant reaches ACTIVE. Postgres CHECK

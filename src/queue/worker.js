@@ -15,6 +15,7 @@ const fullReportService = require('../services/fullReportService');
 const mediaService = require('../services/mediaService');
 const aiTransactionParser = require('../services/aiTransactionParser');
 const categorizationService = require('../services/categorizationService');
+const conversationMemory = require('../services/conversationMemory');
 const exportService = require('../services/exportService');
 const auditLogService = require('../services/auditLogService');
 const diskCleanupService = require('../services/diskCleanupService');
@@ -651,6 +652,16 @@ const ledgerWorker = new Worker(
     }
 
     await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'ledger_entry.parsed', metadata: { source, entryType: parsed.entryType } });
+
+    // This transaction is now fully resolved and committed to Postgres —
+    // the source of truth from here on. Any earlier clarifying-question
+    // exchange still sitting in conversation memory (e.g. "How much did
+    // John owe?" from a minute ago) is now stale and, if left there,
+    // could wrongly bleed into a LATER, unrelated message. Clearing here
+    // (not just skipping the write, which aiTransactionParser already
+    // does on success) is what actually closes the loop, and covers
+    // every path uniformly — regex, reply-context, and AI alike.
+    await conversationMemory.clearHistory(merchantId);
 
     const { ledgerEntry, receipt, outstandingDebtKobo, loyaltyMilestoneText, lowStockAlerts } = await ledgerService.recordLedgerEntryAndReceipt({
       merchant,
