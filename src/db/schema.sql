@@ -222,7 +222,7 @@ CREATE INDEX IF NOT EXISTS idx_data_exports_cleanup_sweep
 CREATE TABLE IF NOT EXISTS report_dispatch_log (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     merchant_id         UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-    report_type         VARCHAR(20) NOT NULL CHECK (report_type IN ('DAILY_SUNSET', 'MONTHLY_INSIGHTS', 'MONTHLY_DIGEST', 'FRIDAY_AMNESTY_PROMPT')),
+    report_type         VARCHAR(24) NOT NULL CHECK (report_type IN ('DAILY_SUNSET', 'MONTHLY_INSIGHTS', 'MONTHLY_DIGEST', 'FRIDAY_AMNESTY_PROMPT')),
     period_key          VARCHAR(10) NOT NULL,             -- 'YYYY-MM-DD' or 'YYYY-MM'
     sent_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (merchant_id, report_type, period_key)

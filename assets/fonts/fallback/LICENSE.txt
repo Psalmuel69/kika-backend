@@ -1,0 +1,7 @@
+DejaVu Sans (bundled here as a currency-glyph fallback) is released
+under the free, redistribution-friendly Bitstream Vera / DejaVu fonts
+license. Full text: https://dejavu-fonts.github.io/License.html
+
+Used only to guarantee the Naira sign (₦, U+20A6) renders correctly on
+every receipt, regardless of which fonts a given host OS happens to
+have installed — Fira Code does not include this glyph.
