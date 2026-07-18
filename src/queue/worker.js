@@ -14,6 +14,7 @@ const monthlyDigestService = require('../services/monthlyDigestService');
 const fullReportService = require('../services/fullReportService');
 const mediaService = require('../services/mediaService');
 const aiTransactionParser = require('../services/aiTransactionParser');
+const categorizationService = require('../services/categorizationService');
 const exportService = require('../services/exportService');
 const auditLogService = require('../services/auditLogService');
 const diskCleanupService = require('../services/diskCleanupService');
@@ -21,7 +22,7 @@ const { getFallbackReply, AI_ERROR_FALLBACK_REPLY, GREETING_REPLY } = require('.
 const { registerSchedules } = require('./scheduler');
 
 const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
-const ONBOARDING_GATE_STATES = ['PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME'];
+const ONBOARDING_GATE_STATES = ['PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'AWAITING_BUSINESS_TYPE'];
 const RESTART_TRIGGERS = ['hi', 'hello', 'start', 'menu', 'help', 'hey'];
 
 function startOfDay(date) {
@@ -49,6 +50,27 @@ function dayKey(date) {
 function currentLagosHour() {
   const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Lagos', hour: 'numeric', hour12: false }).formatToParts(new Date());
   return Number(parts.find((p) => p.type === 'hour').value);
+}
+
+/**
+ * "Good morning Samuel" instead of a generic "Hi" whenever Kika actually
+ * knows who it's talking to — preferring the name the merchant
+ * explicitly gave (merchant_name) over WhatsApp's own contact display
+ * name (whatsapp_display_name, captured automatically from Meta's
+ * webhook metadata; see queries.findOrCreateMerchantByWhatsappNumber),
+ * since a self-introduced name is a stronger signal of what they'd
+ * actually want to be called. Falls back to the original generic
+ * GREETING_REPLY when Kika has no name at all for this merchant yet.
+ */
+function buildTimeAwareGreeting(merchant) {
+  const name = merchant.merchant_name || merchant.whatsapp_display_name;
+  if (!name) return GREETING_REPLY;
+
+  const hour = currentLagosHour();
+  const timeOfDay = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
+  const firstName = name.trim().split(/\s+/)[0];
+
+  return `Good ${timeOfDay}, ${firstName}! \ud83d\udc4b I'm *Kika AI* \u2014 your business ledger assistant right here on WhatsApp. I help you record sales, expenses, and customer debts just by texting me normally, no app needed. How can I help you today?`;
 }
 
 function formatNairaShort(kobo) {
@@ -184,7 +206,33 @@ async function handleOnboarding(merchant, whatsappNumber, jobData) {
     await auditLogService.logEvent({ merchantId: merchant.id, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'onboarding.business_name_set', metadata: { businessName } });
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      `Perfect! *${businessName}* is officially registered on Kika. From now on, any sale you type will carry this name at the top of your digital receipts.\n\nTry it now \u2014 send something like "sold rice 5000" or type HELP for more examples.`
+      `Nice, *${businessName}*! One last thing \u2014 what type of business is it? (e.g. "Provision store", "Hair salon", "Phone accessories")`
+    );
+    return;
+  }
+
+  if (merchant.onboarding_state === 'AWAITING_BUSINESS_TYPE') {
+    if (jobData.mediaType !== 'text' || !rawMessage) {
+      await whatsappService.sendTextMessage(whatsappNumber, 'What type of business is it? (please type it as text, e.g. "Provision store")');
+      return;
+    }
+    const businessType = rawMessage.slice(0, 160);
+    // Kika classifies the merchant's own free-text answer into one fixed
+    // business_category (e.g. "Provision Store" -> "Retail") — see
+    // categorizationService.js. Never blocks onboarding on this: any
+    // failure just falls back to 'Other' inside the service itself.
+    const businessCategory = await categorizationService.categorizeBusinessType(businessType, merchant.business_name);
+    await queries.setMerchantBusinessType(merchant.id, businessType, businessCategory);
+    await auditLogService.logEvent({
+      merchantId: merchant.id,
+      actorType: 'MERCHANT',
+      actorId: whatsappNumber,
+      action: 'onboarding.business_type_set',
+      metadata: { businessType, businessCategory },
+    });
+    await whatsappService.sendTextMessage(
+      whatsappNumber,
+      `Perfect! *${merchant.business_name}* is officially registered on Kika. From now on, any sale you type will carry this name at the top of your digital receipts.\n\nTry it now \u2014 send something like "sold rice 5000" or type HELP for more examples.`
     );
   }
 }
@@ -204,7 +252,7 @@ const ledgerWorker = new Worker(
   async (job) => {
     logger.info({ jobId: job.id, data: job.data }, 'WORKER_RECEIVED_JOB');
 
-    const { merchantId, whatsappNumber } = job.data;
+    const { merchantId, whatsappNumber, whatsappMessageId, replyToWhatsappMessageId } = job.data;
     const merchant = await queries.getMerchantById(merchantId);
     if (!merchant) return;
 
@@ -214,6 +262,29 @@ const ledgerWorker = new Worker(
       await handleOnboarding(merchant, whatsappNumber, job.data);
       return;
     }
+
+    // Belt-and-suspenders duplicate-transaction guard: the webhook's
+    // Redis idempotency lock (48h TTL — see idempotencyService.js and
+    // whatsapp.routes.js) is the primary defense against ever getting
+    // here twice for the same wamid. This is the permanent, TTL-free
+    // backstop — e.g. a delayed BullMQ retry landing after the Redis
+    // lock already expired.
+    if (whatsappMessageId) {
+      const alreadyRecorded = await queries.getLedgerEntryByWhatsappMessageId(merchantId, whatsappMessageId);
+      if (alreadyRecorded) {
+        logger.warn({ whatsappMessageId, ledgerEntryId: alreadyRecorded.id }, 'Duplicate WhatsApp message id — entry already recorded, skipping');
+        return;
+      }
+    }
+
+    // Reply-context resolution: if this message is a WhatsApp reply,
+    // look up the ledger entry Kika's own earlier message (the one
+    // being replied to) was about — see queries.
+    // getLedgerEntryByOutboundMessageId and the long comment on
+    // ledgerService/businessContextService for how this is used below.
+    const replyEntry = replyToWhatsappMessageId
+      ? await queries.getLedgerEntryByOutboundMessageId(merchantId, replyToWhatsappMessageId)
+      : null;
 
     const { text: rawMessage, imageBase64, mediaError } = await resolveInboundContent(job);
 
@@ -225,10 +296,35 @@ const ledgerWorker = new Worker(
       return;
     }
 
+    // A merchant introducing themselves by name ("I'm Samuel") is stored
+    // on merchant_name — deliberately separate from whatsapp_display_name
+    // (Meta's own contact metadata, captured automatically on every
+    // message) and business_name. See ledgerParser.extractSelfIntroduction
+    // and buildTimeAwareGreeting, which prefers this name once known.
+    // Detected on every text message (cheap regex, no AI), not just a
+    // dedicated onboarding step — a merchant might introduce themselves
+    // at any point in the conversation.
+    if (job.data.mediaType === 'text' && rawMessage) {
+      const introducedName = ledgerParser.extractSelfIntroduction(rawMessage);
+      if (introducedName && introducedName !== merchant.merchant_name) {
+        await queries.setMerchantName(merchantId, introducedName);
+        merchant.merchant_name = introducedName; // keep this job's in-memory copy current for the greeting below
+        // A short message that's basically JUST the introduction gets a
+        // warm standalone acknowledgement instead of falling through to
+        // "I didn't understand that" — anything longer (introduction
+        // embedded in a longer message) is stored silently and normal
+        // processing continues below.
+        if (rawMessage.trim().length <= introducedName.length + 20) {
+          await whatsappService.sendTextMessage(whatsappNumber, `Nice to meet you, ${introducedName}! \ud83d\ude0a I'll remember that.`);
+          return;
+        }
+      }
+    }
+
     const command = ledgerParser.detectCommand(rawMessage);
 
     if (command === 'GREETING') {
-      await whatsappService.sendTextMessage(whatsappNumber, GREETING_REPLY);
+      await whatsappService.sendTextMessage(whatsappNumber, buildTimeAwareGreeting(merchant));
       return;
     }
 
@@ -505,19 +601,22 @@ const ledgerWorker = new Worker(
       return;
     }
 
-    // --- Hybrid parsing: fast regex first ---
-    let parsed = ledgerParser.parseLedgerMessage(rawMessage);
-    let source = 'regex';
+    // --- Hybrid parsing: reply-context bare payments first (fastest,
+    // most deterministic — see the long comment in ledgerParser.js),
+    // then the fast regex parser, then the AI fallback. ---
+    let parsed = ledgerParser.parseReplyMessage(rawMessage, replyEntry);
+    let source = parsed ? 'reply-context' : 'regex';
+    if (!parsed) parsed = ledgerParser.parseLedgerMessage(rawMessage);
 
-    // --- AI safety net: only reached when the regex parser can't make
-    // sense of the message (unfamiliar slang, indirect phrasing, an
-    // image, or a transcribed voice note) ---
+    // --- AI safety net: only reached when neither of the above parsers
+    // can make sense of the message (unfamiliar slang, indirect
+    // phrasing, an image, or a transcribed voice note) ---
     let aiConversationalReply = null;
     let aiDetectedLanguage = null;
     let aiCallFailed = false;
     if (!parsed) {
       logger.info({ jobId: job.id }, 'WORKER_STARTING_AI_CALL');
-      const aiResult = await aiTransactionParser.parseWithAI(merchant, rawMessage, { imageBase64 });
+      const aiResult = await aiTransactionParser.parseWithAI(merchant, rawMessage, { imageBase64, replyEntry });
       if (aiResult.parsed) {
         parsed = aiResult.parsed;
         source = 'ai';
@@ -543,12 +642,22 @@ const ledgerWorker = new Worker(
       return;
     }
 
+    // The fast regex path doesn't classify expenses (keeps it simple and
+    // dependency-free) — backfill via the same keyword/AI classifier the
+    // AI path already uses for itself. Bare reply-payments and the AI
+    // path never need this (they're never a fresh DEBIT).
+    if (parsed.entryType === 'DEBIT' && !parsed.expenseCategory) {
+      parsed.expenseCategory = await categorizationService.categorizeExpense(parsed.description, parsed.items?.[0]?.name);
+    }
+
     await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'ledger_entry.parsed', metadata: { source, entryType: parsed.entryType } });
 
-    const { receipt, outstandingDebtKobo, loyaltyMilestoneText, lowStockAlerts } = await ledgerService.recordLedgerEntryAndReceipt({
+    const { ledgerEntry, receipt, outstandingDebtKobo, loyaltyMilestoneText, lowStockAlerts } = await ledgerService.recordLedgerEntryAndReceipt({
       merchant,
       parsedEntry: parsed,
       rawMessage,
+      whatsappMessageId,
+      replyToWhatsappMessageId,
     });
 
     const debtNote = Number(outstandingDebtKobo) > 0 ? '\n\nSend BALANCE anytime for a full summary.' : '';
@@ -556,7 +665,17 @@ const ledgerWorker = new Worker(
     if (loyaltyMilestoneText) caption += loyaltyMilestoneText;
 
     logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
-    await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, caption);
+    const sendResult = await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, caption);
+
+    // Persist the wamid of THIS receipt against the entry — this is
+    // what lets a later "he paid" reply (tapping Reply on this exact
+    // WhatsApp message) resolve straight back to it. See
+    // ledgerParser.parseReplyMessage and businessContextService's
+    // "Reply context" block for where this pays off.
+    const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
+    if (ledgerEntry?.id && outboundMessageId) {
+      await queries.setLedgerEntryOutboundMessageId(ledgerEntry.id, outboundMessageId);
+    }
 
     for (const alert of lowStockAlerts || []) {
       await whatsappService.sendTextMessage(whatsappNumber, alert);

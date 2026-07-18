@@ -55,6 +55,19 @@ function extractInboundPayload(message) {
 }
 
 /**
+ * The contact's current WhatsApp profile display name, sent alongside
+ * every message delivery in `change.value.contacts[]`, keyed by wa_id
+ * (the same number as `message.from`). This is Meta's own metadata, not
+ * anything the merchant explicitly told Kika — see queries.
+ * findOrCreateMerchantByWhatsappNumber for how it's stored (and kept
+ * fresh) separately from merchant_name.
+ */
+function extractDisplayName(contacts, waId) {
+  const contact = (contacts || []).find((c) => c.wa_id === waId);
+  return contact?.profile?.name || null;
+}
+
+/**
  * Inbound message delivery. Deliberately thin: verify signature, gate on
  * access control, extract the minimum needed fields, enqueue for async
  * processing, and return 200 immediately. All the actual work (media
@@ -105,7 +118,8 @@ router.post(
             const payload = extractInboundPayload(message);
             if (!payload) continue;
 
-            const merchant = await queries.findOrCreateMerchantByWhatsappNumber(whatsappNumber);
+            const displayName = extractDisplayName(change.value?.contacts, message.from);
+            const merchant = await queries.findOrCreateMerchantByWhatsappNumber(whatsappNumber, displayName);
 
             // Access control gate: blacklist / whitelist-mode / active
             // human-handoff label. A blocked message is still visible in
@@ -144,6 +158,8 @@ router.post(
                 rawMessage: payload.rawMessage,
                 mediaType: payload.mediaType,
                 mediaId: payload.mediaId,
+                whatsappMessageId: message.id,
+                replyToWhatsappMessageId: message.context?.id || null,
               },
               { jobId: message.id } // dedupes retried webhook deliveries for the same message
             );

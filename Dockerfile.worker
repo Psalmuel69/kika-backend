@@ -3,18 +3,23 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev && npm cache clean --force
 COPY src ./src
+COPY assets ./assets
 
 FROM node:20-bookworm-slim
 WORKDIR /app
 
+# See Dockerfile's comment on this block — fontconfig itself (not just
+# libvips) is required for any receipt text to render at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips42 \
+    fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
 RUN addgroup --system kika && adduser --system --ingroup kika kika
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/src ./src
+COPY --from=build /app/assets ./assets
 COPY package.json ./
 
 RUN mkdir -p /data/receipts && chown -R kika:kika /data/receipts /app

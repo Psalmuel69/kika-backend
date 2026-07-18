@@ -72,23 +72,56 @@ function extractMoneyMentions(text) {
   return mentions;
 }
 
-// "3 carton of indomie", "2 bags rice", "5 packs of sugar"
-const ITEM_RE = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to | for )/i;
+// "3 carton of indomie", "2 bags rice", "5 packs of sugar" — quantity
+// and unit BEFORE the item name.
+const ITEM_RE_QTY_FIRST = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to | for )/i;
+
+// "rice 2 bags", "indomie 3 cartons" — item name BEFORE quantity/unit,
+// equally common phrasing ("bought/sold <item> <qty> <unit>"). Captures
+// only the single word immediately adjacent to the quantity (JS regex
+// search tries the leftmost position where the WHOLE pattern matches,
+// so for "John buy rice 2 bags" it correctly skips "John"/"buy" — they
+// aren't immediately followed by a digit — and lands on "rice 2 bags").
+// Deliberately doesn't support multi-word names in this order (e.g.
+// "bag of rice 2 bags") to avoid re-introducing the over-capture bug
+// this replaced; ITEM_RE_QTY_FIRST already handles multi-word names
+// fine in the far more common "2 bags of rice" order.
+const ITEM_RE_NAME_FIRST = /\b([a-zA-Z]+)\s+(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\b/i;
 
 function extractItem(text) {
-  const match = text.match(ITEM_RE);
-  if (!match) return null;
-  const [, quantity, unit, name] = match;
-  return {
-    name: name.trim(),
-    quantity: Number(quantity),
-    unit: unit.toLowerCase(),
-    // Index of the quantity digit within the message, so callers can
-    // exclude it from money-amount detection (e.g. the "2" in "2 bags
-    // rice" is a quantity, not a price, even though it matches the same
-    // digit pattern as a bare money mention).
-    quantityIndex: match.index,
-  };
+  const qtyFirstMatch = text.match(ITEM_RE_QTY_FIRST);
+  if (qtyFirstMatch) {
+    const [, quantity, unit, name] = qtyFirstMatch;
+    return {
+      name: name.trim(),
+      quantity: Number(quantity),
+      unit: unit.toLowerCase(),
+      // Index of the quantity digit within the message, so callers can
+      // exclude it from money-amount detection (e.g. the "2" in "2 bags
+      // rice" is a quantity, not a price, even though it matches the
+      // same digit pattern as a bare money mention).
+      quantityIndex: qtyFirstMatch.index,
+    };
+  }
+
+  const nameFirstMatch = text.match(ITEM_RE_NAME_FIRST);
+  if (nameFirstMatch) {
+    const [, name, quantity, unit] = nameFirstMatch;
+    // Guard against matching a preceding verb as if it were the item
+    // name (e.g. "buy 2 bags" with no item word at all) — a handful of
+    // common transaction verbs never ARE the item.
+    const VERB_BLOCKLIST = ['buy', 'bought', 'sold', 'sell', 'sells', 'selling', 'pay', 'paid', 'owe', 'owes', 'got'];
+    if (VERB_BLOCKLIST.includes(name.toLowerCase())) return null;
+    const quantityIndex = nameFirstMatch.index + nameFirstMatch[0].indexOf(quantity, name.length);
+    return {
+      name: name.trim(),
+      quantity: Number(quantity),
+      unit: unit.toLowerCase(),
+      quantityIndex,
+    };
+  }
+
+  return null;
 }
 
 // Nigerian mobile numbers: local "0803..." (11 digits) or international
@@ -311,4 +344,99 @@ module.exports = {
   parseInvoiceCommand,
   parseAddStockCommand,
   parseClosingHourCommand,
+  parseReplyMessage,
+  extractSelfIntroduction,
 };
+
+// ---------------------------------------------------------------------------
+// Reply-context resolution — "John owes ₦12,000" gets sent as a receipt;
+// the merchant later taps Reply on THAT WhatsApp message and just types
+// "he paid" or "paid" with no name and no amount repeated. WhatsApp
+// includes `context: { id: "wamid..." }` on that inbound message; the
+// caller (worker.js) resolves that wamid back to the original ledger
+// entry via queries.getLedgerEntryByOutboundMessageId and passes it in
+// here as `replyEntry`. This is deliberately narrow — a fast, confident
+// regex path for the single most common "bare payment reply" shape.
+// Anything more indirect ("he paid me back yesterday for that") still
+// falls through to the AI fallback, which also receives the reply
+// context (see aiTransactionParser.js) and can resolve it more flexibly.
+// ---------------------------------------------------------------------------
+
+// "he paid", "she paid 5k", "paid in full", "don pay", "he don pay 3000",
+// "fully paid", "cleared" — a bare settlement acknowledgement with no
+// customer name of its own, meant to be resolved against replyEntry.
+const BARE_REPLY_PAYMENT_RE =
+  /^(?:(?:he|she|they|him|her)\s+)?(?:has\s+|don\s+)?(?:paid|pays|payed|cleared|settled)(?:\s+(?:in\s+full|up|off))?\b/i;
+
+/**
+ * @param {string} rawMessage
+ * @param {object|null} replyEntry - the ledger_entries row the inbound
+ *   message was a WhatsApp reply to (or null if it wasn't a reply, or
+ *   the replied-to message doesn't map to any entry).
+ * @returns {object|null} a DEBT_SETTLEMENT-shaped parsed entry, or null
+ *   if this doesn't look like a bare reply-payment at all (caller should
+ *   fall through to the normal parser / AI fallback).
+ */
+function parseReplyMessage(rawMessage, replyEntry) {
+  if (!replyEntry || typeof rawMessage !== 'string') return null;
+  // Only a DEBT (or a still-open DEBT_SETTLEMENT chain) has an
+  // outstanding balance a bare "he paid" could plausibly be closing.
+  if (!replyEntry.counterparty_name || Number(replyEntry.balance_kobo) <= 0) return null;
+
+  const text = rawMessage.trim();
+  if (!BARE_REPLY_PAYMENT_RE.test(text)) return null;
+
+  // An explicit amount in the reply itself overrides "assume it's the
+  // full outstanding balance" — e.g. "he paid 5k" against a ₦12,000 debt
+  // is a partial settlement, not a full one.
+  const mentions = extractMoneyMentions(text);
+  const paidKobo = mentions.length > 0 ? mentions[0].amountKobo : Number(replyEntry.balance_kobo);
+
+  return {
+    entryType: 'DEBT_SETTLEMENT',
+    description: `Payment from ${replyEntry.counterparty_name} (via reply)`,
+    counterpartyName: replyEntry.counterparty_name,
+    counterpartyPhone: replyEntry.counterparty_phone || null,
+    items: [],
+    totalKobo: paidKobo,
+    paidKobo,
+    balanceKobo: 0,
+  };
+}
+
+// "I'm Samuel", "I am Samuel", "My name is Samuel", "This is Samuel",
+// "Call me Samuel" — deliberately conservative (2-word cap on the
+// captured name, letters/hyphen/apostrophe only) so it doesn't
+// misfire on unrelated sentences that happen to start similarly.
+// Prefixes are matched case-insensitively; the name itself must still
+// start with a capital letter, so the /i flag can't apply to the whole
+// pattern (it would then also accept an all-lowercase "name").
+const SELF_INTRO_PREFIXES = [/^i'?m\s+/i, /^i\s+am\s+/i, /^my\s+name\s+is\s+/i, /^this\s+is\s+/i, /^call\s+me\s+/i];
+const NAME_CAPTURE_RE = /^([A-Z][a-zA-Z'-]*(?:\s+[A-Z][a-zA-Z'-]*){0,1})\b/;
+
+/**
+ * Best-effort extraction of a merchant introducing themselves by name in
+ * ordinary conversation — NOT a business name (that's the separate,
+ * explicit onboarding step). Deliberately only matches a handful of
+ * clear self-introduction phrasings; anything murkier is left alone
+ * rather than risk mis-attributing a name.
+ */
+function extractSelfIntroduction(rawMessage) {
+  if (typeof rawMessage !== 'string') return null;
+  const text = rawMessage.trim();
+
+  for (const prefixRe of SELF_INTRO_PREFIXES) {
+    const prefixMatch = text.match(prefixRe);
+    if (!prefixMatch) continue;
+    const rest = text.slice(prefixMatch[0].length);
+    const nameMatch = rest.match(NAME_CAPTURE_RE);
+    if (!nameMatch) continue;
+    const name = nameMatch[1].trim();
+    // Guard against matching common non-name follow-ups like "I'm fine",
+    // "I'm good", "I am here" etc.
+    const BLOCKLIST = ['Fine', 'Good', 'Okay', 'Ok', 'Here', 'Back', 'Ready', 'Sorry', 'Busy', 'Kika'];
+    if (BLOCKLIST.includes(name)) return null;
+    return name.slice(0, 60);
+  }
+  return null;
+}

@@ -19,9 +19,9 @@ const logger = require('../utils/logger');
  * transaction wrapper, is what actually prevents two sales to the same
  * customer within seconds of each other from producing a lost update.
  */
-async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage }) {
+async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, whatsappMessageId, replyToWhatsappMessageId }) {
   if (parsedEntry.entryType === 'DEBT_SETTLEMENT' && parsedEntry.counterpartyName) {
-    return recordDebtSettlement({ merchant, parsedEntry, rawMessage });
+    return recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsappMessageId, replyToWhatsappMessageId });
   }
 
   const ledgerEntry = await queries.withTransaction(async (client) => {
@@ -54,6 +54,9 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage }
       balanceKobo: parsedEntry.balanceKobo,
       balanceAfterKobo,
       rawMessage,
+      whatsappMessageId,
+      replyToWhatsappMessageId,
+      expenseCategory: parsedEntry.expenseCategory || null,
     });
     // COMMIT happens automatically here as withTransaction's callback
     // resolves; the lock acquired above is held for the entire block
@@ -122,7 +125,7 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage }
  * why the ordering matters), so this inherits the same race-free
  * guarantee as a new DEBT entry.
  */
-async function recordDebtSettlement({ merchant, parsedEntry, rawMessage }) {
+async function recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsappMessageId, replyToWhatsappMessageId }) {
   const { settlementResult, ledgerEntry } = await queries.withTransaction(async (client) => {
     const settlementResult = await queries.settleOutstandingDebtForCounterparty(
       client,
@@ -143,6 +146,8 @@ async function recordDebtSettlement({ merchant, parsedEntry, rawMessage }) {
       balanceKobo: 0,
       balanceAfterKobo: settlementResult.rollingBalanceKobo,
       rawMessage,
+      whatsappMessageId,
+      replyToWhatsappMessageId,
     });
 
     return { settlementResult, ledgerEntry };

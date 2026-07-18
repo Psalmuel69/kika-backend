@@ -15,11 +15,19 @@ function formatNaira(kobo) {
  * is what lets it ask sharper follow-up questions and stop guessing at
  * numbers it was never given.
  *
+ * `replyEntry` (optional) is the ledger entry the merchant's CURRENT
+ * message was a WhatsApp reply to (resolved by the caller from the
+ * inbound webhook's `context.id` — see worker.js and
+ * queries.getLedgerEntryByOutboundMessageId). When present, it's
+ * surfaced as an explicit "Reply context" block so the model can resolve
+ * pronoun-only replies like "he paid" against the exact record being
+ * replied to, instead of guessing which customer is meant.
+ *
  * Deliberately bounded (8 recent transactions, 15 inventory rows) to
  * keep prompts short and cheap — this is meant to orient the model, not
  * replace Postgres as the source of truth for exact historical figures.
  */
-async function buildBusinessContextBlock(merchant) {
+async function buildBusinessContextBlock(merchant, replyEntry = null) {
   const [debt, recentEntries, inventory] = await Promise.all([
     queries.getOutstandingDebtTotal(merchant.id),
     queries.listRecentEntries(merchant.id, 8),
@@ -29,6 +37,9 @@ async function buildBusinessContextBlock(merchant) {
   const lines = ['## Business context for this merchant (ground truth — never invent numbers beyond this)', ''];
 
   lines.push(`Business name: ${merchant.business_name || 'Not set yet'}`);
+  if (merchant.business_type) lines.push(`Business type: ${merchant.business_type}${merchant.business_category ? ` (category: ${merchant.business_category})` : ''}`);
+  const ownerName = merchant.merchant_name || merchant.whatsapp_display_name;
+  if (ownerName) lines.push(`Merchant's own name: ${ownerName}`);
   lines.push(`Plan: ${merchant.plan}`);
 
   if (Number(debt.total_kobo) > 0) {
@@ -53,6 +64,15 @@ async function buildBusinessContextBlock(merchant) {
       const low = Number(p.current_stock) <= Number(p.low_stock_threshold) ? ' (LOW)' : '';
       lines.push(`- ${p.name}: ${p.current_stock} ${p.unit || 'units'}${low}`);
     });
+  }
+
+  if (replyEntry) {
+    lines.push(
+      '',
+      '## Reply context — the merchant\'s current message is a WhatsApp reply to this earlier message/entry:',
+      `[${replyEntry.entry_type}] ${replyEntry.description} \u2014 total ${formatNaira(replyEntry.total_kobo)}, paid ${formatNaira(replyEntry.paid_kobo)}, balance ${formatNaira(replyEntry.balance_kobo)}${replyEntry.counterparty_name ? `, customer: ${replyEntry.counterparty_name}` : ''}.`,
+      'If the current message uses a pronoun ("he paid", "she paid", "cleared it") with no name of its own, it almost certainly refers to the customer named above — use that name as counterpartyName rather than asking who it is, unless the message clearly names someone different.'
+    );
   }
 
   lines.push(

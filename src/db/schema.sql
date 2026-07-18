@@ -480,3 +480,86 @@ DROP TRIGGER IF EXISTS trg_customer_loyalty_updated_at ON customer_loyalty;
 CREATE TRIGGER trg_customer_loyalty_updated_at
     BEFORE UPDATE ON customer_loyalty
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- Migration: merchant identity (WhatsApp display name vs. self-introduced
+-- name), business type/category classification, and WhatsApp message
+-- traceability (dedup, audit, reply-context resolution) on ledger entries.
+--
+-- Written as ADD COLUMN IF NOT EXISTS / idempotent DDL throughout so
+-- re-running this whole schema.sql (migrate.js's only migration
+-- mechanism — see that file) against an already-migrated database is a
+-- no-op, exactly like every other table above.
+-- ---------------------------------------------------------------------------
+
+-- whatsapp_display_name: the contact's profile name as reported by
+-- WhatsApp itself (`contacts[0].profile.name` on every webhook delivery)
+-- — captured automatically the moment they first message us, no prompt
+-- needed. merchant_name: the name the merchant actually gave US when
+-- introducing themselves in conversation ("I'm Samuel", or a direct
+-- answer to a name prompt) — deliberately a SEPARATE column, since a
+-- WhatsApp display name is often a shop name, an emoji, or a nickname a
+-- merchant wouldn't want Kika calling them by, and shouldn't silently
+-- overwrite a name they explicitly gave us.
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS whatsapp_display_name VARCHAR(160);
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS merchant_name VARCHAR(120);
+
+-- business_type: the merchant's own free-text answer to "what type of
+-- business is it?" (e.g. "Provision Store"), asked immediately after
+-- business_name during onboarding. business_category: Kika's own
+-- classification of that free text into one fixed marketing/analytics
+-- category (e.g. "Wholesale") — see categorizationService.js. Kept as
+-- two columns because business_type is what the merchant actually said
+-- (shown back to them, useful verbatim) while business_category is a
+-- normalized value the rest of the product (segment-specific tips,
+-- future analytics, support tooling) can group and filter on.
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS business_type VARCHAR(160);
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS business_category VARCHAR(60);
+
+-- New onboarding step: business type is collected immediately after
+-- business name, before a merchant reaches ACTIVE. Postgres CHECK
+-- constraints can't be altered in place, so drop and recreate by the
+-- name Postgres auto-assigned it (<table>_<column>_check).
+ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_onboarding_state_check;
+ALTER TABLE merchants ADD CONSTRAINT merchants_onboarding_state_check
+    CHECK (onboarding_state IN (
+        'PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'AWAITING_BUSINESS_TYPE',
+        'NEW', 'ACTIVE', 'STANDARD_ACTIVE', 'PREMIUM_ACTIVE'
+    ));
+
+-- WhatsApp message traceability on every ledger entry:
+--   whatsapp_message_id          — the inbound wamid of the merchant
+--                                   message that created this entry.
+--                                   Redis's idempotency lock (see
+--                                   idempotencyService.js) already blocks
+--                                   double-processing within its 48h TTL;
+--                                   this column is the permanent,
+--                                   queryable record for auditing and
+--                                   traceability after that TTL expires.
+--   reply_to_whatsapp_message_id — populated from the inbound webhook's
+--                                   `context.id` when the merchant's
+--                                   message was itself a reply to an
+--                                   earlier WhatsApp message.
+--   outbound_whatsapp_message_id — the wamid of KIKA'S OWN reply/receipt
+--                                   about this entry. When a later
+--                                   inbound message's `context.id`
+--                                   matches this column, Kika knows
+--                                   exactly which entry a bare reply like
+--                                   "he paid" refers to — see
+--                                   ledgerParser.parseReplyMessage and
+--                                   queries.getLedgerEntryByOutboundMessageId.
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS whatsapp_message_id VARCHAR(128);
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS reply_to_whatsapp_message_id VARCHAR(128);
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS outbound_whatsapp_message_id VARCHAR(128);
+
+-- expense_category: Kika's classification of a DEBIT entry into a fixed
+-- expense category (e.g. "Inventory & Stock", "Transport & Logistics")
+-- — see categorizationService.js. NULL for non-DEBIT entries.
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS expense_category VARCHAR(60);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_whatsapp_message_id
+    ON ledger_entries (whatsapp_message_id) WHERE whatsapp_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_outbound_whatsapp_message_id
+    ON ledger_entries (outbound_whatsapp_message_id) WHERE outbound_whatsapp_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_expense_category
+    ON ledger_entries (merchant_id, expense_category) WHERE expense_category IS NOT NULL;

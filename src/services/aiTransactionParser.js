@@ -3,6 +3,8 @@
 const openaiService = require('./openaiService');
 const businessContextService = require('./businessContextService');
 const conversationMemory = require('./conversationMemory');
+const categorizationService = require('./categorizationService');
+const { EXPENSE_CATEGORIES } = categorizationService;
 const { KIKA_SYSTEM_PROMPT, SUPPORTED_LANGUAGES } = require('../config/aiPersona');
 const logger = require('../utils/logger');
 
@@ -27,6 +29,11 @@ const RECORD_TRANSACTION_TOOL = {
         itemName: { type: ['string', 'null'] },
         itemQuantity: { type: ['number', 'null'] },
         itemUnit: { type: ['string', 'null'], description: 'e.g. "bags", "cartons", "pieces" — null if not applicable.' },
+        expenseCategory: {
+          type: ['string', 'null'],
+          enum: [...EXPENSE_CATEGORIES, null],
+          description: 'Only for entryType DEBIT: which fixed expense category this spend falls under. Null for CREDIT/DEBT/DEBT_SETTLEMENT.',
+        },
         totalNaira: { type: 'number', description: 'Total value of the transaction, in Naira (not kobo).' },
         paidNaira: { type: 'number', description: 'Amount actually paid/received right now, in Naira.' },
         balanceNaira: { type: 'number', description: 'Amount still owed after this transaction, in Naira. 0 if fully settled.' },
@@ -78,6 +85,7 @@ function normalizeToolCallArgs(args) {
     totalKobo: toKobo(args.totalNaira),
     paidKobo: toKobo(args.paidNaira),
     balanceKobo: toKobo(args.balanceNaira),
+    expenseCategory: args.entryType === 'DEBIT' && EXPENSE_CATEGORIES.includes(args.expenseCategory) ? args.expenseCategory : null,
   };
 }
 
@@ -101,7 +109,7 @@ function normalizeToolCallArgs(args) {
  *                                                caller must use the fixed
  *                                                fallback text as a safety net
  */
-async function parseWithAI(merchant, rawText, { imageBase64 } = {}) {
+async function parseWithAI(merchant, rawText, { imageBase64, replyEntry } = {}) {
   if (!hasAiProviderConfigured()) {
     logger.warn('Neither OPENAI_API_KEY nor GEMINI_API_KEY configured — skipping AI fallback, using fixed fallback reply');
     return { parsed: null, error: true };
@@ -109,7 +117,7 @@ async function parseWithAI(merchant, rawText, { imageBase64 } = {}) {
 
   try {
     const [businessContext, history] = await Promise.all([
-      businessContextService.buildBusinessContextBlock(merchant),
+      businessContextService.buildBusinessContextBlock(merchant, replyEntry),
       conversationMemory.getHistory(merchant.id),
     ]);
 
@@ -129,6 +137,13 @@ async function parseWithAI(merchant, rawText, { imageBase64 } = {}) {
       const isConfident = Number.isFinite(confidence) ? confidence >= MIN_CONFIDENCE_THRESHOLD : true;
 
       if (parsed && parsed.totalKobo > 0 && isConfident) {
+        // The model is asked to classify DEBIT expenses itself (cheaper
+        // than a second round-trip), but if it left it blank, fall back
+        // to the same keyword/AI classifier the regex path uses rather
+        // than shipping an uncategorized expense.
+        if (parsed.entryType === 'DEBIT' && !parsed.expenseCategory) {
+          parsed.expenseCategory = await categorizationService.categorizeExpense(parsed.description, parsed.items?.[0]?.name);
+        }
         // A confirmed transaction is NOT stored in conversation memory —
         // Postgres is the source of truth for it, and re-stating it here
         // would only bloat future prompts for no benefit (see the note

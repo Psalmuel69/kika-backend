@@ -198,6 +198,17 @@ async function safeSend(payload) {
   }
 }
 
+/**
+ * Pulls the wamid Meta assigns to a just-sent message out of the Graph
+ * API response shape (`{ messages: [{ id: 'wamid...' }] }`). Used to
+ * persist the outbound message id against a ledger entry so a later
+ * reply to that exact message can be resolved back to it — see
+ * queries.setLedgerEntryOutboundMessageId.
+ */
+function extractOutboundMessageId(sendResult) {
+  return sendResult?.messages?.[0]?.id || null;
+}
+
 module.exports = {
   verifyWebhookSignature,
   sendTextMessage,
@@ -209,4 +220,5 @@ module.exports = {
   sendConsentPrompt,
   sendFridayAmnestyPrompt,
   sendMonthlyDigestCard,
+  extractOutboundMessageId,
 };

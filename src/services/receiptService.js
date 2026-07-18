@@ -20,26 +20,45 @@ const logger = require('../utils/logger');
 // module load) pointing at assets/fonts (Fira Code, bundled) and
 // assets/fonts/agrandir (Agrandir, NOT bundled — see that folder's
 // README), using this deployment's actual absolute path. It's written
-// to the OS temp dir and FONTCONFIG_FILE is pointed at it before any
-// render happens, so this works identically on a laptop, in Docker, or
-// on Render, with no system font install step and no root required —
-// and with no ambiguous-relative-path warnings from fontconfig, since
-// the generated config always uses an absolute <dir>.
+// to the OS temp dir and FONTCONFIG_FILE (and, for older/alternate
+// fontconfig builds that only honor the directory form,
+// FONTCONFIG_PATH) is pointed at it before any render happens, so this
+// works identically on a laptop, in Docker, or on Render, with no
+// system font install step and no root required — and with no
+// ambiguous-relative-path warnings from fontconfig, since the generated
+// config always uses an absolute <dir>.
+//
+// Two real-world footguns this deliberately avoids, both of which
+// produce the exact same silent symptom — a receipt that "renders" fine
+// (no error, no crash) but comes out totally blank except for the
+// vector-drawn dashed dividers, because every <text> glyph quietly
+// failed to resolve:
+//   1. The `<!DOCTYPE fontconfig SYSTEM "fonts.dtd">` header some
+//      fontconfig examples include. It's optional, and on a minimal
+//      libxml2 (no local XML catalog entry for fonts.dtd, no network)
+//      it can make the whole config fail to parse. Left out entirely.
+//   2. `fontconfig` (the actual OS package, not just `libvips`) not
+//      being installed in the container at all — see the Dockerfile,
+//      which installs it explicitly and copies this assets/ folder in.
 const os = require('os');
 const FONTS_DIR = path.join(__dirname, '..', '..', 'assets', 'fonts');
 if (!process.env.FONTCONFIG_FILE) {
   try {
+    const cacheDir = path.join(os.tmpdir(), 'kika-fontconfig-cache');
+    fssync.mkdirSync(cacheDir, { recursive: true });
     const generatedConf = `<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
   <dir>${FONTS_DIR}</dir>
   <dir>${path.join(FONTS_DIR, 'agrandir')}</dir>
   <dir>${path.join(FONTS_DIR, 'fallback')}</dir>
-  <cachedir>${path.join(os.tmpdir(), 'kika-fontconfig-cache')}</cachedir>
+  <cachedir>${cacheDir}</cachedir>
 </fontconfig>`;
-    const generatedConfPath = path.join(os.tmpdir(), 'kika-fonts.conf');
+    const generatedConfDir = path.join(os.tmpdir(), 'kika-fontconfig');
+    fssync.mkdirSync(generatedConfDir, { recursive: true });
+    const generatedConfPath = path.join(generatedConfDir, 'fonts.conf');
     fssync.writeFileSync(generatedConfPath, generatedConf);
     process.env.FONTCONFIG_FILE = generatedConfPath;
+    if (!process.env.FONTCONFIG_PATH) process.env.FONTCONFIG_PATH = generatedConfDir;
   } catch (err) {
     logger.warn({ err: err.message }, 'Could not generate fontconfig config; receipts will fall back to system fonts');
   }
@@ -523,12 +542,64 @@ function buildReceiptSvg({
 </svg>`.trim();
 }
 
+// --- Font self-test ------------------------------------------------------
+//
+// The single most common way receipts break in production is silent:
+// fontconfig/the bundled fonts aren't actually reachable (see the long
+// comment near the top of this file), sharp/librsvg renders without
+// error, and the output is a technically-valid PNG that's just...
+// blank except for vector lines. Nothing throws, nothing shows up as a
+// 500, so it can go unnoticed for a while. This renders one throwaway
+// glyph and checks whether any ink actually landed, logging a loud,
+// specific warning if not — so this is a line in the logs on day one,
+// not a support ticket three weeks later. Runs once (result cached) the
+// first time a receipt is generated, and never blocks/fails the actual
+// receipt render even if the self-test itself errors.
+let fontSelfTestPromise = null;
+function verifyFontsRenderable() {
+  if (fontSelfTestPromise) return fontSelfTestPromise;
+  fontSelfTestPromise = (async () => {
+    try {
+      const probeSvg = `<svg width="120" height="60" xmlns="http://www.w3.org/2000/svg"><rect width="120" height="60" fill="#fff"/><text x="10" y="40" font-family="${FONT_BODY}" font-size="36" fill="#000">Aa1</text></svg>`;
+      const { data, info } = await sharp(Buffer.from(probeSvg)).raw().toBuffer({ resolveWithObject: true });
+      let inkPixels = 0;
+      for (let i = 0; i < data.length; i += info.channels) {
+        if (data[i] < 200) inkPixels++; // anything meaningfully darker than the white background
+      }
+      if (inkPixels < 20) {
+        logger.error(
+          {
+            FONTCONFIG_FILE: process.env.FONTCONFIG_FILE,
+            FONTCONFIG_PATH: process.env.FONTCONFIG_PATH,
+            fontsDir: FONTS_DIR,
+            fontsDirExists: fssync.existsSync(FONTS_DIR),
+          },
+          'RECEIPT FONT SELF-TEST FAILED: no glyph ink detected when rendering test text. ' +
+            'Receipts will render as blank cards (vector lines only, no text). ' +
+            'Most likely cause: the "assets" folder was not copied into this deployment image, ' +
+            'or the "fontconfig" OS package is not installed. See Dockerfile / Dockerfile.worker ' +
+            'for the required "COPY assets" step and "apt-get install fontconfig".'
+        );
+      } else {
+        logger.info({ inkPixels }, 'Receipt font self-test passed');
+      }
+    } catch (err) {
+      logger.error({ err: err.message }, 'Receipt font self-test itself failed to run (non-fatal, continuing)');
+    }
+  })();
+  return fontSelfTestPromise;
+}
+
 /**
  * Renders a receipt PNG for a ledger entry, stores it, and returns a
  * safe, unguessable, expiring URL suitable for handing straight to the
  * WhatsApp message broker as a media attachment.
  */
 async function generateReceipt({ merchant, ledgerEntry }) {
+  // Fire-and-forget: don't make every single receipt wait on this, but
+  // do make sure it's running so the warning above shows up promptly.
+  verifyFontsRenderable();
+
   const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
 

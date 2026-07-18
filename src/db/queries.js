@@ -56,22 +56,36 @@ async function getSubscriptionTierById(id) {
 
 // --- Merchants ---------------------------------------------------------
 
-async function findOrCreateMerchantByWhatsappNumber(whatsappNumber) {
+async function findOrCreateMerchantByWhatsappNumber(whatsappNumber, whatsappDisplayName) {
   const existing = await query(`${MERCHANT_WITH_TIER_SELECT} WHERE m.whatsapp_number = $1`, [
     whatsappNumber,
   ]);
-  if (existing.rows[0]) return existing.rows[0];
+  if (existing.rows[0]) {
+    // WhatsApp resends the contact's current profile name on every
+    // delivery — cheap to keep in sync so Kika always has an up to date
+    // fallback for greetings even if the merchant never introduces
+    // themselves. Only writes when it actually changed, and never
+    // touches merchant_name (the name the merchant explicitly gave us).
+    if (whatsappDisplayName && whatsappDisplayName !== existing.rows[0].whatsapp_display_name) {
+      await query('UPDATE merchants SET whatsapp_display_name = $2 WHERE id = $1', [
+        existing.rows[0].id,
+        whatsappDisplayName,
+      ]);
+      existing.rows[0].whatsapp_display_name = whatsappDisplayName;
+    }
+    return existing.rows[0];
+  }
 
   // New merchants default to subscription_tier_id 1 (Free) and
   // onboarding_state 'PENDING_CONSENT' via the columns' own DEFAULTs —
   // the very first thing they see is the consent prompt, before any
   // ledger functionality is available to them.
   const created = await query(
-    `INSERT INTO merchants (whatsapp_number)
-     VALUES ($1)
+    `INSERT INTO merchants (whatsapp_number, whatsapp_display_name)
+     VALUES ($1, $2)
      ON CONFLICT (whatsapp_number) DO UPDATE SET whatsapp_number = EXCLUDED.whatsapp_number
      RETURNING id`,
-    [whatsappNumber]
+    [whatsappNumber, whatsappDisplayName || null]
   );
   return getMerchantById(created.rows[0].id);
 }
@@ -130,9 +144,42 @@ async function restartConsentFlow(merchantId) {
 async function setMerchantBusinessName(merchantId, businessName) {
   const res = await query(
     `UPDATE merchants
-     SET business_name = $2, onboarding_state = 'ACTIVE'
+     SET business_name = $2, onboarding_state = 'AWAITING_BUSINESS_TYPE'
      WHERE id = $1 RETURNING id`,
     [merchantId, businessName]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/**
+ * Second onboarding step, right after business name: the merchant's own
+ * free-text answer to "what type of business is it?" is stored verbatim
+ * in business_type, alongside Kika's own classification of it into a
+ * fixed business_category (see categorizationService.categorizeBusinessType,
+ * called by the worker before this is written). Advances to ACTIVE —
+ * this is the last onboarding gate.
+ */
+async function setMerchantBusinessType(merchantId, businessType, businessCategory) {
+  const res = await query(
+    `UPDATE merchants
+     SET business_type = $2, business_category = $3, onboarding_state = 'ACTIVE'
+     WHERE id = $1 RETURNING id`,
+    [merchantId, businessType, businessCategory || null]
+  );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/**
+ * Sets the merchant's OWN name — deliberately distinct from
+ * whatsapp_display_name (Meta's contact profile name, captured
+ * automatically) and business_name (their shop's name). Only written
+ * when the merchant actually introduces themselves ("I'm Samuel") or
+ * answers a direct name prompt — never inferred or guessed.
+ */
+async function setMerchantName(merchantId, merchantName) {
+  const res = await query(
+    'UPDATE merchants SET merchant_name = $2 WHERE id = $1 RETURNING id',
+    [merchantId, merchantName]
   );
   return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
 }
@@ -226,8 +273,9 @@ async function createLedgerEntry(client, entry) {
   const res = await client.query(
     `INSERT INTO ledger_entries
        (merchant_id, entry_type, counterparty_name, counterparty_phone, description, items,
-        total_kobo, paid_kobo, balance_kobo, balance_after_kobo, currency, is_settled, raw_message)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
+        total_kobo, paid_kobo, balance_kobo, balance_after_kobo, currency, is_settled, raw_message,
+        whatsapp_message_id, reply_to_whatsapp_message_id, expense_category)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      RETURNING *`,
     [
       entry.merchantId,
@@ -243,9 +291,57 @@ async function createLedgerEntry(client, entry) {
       entry.currency || 'NGN',
       entry.balanceKobo <= 0,
       entry.rawMessage || null,
+      entry.whatsappMessageId || null,
+      entry.replyToWhatsappMessageId || null,
+      entry.expenseCategory || null,
     ]
   );
   return res.rows[0];
+}
+
+/**
+ * Records the wamid of KIKA'S OWN reply/receipt about a ledger entry —
+ * called right after the outbound WhatsApp send succeeds. This is what
+ * lets a later inbound reply (its `context.id` matching this value) be
+ * resolved back to the exact entry it's responding to — see
+ * getLedgerEntryByOutboundMessageId and ledgerParser.parseReplyMessage.
+ * Fire-and-forget safe: a failure here never blocks the send itself,
+ * it just means that specific message can't be used as a reply anchor.
+ */
+async function setLedgerEntryOutboundMessageId(ledgerEntryId, outboundWhatsappMessageId) {
+  if (!ledgerEntryId || !outboundWhatsappMessageId) return;
+  await query('UPDATE ledger_entries SET outbound_whatsapp_message_id = $2 WHERE id = $1', [
+    ledgerEntryId,
+    outboundWhatsappMessageId,
+  ]);
+}
+
+/**
+ * Resolves an inbound message's `context.id` (the wamid it's replying
+ * to) back to the ledger entry Kika originally messaged about, if any.
+ * Scoped to this merchant and to non-voided entries — a reply can only
+ * ever meaningfully refer to that merchant's own still-valid record.
+ */
+async function getLedgerEntryByOutboundMessageId(merchantId, outboundWhatsappMessageId) {
+  if (!outboundWhatsappMessageId) return null;
+  const res = await query(
+    `SELECT * FROM ledger_entries
+     WHERE merchant_id = $1 AND outbound_whatsapp_message_id = $2 AND is_voided = false
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [merchantId, outboundWhatsappMessageId]
+  );
+  return res.rows[0] || null;
+}
+
+/** Whether a given inbound WhatsApp message id has already produced a ledger entry — permanent audit/traceability check beyond the 48h Redis idempotency lock's TTL. */
+async function getLedgerEntryByWhatsappMessageId(merchantId, whatsappMessageId) {
+  if (!whatsappMessageId) return null;
+  const res = await query(
+    'SELECT * FROM ledger_entries WHERE merchant_id = $1 AND whatsapp_message_id = $2 LIMIT 1',
+    [merchantId, whatsappMessageId]
+  );
+  return res.rows[0] || null;
 }
 
 /**
@@ -1211,6 +1307,8 @@ module.exports = {
   markConsentDeclined,
   restartConsentFlow,
   setMerchantBusinessName,
+  setMerchantBusinessType,
+  setMerchantName,
   setMerchantClosingHour,
   setMerchantLogo,
   setAwaitingLogoWindow,
@@ -1219,6 +1317,9 @@ module.exports = {
   downgradeMerchantToFreeTier,
   extendMerchantSubscription,
   createLedgerEntry,
+  setLedgerEntryOutboundMessageId,
+  getLedgerEntryByOutboundMessageId,
+  getLedgerEntryByWhatsappMessageId,
   settleOutstandingDebtForCounterparty,
   lockCustomerBalance,
   applyCustomerBalanceDelta,
