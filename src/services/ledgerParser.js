@@ -292,6 +292,7 @@ const COMMAND_KEYWORDS = {
   UNDO: ['undo', 'delete last sale', 'delete last entry', 'cancel last sale'],
   EXPORT: ['export', 'my data', 'excel', 'csv'],
   REVIEW_SCAN: ['review scan', 'review'],
+  TESTDIGEST: ['testdigest', 'test digest'],
   GREETING: [
     'hi', 'hey', 'hello', 'howdy', 'yo',
     'hi kika', 'hey kika', 'hello kika', 'yo kika',
