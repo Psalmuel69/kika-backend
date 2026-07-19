@@ -21,12 +21,6 @@ const auditLogService = require('../services/auditLogService');
 const diskCleanupService = require('../services/diskCleanupService');
 const { getFallbackReply, AI_ERROR_FALLBACK_REPLY, GREETING_REPLY } = require('../config/aiPersona');
 const { registerSchedules } = require('./scheduler');
-const { startOfMonth, addMonths, monthKey } = require('../../../AppData/Local/Temp/1b2c693d-199d-45af-98de-021f4c17db2b_kika-backend (9).zip.b2b/kika-backend/src/queue/worker');
-const fullReportService = require('../services/fullReportService');
-const ledgerService = require('../services/ledgerService');
-const monthlyDigestService = require('../services/monthlyDigestService');
-const whatsappService = require('../services/whatsappService');
-const logger = require('../utils/logger');
 
 const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || 10);
 const ONBOARDING_GATE_STATES = ['PENDING_CONSENT', 'CONSENT_DECLINED', 'AWAITING_BUSINESS_NAME', 'AWAITING_BUSINESS_TYPE'];
@@ -366,6 +360,44 @@ const ledgerWorker = new Worker(
       return;
     }
 
+    // TESTDIGEST — dev/QA utility. Regenerates and sends THIS merchant's
+    // current-month digest card + full report on demand, bypassing the
+    // real scheduled flow's Premium-only gate and "active this month"
+    // requirement. Calls the generation services directly rather than
+    // going through report_dispatch_log, so it never marks the real
+    // monthly send as already-delivered — running this doesn't affect
+    // whether the actual 1st-of-month job fires normally later.
+    if (command === 'TESTDIGEST') {
+      const now = new Date();
+      const monthStart = startOfMonth(now);
+      const monthEnd = addMonths(monthStart, 1);
+      const prevMonthStart = addMonths(monthStart, -1);
+      const periodKey = monthKey(monthStart); // digest_cards/monthly_reports upsert on (merchant_id, period_key), so repeat test runs just update the same row — safe and keeps within the VARCHAR(10) column
+
+      try {
+        const digestSummary = await ledgerService.buildMonthlyDigestSummary(merchantId, monthStart, monthEnd, prevMonthStart);
+        logger.info({ merchantId, digestSummary }, 'TESTDIGEST summary');
+
+        const digestCard = await monthlyDigestService.generateDigestCard({ merchant, periodKey, ...digestSummary });
+        const { reportUrl, snapshot } = await fullReportService.generateFullReport({ merchant, periodKey, monthStart, monthEnd, prevMonthStart });
+        logger.info({ merchantId, snapshot }, 'TESTDIGEST full report snapshot');
+
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `\ud83e\uddea *Test Digest* (this month so far, not the real monthly send)\n\nMoney Inflow: \u20a6${(digestSummary.moneyInflowKobo / 100).toLocaleString('en-NG')}\nOutstanding: \u20a6${(digestSummary.outstandingKobo / 100).toLocaleString('en-NG')}\nTrade Days: ${digestSummary.tradeDays}\nTop Debtor: ${digestSummary.topDebtor?.counterparty_name || 'None'}`
+        );
+        await whatsappService.sendMonthlyDigestCard(whatsappNumber, {
+          imageUrl: digestCard.url,
+          bodyText: 'Test digest card \u2014 this is what your real Monthly Digest will look like.',
+          reportUrl,
+        });
+      } catch (err) {
+        logger.error({ err: err.message, merchantId }, 'TESTDIGEST failed');
+        await whatsappService.sendTextMessage(whatsappNumber, `TESTDIGEST failed: ${err.message}`);
+      }
+      return;
+    }
+
     if (command === 'UPGRADE') {
       const highestTier = await queries.getHighestActiveSubscriptionTier();
       if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
@@ -478,44 +510,6 @@ const ledgerWorker = new Worker(
       }
       const lines = JSON.parse(cached);
       await whatsappService.sendTextMessage(whatsappNumber, lines.join('\n'));
-      return;
-    }
-
-    // TESTDIGEST — dev/QA utility. Regenerates and sends THIS merchant's
-    // current-month digest card + full report on demand, bypassing the
-    // real scheduled flow's Premium-only gate and "active this month"
-    // requirement. Calls the generation services directly rather than
-    // going through report_dispatch_log, so it never marks the real
-    // monthly send as already-delivered — running this doesn't affect
-    // whether the actual 1st-of-month job fires normally later.
-    if (command === 'TESTDIGEST') {
-      const now = new Date();
-      const monthStart = startOfMonth(now);
-      const monthEnd = addMonths(monthStart, 1);
-      const prevMonthStart = addMonths(monthStart, -1);
-      const periodKey = monthKey(monthStart); // digest_cards/monthly_reports upsert on (merchant_id, period_key), so repeat test runs just update the same row — safe and keeps within the VARCHAR(10) column
-
-      try {
-        const digestSummary = await ledgerService.buildMonthlyDigestSummary(merchantId, monthStart, monthEnd, prevMonthStart);
-        logger.info({ merchantId, digestSummary }, 'TESTDIGEST summary');
-
-        const digestCard = await monthlyDigestService.generateDigestCard({ merchant, periodKey, ...digestSummary });
-        const { reportUrl, snapshot } = await fullReportService.generateFullReport({ merchant, periodKey, monthStart, monthEnd, prevMonthStart });
-        logger.info({ merchantId, snapshot }, 'TESTDIGEST full report snapshot');
-
-        await whatsappService.sendTextMessage(
-          whatsappNumber,
-          `\ud83e\uddea *Test Digest* (this month so far, not the real monthly send)\n\nMoney Inflow: \u20a6${(digestSummary.moneyInflowKobo / 100).toLocaleString('en-NG')}\nOutstanding: \u20a6${(digestSummary.outstandingKobo / 100).toLocaleString('en-NG')}\nTrade Days: ${digestSummary.tradeDays}\nTop Debtor: ${digestSummary.topDebtor?.counterparty_name || 'None'}`
-        );
-        await whatsappService.sendMonthlyDigestCard(whatsappNumber, {
-          imageUrl: digestCard.url,
-          bodyText: 'Test digest card \u2014 this is what your real Monthly Digest will look like.',
-          reportUrl,
-        });
-      } catch (err) {
-        logger.error({ err: err.message, merchantId }, 'TESTDIGEST failed');
-        await whatsappService.sendTextMessage(whatsappNumber, `TESTDIGEST failed: ${err.message}`);
-      }
       return;
     }
 
