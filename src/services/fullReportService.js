@@ -122,46 +122,121 @@ async function buildReportSnapshot({ merchant, periodKey, monthStart, monthEnd, 
   };
 }
 
+// ---------------------------------------------------------------------------
+// This HTML/CSS is a direct port of the supplied FullReport.tsx +
+// WeeklyRevenueChart.tsx (React/Tailwind) — every hex color, spacing value,
+// type size, and icon below matches those components exactly (icon path
+// data pulled straight from `lucide-static`, so it's pixel-identical to
+// lucide-react's own rendering). The one deliberate structural change: the
+// TSX renders this as a modal dialog (dark backdrop, close button, escape-
+// to-close) sitting on top of a host page; a monthly report is instead a
+// standalone page reached via its own link, so the "card" IS the page and
+// the close button is dropped — there's nothing here for it to close.
+// Framer-motion's entrance animations aren't meaningful for a page a
+// merchant opens directly, so they're intentionally not reproduced either.
+// Everything else — every section, color, icon, and pixel value — is as-is.
+// ---------------------------------------------------------------------------
+
+// Exact icon path data from lucide-static, matching lucide-react's
+// TrendingUp / AlertTriangle / Zap / BookOpen used in FullReport.tsx.
+const ICON_PATHS = {
+  trendingUp: ['M16 7h6v6', 'm22 7-8.5 8.5-5-5L2 17'],
+  alertTriangle: [
+    'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3',
+    'M12 9v4',
+    'M12 17h.01',
+  ],
+  zap: [
+    'M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z',
+  ],
+  bookOpen: [
+    'M12 7v14',
+    'M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z',
+  ],
+};
+
+function lucideIcon(name, { size = 18, color = 'currentColor', strokeWidth = 2.3 } = {}) {
+  const paths = ICON_PATHS[name].map((d) => `<path d="${d}" />`).join('');
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+}
+
+const STAT_ICON_BY_ID = { revenue: 'trendingUp', outstanding: 'alertTriangle', cashflow: 'zap' };
+
+function renderStatCard({ id, icon, label, value, tone, note }) {
+  return `
+    <div class="stat-card">
+      <div class="stat-icon">${lucideIcon(icon, { size: 18, color: tone === 'green' ? 'var(--tone-green)' : 'var(--tone-amber)', strokeWidth: 2.3 })}</div>
+      <p class="stat-label">${escapeHtml(label)}</p>
+      <div class="stat-value ${tone}">${value}</div>
+      <p class="stat-note">${escapeHtml(note)}</p>
+    </div>`;
+}
+
 function renderDebtorRow(d) {
   const initial = escapeHtml((d.counterparty_name || '?').charAt(0).toUpperCase());
   return `
     <div class="debtor-row">
-      <div class="avatar">${initial}</div>
-      <div class="debtor-main">
-        <div class="debtor-top">
-          <span class="debtor-name">${escapeHtml(d.counterparty_name)}</span>
-          <span class="debtor-amount">${formatNaira(d.balance_kobo)}</span>
-        </div>
-        <div class="progress-track"><div class="progress-fill" style="width:${d.percentage}%"></div></div>
-      </div>
+      <div class="debtor-avatar">${initial}</div>
+      <span class="debtor-name">${escapeHtml(d.counterparty_name)}</span>
+      <span class="debtor-amount">${formatNaira(d.balance_kobo)}</span>
       <span class="debtor-pct">${d.percentage}%</span>
-    </div>`;
+    </div>
+    <div class="debtor-progress-track"><div class="debtor-progress-fill" style="width:${d.percentage}%"></div></div>`;
 }
 
 function renderProductRow(p, index) {
   return `
     <div class="product-row">
       <div class="product-rank">${index + 1}</div>
+      <span class="product-name">${escapeHtml(capitalize(p.name))}</span>
       <div class="product-main">
-        <span class="product-name">${escapeHtml(capitalize(p.name))}</span>
-        <span class="product-units">${Math.round(Number(p.total_quantity))} units</span>
+        <div class="product-amount">${formatNaira(p.revenue_kobo)}</div>
+        <div class="product-units">${Math.round(Number(p.total_quantity))} units</div>
       </div>
-      <span class="product-revenue">${formatNaira(p.revenue_kobo)}</span>
     </div>`;
 }
 
-function renderWeekBar(w, maxKobo) {
-  const heightPct = maxKobo > 0 ? Math.max(6, Math.round((w.revenueKobo / maxKobo) * 100)) : 6;
+function renderWeekBar(w, maxKobo, isBest) {
+  const CHART_HEIGHT = 168;
+  const heightPx = maxKobo > 0 ? Math.max((w.revenueKobo / maxKobo) * CHART_HEIGHT, 24) : 24;
+  const shortLabel = w.revenueKobo >= 1000 ? `\u20a6${Math.round(w.revenueKobo / 1000)}k` : formatNaira(w.revenueKobo);
   return `
     <div class="week-col">
-      <span class="week-amount">${formatNaira(w.revenueKobo).replace('\u20a6', '\u20a6')}</span>
-      <div class="week-bar-track"><div class="week-bar" style="height:${heightPct}%"></div></div>
+      <span class="week-value">${escapeHtml(shortLabel)}</span>
+      <div class="week-track" style="height:${CHART_HEIGHT}px">
+        <div class="week-bar ${isBest ? 'best' : ''}" style="height:${heightPx}px"></div>
+      </div>
       <span class="week-label">W${w.week}</span>
     </div>`;
 }
 
 function renderReportHtml(snapshot) {
   const maxWeekKobo = Math.max(...snapshot.weeklyRevenue.map((w) => w.revenueKobo), 1);
+  const weekCols = Math.max(snapshot.weeklyRevenue.length, 1);
+
+  const stats = [
+    {
+      id: 'revenue',
+      label: 'Total Revenue',
+      value: formatNaira(snapshot.totalRevenueKobo),
+      tone: 'green',
+      note: snapshot.growthPct == null ? 'No prior data' : `${snapshot.growthPct >= 0 ? '+' : ''}${snapshot.growthPct.toFixed(0)}% vs last month`,
+    },
+    {
+      id: 'outstanding',
+      label: 'Outstanding',
+      value: formatNaira(snapshot.totalOutstandingKobo),
+      tone: 'amber',
+      note: `${snapshot.debtorCount} debtor${snapshot.debtorCount === 1 ? '' : 's'}`,
+    },
+    {
+      id: 'cashflow',
+      label: 'Net Cashflow',
+      value: formatNaira(snapshot.netCashflowKobo),
+      tone: 'green',
+      note: snapshot.netCashflowKobo >= 0 ? 'Clean profit' : 'Running at a loss',
+    },
+  ];
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -171,120 +246,159 @@ function renderReportHtml(snapshot) {
 <title>Kika Monthly Report \u2014 ${escapeHtml(snapshot.periodKey)}</title>
 <style>
   :root {
-    --bg: #0B0F19; --card-bg: #161B26; --accent: #10B981; --mint: #34D399;
-    --amber: #FBBF24; --coral: #F0655A; --text-primary: #F9FAFB; --text-muted: #9CA3AF;
+    --tone-green: #22c55e; --tone-amber: #eab308; --tone-red: #f05252; --tone-red-dark: #d63c3c;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text-primary);
+    margin: 0; background: #0b0b0c; color: #ffffff;
     font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
-    padding: 24px 16px 60px; max-width: 640px; margin-inline: auto;
+    display: flex; justify-content: center; padding: 24px 12px 48px;
   }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 24px; }
-  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; }
-  .stat-card { background: var(--card-bg); border-radius: 16px; padding: 16px 14px; }
-  .stat-icon { font-size: 20px; margin-bottom: 8px; }
-  .stat-label { color: var(--text-muted); font-size: 13px; margin-bottom: 6px; }
-  .stat-value { font-size: 22px; font-weight: 700; }
-  .stat-value.green { color: var(--mint); }
-  .stat-value.amber { color: var(--amber); }
-  .stat-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
-  .section-card { background: var(--card-bg); border-radius: 16px; padding: 20px; margin-bottom: 20px; }
-  .section-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
-  .section-title { font-size: 17px; font-weight: 700; }
-  .section-total { color: var(--amber); font-weight: 700; font-size: 14px; }
-  .week-chart { display: flex; justify-content: space-between; align-items: flex-end; height: 160px; margin-bottom: 12px; }
-  .week-col { display: flex; flex-direction: column; align-items: center; width: 22%; height: 100%; }
-  .week-amount { font-size: 11px; color: var(--text-muted); margin-bottom: 6px; }
-  .week-bar-track { flex: 1; width: 100%; display: flex; align-items: flex-end; }
-  .week-bar { width: 100%; background: linear-gradient(180deg, var(--mint), #0d5c40); border-radius: 8px 8px 4px 4px; }
-  .week-label { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
-  .callout { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-muted); border-top: 1px solid rgba(255,255,255,0.08); padding-top: 12px; }
-  .callout-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mint); flex-shrink: 0; }
-  .debtor-row { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
-  .debtor-row:last-child { margin-bottom: 0; }
-  .avatar { width: 36px; height: 36px; border-radius: 50%; background: #4A3416; color: var(--amber); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
-  .debtor-main { flex: 1; min-width: 0; }
-  .debtor-top { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
-  .debtor-name { font-weight: 600; }
-  .debtor-amount { color: var(--amber); font-weight: 700; }
-  .progress-track { height: 6px; border-radius: 4px; background: rgba(255,255,255,0.08); overflow: hidden; }
-  .progress-fill { height: 100%; background: var(--amber); border-radius: 4px; }
-  .debtor-pct { font-size: 12px; color: var(--text-muted); width: 36px; text-align: right; flex-shrink: 0; }
-  .product-row { display: flex; align-items: center; gap: 14px; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
-  .product-row:last-child { border-bottom: none; }
-  .product-rank { width: 26px; height: 26px; border-radius: 8px; background: #3A1620; color: var(--coral); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
-  .product-main { flex: 1; display: flex; flex-direction: column; }
-  .product-name { font-weight: 600; font-size: 15px; }
-  .product-units { font-size: 12px; color: var(--text-muted); }
-  .product-revenue { font-weight: 700; font-size: 16px; }
-  .insight-card { background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.4); border-radius: 16px; padding: 18px; display: flex; gap: 14px; }
-  .insight-icon { width: 36px; height: 36px; border-radius: 50%; background: rgba(16,185,129,0.2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 16px; }
-  .insight-title { color: var(--mint); font-weight: 700; font-size: 15px; margin-bottom: 6px; }
-  .insight-text { font-size: 14px; line-height: 1.5; color: #D1D5DB; }
+  .card {
+    width: 100%; max-width: 720px; background: #131315; border: 1px solid #26262b;
+    border-radius: 20px; overflow: hidden;
+  }
+  /* ===== Header ===== */
+  .header { display: flex; align-items: flex-start; gap: 16px; padding: 24px 24px 8px; }
+  .header-badge {
+    flex-shrink: 0; width: 44px; height: 44px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--tone-red), var(--tone-red-dark));
+    display: flex; align-items: center; justify-content: center;
+  }
+  .header h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
+  .header .subtitle { margin: 2px 0 0; font-size: 12.5px; color: #7d7d85; }
+
+  /* ===== Stat cards ===== */
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 16px 24px 0; }
+  @media (max-width: 560px) { .stat-grid { grid-template-columns: 1fr; } }
+  .stat-card { border-radius: 12px; border: 1px solid #232328; background: #1a1a1d; padding: 16px; }
+  .stat-icon { line-height: 0; }
+  .stat-label { margin: 14px 0 0; font-size: 12px; font-weight: 500; color: #9a9aa3; }
+  .stat-value { margin: 6px 0 0; font-size: 21px; font-weight: 700; letter-spacing: -0.2px; line-height: 1; }
+  .stat-value.green { color: var(--tone-green); }
+  .stat-value.amber { color: var(--tone-amber); }
+  .stat-note { margin: 8px 0 0; font-size: 11.5px; color: #6b6b73; }
+
+  /* ===== Shared section card ===== */
+  .section-card { border-radius: 16px; border: 1px solid #232328; background: #1a1a1d; margin: 16px 24px 0; padding: 20px; }
+  .section-header { display: flex; align-items: baseline; justify-content: space-between; }
+  .section-title { margin: 0; font-size: 15px; font-weight: 600; }
+  .section-period { font-size: 12px; color: #6b6b73; }
+  .section-total { font-size: 13.5px; font-weight: 600; color: var(--tone-amber); }
+
+  /* ===== Weekly Revenue ===== */
+  .week-chart { margin-top: 24px; display: grid; grid-template-columns: repeat(${weekCols}, 1fr); gap: 16px; }
+  .week-col { display: flex; flex-direction: column; align-items: center; }
+  .week-value { font-size: 12px; font-weight: 500; color: #7d7d85; margin-bottom: 8px; }
+  .week-track { width: 100%; display: flex; align-items: flex-end; justify-content: center; }
+  .week-bar {
+    width: 100%; max-width: 150px; border-radius: 10px 10px 0 0;
+    background: linear-gradient(180deg, #0f6b48, #0d5a3e);
+  }
+  .week-bar.best {
+    background: linear-gradient(180deg, #4ade80, #10b981);
+    box-shadow: 0 0 28px -4px rgba(52, 211, 153, 0.45);
+  }
+  .week-label { margin-top: 10px; font-size: 12px; color: #6b6b73; }
+  .week-divider { margin-top: 20px; height: 1px; background: #232328; }
+  .week-callout { margin-top: 16px; display: flex; align-items: center; gap: 10px; }
+  .week-callout-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tone-green); box-shadow: 0 0 10px rgba(34,197,94,0.8); flex-shrink: 0; }
+  .week-callout-text { font-size: 13px; color: #9a9aa3; }
+
+  /* ===== Outstanding Debts ===== */
+  .debtor-row { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
+  .section-card .debtor-row:first-of-type { margin-top: 20px; }
+  .debtor-avatar {
+    flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid rgba(74,61,22,0.6); background: #2c2410; color: var(--tone-amber);
+    display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700;
+  }
+  .debtor-name { font-size: 13.5px; font-weight: 500; color: #e4e4e7; }
+  .debtor-amount { margin-left: auto; font-size: 13.5px; font-weight: 700; color: #ffffff; }
+  .debtor-pct { width: 32px; text-align: right; font-size: 11.5px; color: #6b6b73; }
+  .debtor-progress-track { margin-left: 48px; margin-top: 8px; height: 7px; border-radius: 999px; background: #26262b; overflow: hidden; }
+  .debtor-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #d97706, #facc15); box-shadow: 0 0 12px rgba(234,179,8,0.35); }
+  .empty-note { margin-top: 16px; font-size: 13px; color: #6b6b73; }
+
+  /* ===== Top Products ===== */
+  .products-card { padding: 0; }
+  .products-title { margin: 0; padding: 20px 20px 12px; font-size: 15px; font-weight: 600; }
+  .product-row { display: flex; align-items: center; gap: 16px; padding: 18px 20px; border-top: 1px solid #222226; }
+  .product-row:first-child { border-top: none; }
+  .product-rank {
+    flex-shrink: 0; width: 28px; height: 28px; border-radius: 8px;
+    border: 1px solid rgba(91,36,38,0.5); background: #331a1c; color: var(--tone-red);
+    display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+  }
+  .product-name { font-size: 13.5px; font-weight: 500; color: #d4d4d8; }
+  .product-main { margin-left: auto; text-align: right; }
+  .product-amount { font-size: 13.5px; font-weight: 700; color: #ffffff; }
+  .product-units { margin-top: 2px; font-size: 11.5px; color: #6b6b73; }
+
+  /* ===== Kika AI Insight ===== */
+  .insight-card {
+    margin: 16px 24px 24px; padding: 20px; border-radius: 16px;
+    border: 1px solid rgba(20,83,45,0.4); background: linear-gradient(135deg, #0b1f16, #091711);
+  }
+  .insight-header { display: flex; align-items: center; gap: 12px; }
+  .insight-icon {
+    flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%;
+    border: 1px solid rgba(22,101,52,0.6); background: #052e16;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .insight-title { margin: 0; font-size: 14px; font-weight: 600; color: #4ade80; }
+  .insight-body { margin: 14px 0 0; font-size: 13.5px; line-height: 1.7; color: #9db4a7; }
 </style>
 </head>
 <body>
-  <h1>Monthly Report</h1>
-  <div class="subtitle">${escapeHtml(snapshot.businessName)} &middot; ${escapeHtml(snapshot.periodKey)}</div>
+  <div class="card">
+    <div class="header">
+      <div class="header-badge">${lucideIcon('bookOpen', { size: 20, color: '#ffffff', strokeWidth: 2.2 })}</div>
+      <div>
+        <h1>${escapeHtml(snapshot.periodKey)} \u2014 Full Report</h1>
+        <p class="subtitle">${escapeHtml(snapshot.businessName)} &middot; Powered by Kika AI</p>
+      </div>
+    </div>
 
-  <div class="stat-grid">
-    <div class="stat-card">
-      <div class="stat-icon">\ud83d\udcc8</div>
-      <div class="stat-label">Total Revenue</div>
-      <div class="stat-value green">${formatNaira(snapshot.totalRevenueKobo)}</div>
-      <div class="stat-sub">${snapshot.growthPct == null ? 'No prior data' : `${snapshot.growthPct >= 0 ? '+' : ''}${snapshot.growthPct.toFixed(0)}% vs last month`}</div>
+    <div class="stat-grid">
+      ${stats.map((s) => renderStatCard({ ...s, icon: STAT_ICON_BY_ID[s.id] })).join('')}
     </div>
-    <div class="stat-card">
-      <div class="stat-icon">\u26a0\ufe0f</div>
-      <div class="stat-label">Outstanding</div>
-      <div class="stat-value amber">${formatNaira(snapshot.totalOutstandingKobo)}</div>
-      <div class="stat-sub">${snapshot.debtorCount} debtor${snapshot.debtorCount === 1 ? '' : 's'}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-icon">\u26a1</div>
-      <div class="stat-label">Net Cashflow</div>
-      <div class="stat-value green">${formatNaira(snapshot.netCashflowKobo)}</div>
-      <div class="stat-sub">Clean profit</div>
-    </div>
-  </div>
 
-  <div class="section-card">
-    <div class="section-header">
-      <span class="section-title">Weekly Revenue</span>
-      <span class="stat-sub">${escapeHtml(snapshot.periodKey)}</span>
+    <div class="section-card">
+      <div class="section-header">
+        <h3 class="section-title">Weekly Revenue</h3>
+        <span class="section-period">${escapeHtml(snapshot.periodKey)}</span>
+      </div>
+      <div class="week-chart">
+        ${snapshot.weeklyRevenue.map((w) => renderWeekBar(w, maxWeekKobo, snapshot.bestWeek && w.week === snapshot.bestWeek.week)).join('')}
+      </div>
+      ${snapshot.bestWeek ? `
+      <div class="week-divider"></div>
+      <div class="week-callout">
+        <span class="week-callout-dot"></span>
+        <span class="week-callout-text">Week ${snapshot.bestWeek.week} was your best trading week \u2014 ${formatNaira(snapshot.bestWeek.revenueKobo)} in sales</span>
+      </div>` : ''}
     </div>
-    <div class="week-chart">
-      ${snapshot.weeklyRevenue.map((w) => renderWeekBar(w, maxWeekKobo)).join('')}
-    </div>
-    ${snapshot.bestWeek ? `
-    <div class="callout">
-      <span class="callout-dot"></span>
-      <span>Week ${snapshot.bestWeek.week} was your best trading week \u2014 ${formatNaira(snapshot.bestWeek.revenueKobo)} in sales</span>
-    </div>` : ''}
-  </div>
 
-  <div class="section-card">
-    <div class="section-header">
-      <span class="section-title">Outstanding Debts</span>
-      <span class="section-total">${formatNaira(snapshot.totalOutstandingKobo)} total</span>
+    <div class="section-card">
+      <div class="section-header">
+        <h3 class="section-title">Outstanding Debts</h3>
+        <span class="section-total">${formatNaira(snapshot.totalOutstandingKobo)} total</span>
+      </div>
+      ${snapshot.debtors.length > 0 ? snapshot.debtors.map(renderDebtorRow).join('') : '<p class="empty-note">No outstanding debt \u2014 nice work.</p>'}
     </div>
-    ${snapshot.debtors.length > 0 ? snapshot.debtors.map(renderDebtorRow).join('') : '<div class="stat-sub">No outstanding debt \u2014 nice work.</div>'}
-  </div>
 
-  <div class="section-card">
-    <div class="section-header">
-      <span class="section-title">Top Products This Month</span>
+    <div class="section-card products-card">
+      <h3 class="products-title">Top Products This Month</h3>
+      ${snapshot.topProducts.length > 0 ? snapshot.topProducts.map(renderProductRow).join('') : '<p class="empty-note" style="padding:0 20px 20px;">No itemized sales recorded yet.</p>'}
     </div>
-    ${snapshot.topProducts.length > 0 ? snapshot.topProducts.map(renderProductRow).join('') : '<div class="stat-sub">No itemized sales recorded yet.</div>'}
-  </div>
 
-  <div class="insight-card">
-    <div class="insight-icon">\u26a1</div>
-    <div>
-      <div class="insight-title">Kika AI Insight</div>
-      <div class="insight-text">${escapeHtml(snapshot.aiInsight)}</div>
+    <div class="insight-card">
+      <div class="insight-header">
+        <div class="insight-icon">${lucideIcon('zap', { size: 16, color: 'var(--tone-green)', strokeWidth: 2.3 })}</div>
+        <h3 class="insight-title">Kika AI Insight</h3>
+      </div>
+      <p class="insight-body">${escapeHtml(snapshot.aiInsight)}</p>
     </div>
   </div>
 </body>
