@@ -184,6 +184,85 @@ async function setMerchantName(merchantId, merchantName) {
   return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
 }
 
+// --- NPS survey (engagementService.js) ------------------------------------
+
+/** Total non-voided ledger entries ever recorded — used to check the "50 transactions" NPS milestone. */
+async function getMerchantTransactionCount(merchantId) {
+  const res = await query(
+    'SELECT COUNT(*)::int AS count FROM ledger_entries WHERE merchant_id = $1 AND is_voided = false',
+    [merchantId]
+  );
+  return res.rows[0].count;
+}
+
+/** Non-voided ledger entries since a given timestamp — used for the weekly-transaction email-collection nudge. */
+async function getMerchantTransactionCountSince(merchantId, sinceDate) {
+  const res = await query(
+    'SELECT COUNT(*)::int AS count FROM ledger_entries WHERE merchant_id = $1 AND is_voided = false AND created_at >= $2',
+    [merchantId, sinceDate]
+  );
+  return res.rows[0].count;
+}
+
+/**
+ * Opens an NPS survey: creates the score-less row is NOT done here — a
+ * response row is only created once we actually HAVE a score (see
+ * createNpsResponse). This just flips the merchant into 'SCORE' stage and
+ * stamps nps_last_prompted_at, which is both the "asked recently" cooldown
+ * gate and the historical record of when each survey was sent.
+ */
+async function startNpsSurvey(merchantId, triggerReason) {
+  await query(
+    `UPDATE merchants
+     SET nps_awaiting_stage = 'SCORE', nps_last_prompted_at = now(), nps_pending_trigger_reason = $2
+     WHERE id = $1`,
+    [merchantId, triggerReason]
+  );
+}
+
+async function setNpsAwaitingStage(merchantId, stage) {
+  await query('UPDATE merchants SET nps_awaiting_stage = $2 WHERE id = $1', [merchantId, stage]);
+}
+
+async function createNpsResponse({ merchantId, score, triggerReason }) {
+  const res = await query(
+    `INSERT INTO nps_responses (merchant_id, score, trigger_reason) VALUES ($1, $2, $3) RETURNING *`,
+    [merchantId, score, triggerReason]
+  );
+  return res.rows[0];
+}
+
+async function setNpsResponseReason(npsResponseId, reason) {
+  await query('UPDATE nps_responses SET reason = $2 WHERE id = $1', [npsResponseId, reason]);
+}
+
+/** Most recent NPS response for this merchant without a reason yet — the row the REASON-stage answer belongs to. */
+async function getLatestReasonlessNpsResponse(merchantId) {
+  const res = await query(
+    `SELECT * FROM nps_responses WHERE merchant_id = $1 AND reason IS NULL ORDER BY created_at DESC LIMIT 1`,
+    [merchantId]
+  );
+  return res.rows[0] || null;
+}
+
+// --- Opt-in email collection (engagementService.js) -----------------------
+
+async function setMerchantEmail(merchantId, email) {
+  const res = await query('UPDATE merchants SET email = $2 WHERE id = $1 RETURNING id', [merchantId, email]);
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+async function setEmailCollectionAwaitingStage(merchantId, stage, { bumpPromptedAt = false } = {}) {
+  if (bumpPromptedAt) {
+    await query(
+      'UPDATE merchants SET email_collection_awaiting_stage = $2, email_collection_last_prompted_at = now() WHERE id = $1',
+      [merchantId, stage]
+    );
+  } else {
+    await query('UPDATE merchants SET email_collection_awaiting_stage = $2 WHERE id = $1', [merchantId, stage]);
+  }
+}
+
 async function setMerchantClosingHour(merchantId, hour) {
   const res = await query(
     'UPDATE merchants SET closing_hour_local = $2 WHERE id = $1 RETURNING id',
@@ -1315,6 +1394,15 @@ module.exports = {
   setMerchantBusinessName,
   setMerchantBusinessType,
   setMerchantName,
+  getMerchantTransactionCount,
+  getMerchantTransactionCountSince,
+  startNpsSurvey,
+  setNpsAwaitingStage,
+  createNpsResponse,
+  setNpsResponseReason,
+  getLatestReasonlessNpsResponse,
+  setMerchantEmail,
+  setEmailCollectionAwaitingStage,
   setMerchantClosingHour,
   setMerchantLogo,
   setAwaitingLogoWindow,

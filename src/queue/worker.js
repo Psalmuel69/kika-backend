@@ -16,6 +16,7 @@ const mediaService = require('../services/mediaService');
 const aiTransactionParser = require('../services/aiTransactionParser');
 const categorizationService = require('../services/categorizationService');
 const conversationMemory = require('../services/conversationMemory');
+const engagementService = require('../services/engagementService');
 const exportService = require('../services/exportService');
 const auditLogService = require('../services/auditLogService');
 const diskCleanupService = require('../services/diskCleanupService');
@@ -295,6 +296,25 @@ const ledgerWorker = new Worker(
         "I couldn't process that file — could you resend it, or type the details instead?"
       );
       return;
+    }
+
+    // In-progress NPS survey or email-collection reply takes priority over
+    // everything else — a bare "8" or an email address should never be
+    // mistaken for a transaction attempt or sent to the AI fallback. Both
+    // flows are plain deterministic state machines (engagementService.js),
+    // not AI-assisted, on purpose: a score or an email address is either a
+    // clean match or it isn't.
+    if (job.data.mediaType === 'text' && rawMessage) {
+      if (merchant.nps_awaiting_stage) {
+        const reply = await engagementService.handleNpsReply(merchant, rawMessage);
+        if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
+        return;
+      }
+      if (merchant.email_collection_awaiting_stage) {
+        const reply = await engagementService.handleEmailCollectionReply(merchant, rawMessage);
+        if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
+        return;
+      }
     }
 
     // A merchant introducing themselves by name ("I'm Samuel") is stored
@@ -728,6 +748,31 @@ const ledgerWorker = new Worker(
 
     for (const alert of lowStockAlerts || []) {
       await whatsappService.sendTextMessage(whatsappNumber, alert);
+    }
+
+    // Engagement nudges — checked after every successful recording, since
+    // that's the moment we know an up-to-date transaction count. Both are
+    // plain deterministic checks (engagementService.js), not AI-assisted.
+    // At most one fires per message: NPS is the rarer, more significant
+    // ask (once every ~3 months at most) and takes priority over the
+    // weekly email nudge on the off chance both conditions line up on the
+    // same transaction.
+    try {
+      const npsTriggerReason = await engagementService.checkNpsTrigger(merchant);
+      if (npsTriggerReason) {
+        const npsQuestion = await engagementService.triggerNpsSurvey(merchantId, npsTriggerReason);
+        await whatsappService.sendTextMessage(whatsappNumber, npsQuestion);
+      } else {
+        const weeklyCount = await engagementService.checkEmailMilestoneTrigger(merchant);
+        if (weeklyCount) {
+          const emailNudge = await engagementService.triggerEmailMilestone(merchantId, weeklyCount);
+          await whatsappService.sendTextMessage(whatsappNumber, emailNudge);
+        }
+      }
+    } catch (err) {
+      // Never let an engagement-nudge failure affect the transaction that
+      // was just successfully recorded and confirmed above.
+      logger.error({ err: err.message, merchantId }, 'Engagement nudge check failed (non-fatal)');
     }
   },
   { connection, concurrency: CONCURRENCY }

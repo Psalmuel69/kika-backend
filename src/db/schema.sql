@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS merchants (
     merchant_name        VARCHAR(120),                  -- the merchant's OWN name, only ever set when they actually introduce themselves ("I'm Samuel") or answer a direct name prompt — deliberately separate from whatsapp_display_name and business_name
     business_type        VARCHAR(160),                  -- the merchant's own free-text answer to "what type of business is it?", asked immediately after business_name during onboarding
     business_category    VARCHAR(60),                   -- Kika's classification of business_type into one fixed category (e.g. "Retail", "Wholesale") — see categorizationService.js
+    email                VARCHAR(255),                   -- only ever set when the merchant explicitly gives it in reply to the email-collection prompt (see engagementService.js) — never inferred or required
     subscription_tier_id INTEGER NOT NULL DEFAULT 1 REFERENCES subscription_tiers(id), -- 1 = Free
     subscription_expires_at TIMESTAMPTZ,                -- NULL while on the Free tier
     onboarding_state    VARCHAR(24)  NOT NULL DEFAULT 'PENDING_CONSENT'
@@ -91,6 +92,19 @@ CREATE TABLE IF NOT EXISTS merchants (
     logo_file_path       TEXT,                            -- uploaded business logo, embedded into receipts once set
     awaiting_logo_until TIMESTAMPTZ,                      -- short window after a fresh premium purchase where the next image is treated as a logo upload, not a transaction scan
     default_currency    VARCHAR(3)   NOT NULL DEFAULT 'NGN',
+    -- NPS survey state — see engagementService.js. nps_awaiting_stage tracks
+    -- a specific in-progress survey conversation (SCORE -> REASON), kept
+    -- separate from onboarding_state since it's a periodic interrupt on an
+    -- already-ACTIVE merchant, not a gate. nps_last_prompted_at both records
+    -- when we last asked (for the "track satisfaction over time" cadence)
+    -- and gates re-prompting too soon.
+    nps_awaiting_stage  VARCHAR(10) CHECK (nps_awaiting_stage IN ('SCORE', 'REASON')),
+    nps_last_prompted_at TIMESTAMPTZ,
+    nps_pending_trigger_reason VARCHAR(20) CHECK (nps_pending_trigger_reason IN ('ONE_MONTH', 'MILESTONE')), -- which condition fired the CURRENTLY in-progress survey, carried from the prompt through to the eventual score reply — see engagementService.js
+    -- Email-collection state — same shape as the NPS state above, for the
+    -- "want me to email you reports/tips?" milestone nudge.
+    email_collection_awaiting_stage VARCHAR(12) CHECK (email_collection_awaiting_stage IN ('OPT_IN', 'EMAIL')),
+    email_collection_last_prompted_at TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -297,6 +311,23 @@ CREATE TABLE IF NOT EXISTS customer_loyalty (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (merchant_id, counterparty_phone)
 );
+
+-- Net Promoter Score survey responses — one row per completed survey (a
+-- merchant can be asked again after the cooldown in engagementService.js,
+-- so this is intentionally NOT unique per merchant; every response is its
+-- own row, which is what "track satisfaction over time" needs). `score` is
+-- saved the moment the merchant answers the 0-10 question; `reason` is
+-- filled in by a follow-up UPDATE once they answer the "why" question, and
+-- stays NULL if they never do (score alone is still useful).
+CREATE TABLE IF NOT EXISTS nps_responses (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id         UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    score               SMALLINT NOT NULL CHECK (score BETWEEN 0 AND 10),
+    reason              TEXT,
+    trigger_reason      VARCHAR(20) NOT NULL DEFAULT 'MILESTONE' CHECK (trigger_reason IN ('ONE_MONTH', 'MILESTONE')), -- which condition fired this particular prompt — see engagementService.js
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_nps_responses_merchant_id ON nps_responses (merchant_id, created_at DESC);
 
 -- Paystack payment attempts for tier upgrades.
 CREATE TABLE IF NOT EXISTS payment_transactions (
@@ -581,3 +612,45 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_outbound_whatsapp_message_id
     ON ledger_entries (outbound_whatsapp_message_id) WHERE outbound_whatsapp_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_expense_category
     ON ledger_entries (merchant_id, expense_category) WHERE expense_category IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Migration: NPS survey (nps_responses table + merchants state columns) and
+-- opt-in email collection (merchants.email + state columns). Both are
+-- deterministic conversation flows handled entirely in worker.js /
+-- engagementService.js — no AI involved — see those files.
+--
+-- email, nps_awaiting_stage, nps_last_prompted_at,
+-- email_collection_awaiting_stage, and email_collection_last_prompted_at
+-- now live INLINE in the CREATE TABLE merchants statement above (email
+-- positioned right before subscription_tier_id, as requested). The ADD
+-- COLUMN statements below are the same backward-compatible safety net
+-- pattern used elsewhere in this file — a no-op on a fresh database, and
+-- what actually adds these columns (at the end, physically) on a database
+-- migrated before this change. See the earlier migration block's comment
+-- for why physical column order can't be changed non-destructively.
+-- ---------------------------------------------------------------------------
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS nps_awaiting_stage VARCHAR(10);
+ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_nps_awaiting_stage_check;
+ALTER TABLE merchants ADD CONSTRAINT merchants_nps_awaiting_stage_check
+    CHECK (nps_awaiting_stage IN ('SCORE', 'REASON'));
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS nps_last_prompted_at TIMESTAMPTZ;
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS nps_pending_trigger_reason VARCHAR(20);
+ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_nps_pending_trigger_reason_check;
+ALTER TABLE merchants ADD CONSTRAINT merchants_nps_pending_trigger_reason_check
+    CHECK (nps_pending_trigger_reason IN ('ONE_MONTH', 'MILESTONE'));
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email_collection_awaiting_stage VARCHAR(12);
+ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_email_collection_awaiting_stage_check;
+ALTER TABLE merchants ADD CONSTRAINT merchants_email_collection_awaiting_stage_check
+    CHECK (email_collection_awaiting_stage IN ('OPT_IN', 'EMAIL'));
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS email_collection_last_prompted_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS nps_responses (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id         UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    score               SMALLINT NOT NULL CHECK (score BETWEEN 0 AND 10),
+    reason              TEXT,
+    trigger_reason      VARCHAR(20) NOT NULL DEFAULT 'MILESTONE' CHECK (trigger_reason IN ('ONE_MONTH', 'MILESTONE')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_nps_responses_merchant_id ON nps_responses (merchant_id, created_at DESC);
