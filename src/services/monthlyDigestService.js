@@ -254,7 +254,11 @@ async function generateDigestCard({ merchant, periodKey, moneyInflowKobo, growth
 
   await queries.createDigestCard({ merchantId: merchant.id, periodKey, filePath, publicToken, expiresAt });
 
-  const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  // A dedicated domain so the link reads as "digest.kikahq.com/..." on
+  // WhatsApp rather than the generic API domain — falls back to
+  // PUBLIC_BASE_URL if that subdomain isn't configured for this
+  // deployment yet, so this never produces a broken/empty link.
+  const baseUrl = (process.env.DIGEST_BASE_URL || process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const safeUrl = `${baseUrl}/api/v1/digest-cards/${publicToken}.png`;
 
   logger.info({ merchantId: merchant.id, periodKey }, 'Monthly digest card generated');

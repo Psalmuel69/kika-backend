@@ -295,12 +295,12 @@ async function resolvePendingReceiptDecision(merchantId, entryIds, { receiptId =
 // Always called with a real customerName now — a bare "create
 // invoice"/"new invoice" with no name attached is handled entirely in
 // worker.js (a format-guidance reply) without ever touching this state.
-async function startInvoiceFlow(merchantId, customerName) {
+async function startInvoiceFlow(merchantId, customerName, customerPhone = null) {
   await query(
     `UPDATE merchants
-     SET invoice_awaiting_stage = 'ITEMS', invoice_customer_name = $2, invoice_pending_items = '[]'::jsonb
+     SET invoice_awaiting_stage = 'ITEMS', invoice_customer_name = $2, invoice_customer_phone = $3, invoice_pending_items = '[]'::jsonb
      WHERE id = $1`,
-    [merchantId, customerName]
+    [merchantId, customerName, customerPhone]
   );
 }
 
@@ -323,7 +323,7 @@ async function setInvoiceAwaitingStage(merchantId, stage) {
 async function clearInvoiceFlow(merchantId) {
   await query(
     `UPDATE merchants
-     SET invoice_awaiting_stage = NULL, invoice_customer_name = NULL, invoice_pending_items = '[]'::jsonb
+     SET invoice_awaiting_stage = NULL, invoice_customer_name = NULL, invoice_customer_phone = NULL, invoice_pending_items = '[]'::jsonb
      WHERE id = $1`,
     [merchantId]
   );
@@ -1439,6 +1439,29 @@ async function listOpenLedgerDisputes(merchantId) {
 
 // --- Audit log -------------------------------------------------------------
 
+// Column lengths mirrored from schema.sql's audit_logs table — any
+// caller can hand this an arbitrarily long string (a webhook's raw
+// endpoint URL with Paystack's own reference/trxref query params
+// appended can easily run past 150 characters, well past 100 for a
+// verbose action name), so every varchar-bound field is defensively
+// clipped here rather than trusting every call site to pre-truncate
+// its own inputs. An audit entry with a clipped endpoint is far better
+// than an audit entry that fails to write at all.
+const AUDIT_LOG_FIELD_LIMITS = {
+  actorId: 120,
+  action: 100,
+  endpoint: 150,
+  httpMethod: 10,
+  requestId: 64,
+  ipAddress: 45,
+};
+
+function clipToLength(value, maxLength) {
+  if (value == null) return value;
+  const str = String(value);
+  return str.length > maxLength ? str.slice(0, maxLength) : str;
+}
+
 async function writeAuditLog({
   merchantId,
   actorType,
@@ -1460,14 +1483,14 @@ async function writeAuditLog({
     [
       merchantId || null,
       actorType || 'SYSTEM',
-      actorId || null,
-      action,
-      endpoint || null,
-      httpMethod || null,
+      clipToLength(actorId, AUDIT_LOG_FIELD_LIMITS.actorId) || null,
+      clipToLength(action, AUDIT_LOG_FIELD_LIMITS.action),
+      clipToLength(endpoint, AUDIT_LOG_FIELD_LIMITS.endpoint) || null,
+      clipToLength(httpMethod, AUDIT_LOG_FIELD_LIMITS.httpMethod) || null,
       statusCode || null,
       isSuccess ?? true,
-      requestId || null,
-      ipAddress || null,
+      clipToLength(requestId, AUDIT_LOG_FIELD_LIMITS.requestId) || null,
+      clipToLength(ipAddress, AUDIT_LOG_FIELD_LIMITS.ipAddress) || null,
       JSON.stringify(metadata || {}),
     ]
   );

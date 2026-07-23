@@ -106,6 +106,20 @@ const MIN_HEIGHT = 1350;
 const MARGIN_X = 84;
 const CONTENT_WIDTH = CARD_WIDTH - MARGIN_X * 2;
 
+// --- Invoice theme (separate visual system from the receipt card) ------
+// The receipt keeps its existing dashed-line, centered-wordmark look.
+// Invoices follow a different reference layout entirely (warm paper
+// background, left-aligned masthead, solid hairlines, a purple accent
+// on the amount actually owed) — see buildInvoiceSvg further below.
+const INVOICE_THEME = {
+  background: '#FFFDF9',
+  ink: '#1B1B2E',        // headings, item names, values that matter
+  inkMuted: '#8D8D9C',   // secondary text — labels' values, dates, descriptions
+  hairline: '#E7E3D8',   // solid (not dashed) divider lines
+  accent: '#5B4FE0',     // "Amount due" — the one figure that should pop
+  footer: '#ADADBE',
+};
+
 // --- Small helpers -------------------------------------------------------
 
 function escapeXml(unsafe) {
@@ -733,57 +747,319 @@ async function generateReceipt({ merchant, ledgerEntry, ledgerEntries }) {
 }
 
 /**
- * Renders an invoice card — visually the same system as a receipt (same
- * card, same fonts, same tiered watermark), but representing money NOT
- * YET collected rather than a completed transaction. Reusing
- * buildReceiptSvg needs no changes to it at all: Total = the invoice
- * amount, Paid = ₦0, Outstanding = the same amount, which reads exactly
- * as "this much is owed" — precisely what an invoice is.
+ * Builds the invoice card SVG — a distinct layout from buildReceiptSvg
+ * above, matching a reference invoice template: left-aligned masthead
+ * (INVOICE + number, with the merchant's logo badge top-right on
+ * Standard/Premium), a three-column Issued/Due, Billed to, From block,
+ * an itemized table with real Qty/Rate/Line-total columns, then a
+ * right-aligned Subtotal/Tax/Total/Amount-due stack with the amount
+ * actually owed picked out in the accent color.
  *
- * This card (and its payment link, generated separately by
- * paystackService) is handed to the MERCHANT, never sent directly to
- * the customer — see worker.js's invoice-flow handling. Stored in the
- * same `receipts` table as ordinary receipts (with a NULL
- * ledger_entry_id, since an invoice doesn't correspond to one) so it
- * gets the same public-token URL scheme and expiry sweep for free.
+ * "Billed to" intentionally shows only the customer's name and phone
+ * (if one was given) — never an address, which Kika never collects for
+ * a customer. "From" always shows the merchant's business name and
+ * WhatsApp number, address included nowhere either — consistent with
+ * the rest of the product never asking a merchant for a street address.
  */
-async function generateInvoiceCard({ merchant, invoiceNumber, customerName, items, totalKobo }) {
+function buildInvoiceSvg({
+  businessName,
+  businessPhone,
+  invoiceNumber,
+  issuedAt,
+  dueAt,
+  customerName,
+  customerPhone,
+  logoDataUri,
+  tier,
+  items,
+  subtotalLabel,
+  taxLabel,
+  totalLabel,
+}) {
+  const T = INVOICE_THEME;
+  let y = 90;
+
+  // --- Masthead: "INVOICE" + number, logo badge top-right -------------
+  const TITLE_SIZE = 56;
+  const titleY = y + TITLE_SIZE;
+  const NUMBER_SIZE = 26;
+  const numberY = titleY + NUMBER_SIZE + 14;
+
+  // Per product decision, the logo badge only appears for Standard/
+  // Premium merchants who've actually uploaded one — Free tier gets no
+  // substitute mark here (the card's branding lives entirely in the
+  // "Powered by Kika" footer line instead).
+  const showLogoBadge = ['standard', 'premium'].includes(String(tier || '').toLowerCase()) && !!logoDataUri;
+  const LOGO_BADGE_SIZE = 96;
+  let logoBadgeSvg = '';
+  if (showLogoBadge) {
+    const badgeX = CARD_WIDTH - MARGIN_X - LOGO_BADGE_SIZE;
+    const badgeY = y;
+    logoBadgeSvg = `
+  <clipPath id="invLogoClip"><rect x="${badgeX}" y="${badgeY}" width="${LOGO_BADGE_SIZE}" height="${LOGO_BADGE_SIZE}" rx="16" /></clipPath>
+  <image href="${logoDataUri}" x="${badgeX}" y="${badgeY}" width="${LOGO_BADGE_SIZE}" height="${LOGO_BADGE_SIZE}" clip-path="url(#invLogoClip)" preserveAspectRatio="xMidYMid slice" />`;
+  }
+
+  const mastheadSvg = `
+  <text x="${MARGIN_X}" y="${titleY}" font-family="${FONT_BRAND}" font-size="${TITLE_SIZE}" font-weight="800" fill="${T.ink}">INVOICE</text>
+  <text x="${MARGIN_X}" y="${numberY}" font-family="${FONT_BODY}" font-size="${NUMBER_SIZE}" font-weight="500" fill="${T.inkMuted}">#${escapeXml(invoiceNumber)}</text>
+  ${logoBadgeSvg}`;
+
+  y = Math.max(numberY, y + LOGO_BADGE_SIZE) + 50;
+  const dividerAfterMastheadY = y;
+  y += 56;
+
+  // --- Three-column meta: Issued/Due | Billed to | From ----------------
+  const COL_GAP = 40;
+  const colWidth = (CONTENT_WIDTH - COL_GAP * 2) / 3;
+  const col1X = MARGIN_X;
+  const col2X = MARGIN_X + colWidth + COL_GAP;
+  const col3X = MARGIN_X + (colWidth + COL_GAP) * 2;
+
+  const META_LABEL_SIZE = 22;
+  const META_VALUE_SIZE = 27;
+  const META_LINE_GAP = 8;
+  const META_GROUP_GAP = 34;
+
+  // A "group" is one label + its value line(s) — Issued/Due are two
+  // small groups stacked in column 1; Billed to/From are each one
+  // group (name, then an optional second line) in columns 2 and 3.
+  function metaGroup(label, lines) {
+    const safeLines = (lines || []).filter(Boolean);
+    return { label, lines: safeLines.length ? safeLines : ['\u2014'] };
+  }
+
+  function renderMetaGroups(groups, x, colW) {
+    let gy = y;
+    let svg = '';
+    for (const group of groups) {
+      svg += `<text x="${x}" y="${gy + META_LABEL_SIZE}" font-family="${FONT_BODY}" font-size="${META_LABEL_SIZE}" font-weight="700" fill="${T.ink}">${escapeXml(group.label)}</text>`;
+      let ly = gy + META_LABEL_SIZE + META_VALUE_SIZE + META_LINE_GAP;
+      for (const line of group.lines) {
+        const wrapped = wrapText(line, META_VALUE_SIZE, colW, { monospace: true, maxLines: 1 });
+        svg += `<text x="${x}" y="${ly}" font-family="${FONT_BODY}" font-size="${META_VALUE_SIZE}" font-weight="500" fill="${T.inkMuted}">${escapeXml(wrapped[0])}</text>`;
+        ly += META_VALUE_SIZE + META_LINE_GAP;
+      }
+      gy = ly + META_GROUP_GAP - META_LINE_GAP;
+    }
+    return { svg, height: gy - y - META_GROUP_GAP + META_LINE_GAP };
+  }
+
+  const col1Groups = [metaGroup('ISSUED', [issuedAt]), metaGroup('DUE', [dueAt])];
+  // "Billed to" — name only, then phone on its own line if given. No
+  // address line ever, by design (see function doc comment above).
+  const col2Groups = [metaGroup('BILLED TO', [customerName, customerPhone].filter(Boolean))];
+  // "From" — business name, then the merchant's own WhatsApp number,
+  // always (not conditional on it being "given", since every merchant
+  // has one by definition).
+  const col3Groups = [metaGroup('FROM', [businessName, businessPhone].filter(Boolean))];
+
+  const r1 = renderMetaGroups(col1Groups, col1X, colWidth);
+  const r2 = renderMetaGroups(col2Groups, col2X, colWidth);
+  const r3 = renderMetaGroups(col3Groups, col3X, colWidth);
+  const metaSvg = r1.svg + r2.svg + r3.svg;
+  y += Math.max(r1.height, r2.height, r3.height);
+
+  const dividerAfterMetaY = y + 10;
+  y = dividerAfterMetaY + 54;
+
+  // --- Item table --------------------------------------------------------
+  // Column right-edges (Qty/Rate/Line total are right-aligned within
+  // their own column, matching the reference); Service name + its
+  // description line occupy the remaining left-hand space.
+  const totalColRightX = CARD_WIDTH - MARGIN_X;
+  const rateColRightX = totalColRightX - 190;
+  const qtyColRightX = rateColRightX - 170;
+  const serviceMaxWidth = qtyColRightX - 90 - MARGIN_X;
+
+  const HEADER_SIZE = 22;
+  const headerY = y + HEADER_SIZE;
+  const headerSvg = `
+  <text x="${MARGIN_X}" y="${headerY}" font-family="${FONT_BODY}" font-size="${HEADER_SIZE}" font-weight="700" fill="${T.inkMuted}">SERVICE</text>
+  <text x="${qtyColRightX}" y="${headerY}" text-anchor="end" font-family="${FONT_BODY}" font-size="${HEADER_SIZE}" font-weight="700" fill="${T.inkMuted}">QTY</text>
+  <text x="${rateColRightX}" y="${headerY}" text-anchor="end" font-family="${FONT_BODY}" font-size="${HEADER_SIZE}" font-weight="700" fill="${T.inkMuted}">RATE</text>
+  <text x="${totalColRightX}" y="${headerY}" text-anchor="end" font-family="${FONT_BODY}" font-size="${HEADER_SIZE}" font-weight="700" fill="${T.inkMuted}">LINE TOTAL</text>`;
+  y = headerY + 20;
+  const dividerAfterHeaderY = y;
+  y += 40;
+
+  const ITEM_NAME_SIZE = 28;
+  const ITEM_DESC_SIZE = 22;
+  const ITEM_ROW_GAP = 34;
+
+  let itemsSvg = '';
+  for (const item of items) {
+    const nameLines = wrapText(titleCaseFirst(item.name || 'Item'), ITEM_NAME_SIZE, serviceMaxWidth, { monospace: true, maxLines: 2 });
+    const nameBaselineY = y + ITEM_NAME_SIZE;
+    nameLines.forEach((line, i) => {
+      const ly = nameBaselineY + i * (ITEM_NAME_SIZE + 6);
+      itemsSvg += `<text x="${MARGIN_X}" y="${ly}" font-family="${FONT_BODY}" font-size="${ITEM_NAME_SIZE}" font-weight="600" fill="${T.ink}">${escapeXml(line)}</text>`;
+    });
+    let rowBottomY = nameBaselineY + (nameLines.length - 1) * (ITEM_NAME_SIZE + 6);
+
+    if (item.descriptionLabel) {
+      const descY = rowBottomY + ITEM_DESC_SIZE + 8;
+      itemsSvg += `<text x="${MARGIN_X}" y="${descY}" font-family="${FONT_BODY}" font-size="${ITEM_DESC_SIZE}" font-weight="400" fill="${T.inkMuted}">${escapeXml(item.descriptionLabel)}</text>`;
+      rowBottomY = descY;
+    }
+
+    // Qty/Rate/Line total sit on the item name's first baseline,
+    // matching the reference (they don't shift down for a wrapped name
+    // or a description line below).
+    if (item.qtyLabel != null) {
+      itemsSvg += `<text x="${qtyColRightX}" y="${nameBaselineY}" text-anchor="end" font-family="${FONT_BODY}" font-size="${ITEM_NAME_SIZE}" font-weight="500" fill="${T.inkMuted}">${escapeXml(item.qtyLabel)}</text>`;
+    }
+    if (item.rateLabel) {
+      itemsSvg += `<text x="${rateColRightX}" y="${nameBaselineY}" text-anchor="end" fill="${T.inkMuted}">${amountMarkup(item.rateLabel, { fontSize: ITEM_NAME_SIZE, weight: 500 })}</text>`;
+    }
+    itemsSvg += `<text x="${totalColRightX}" y="${nameBaselineY}" text-anchor="end" fill="${T.ink}">${amountMarkup(item.lineTotalLabel, { fontSize: ITEM_NAME_SIZE, weight: 600 })}</text>`;
+
+    y = rowBottomY + ITEM_ROW_GAP;
+  }
+  const itemsEndY = y - ITEM_ROW_GAP;
+
+  // --- Totals block (right-aligned) + footer, anchored to the bottom ---
+  const TOTALS_LABEL_SIZE = 27;
+  const TOTALS_ROW_HEIGHT = 46;
+  const totalsBlockX = MARGIN_X + CONTENT_WIDTH * 0.5;
+  const GAP_BEFORE_TOTALS_MIN = 40;
+  const GAP_ABOVE_TOTAL_DIVIDER = 22;
+  const GAP_ABOVE_DUE_DIVIDER = 26;
+  const GAP_AFTER_TOTALS = 60;
+  const FOOTER_NOTE_SIZE = 24;
+  const FOOTER_SUBNOTE_SIZE = 21;
+  const FOOTER_LINE_HEIGHT = 34;
+  const GAP_BEFORE_FOOTER_DIVIDER = 50;
+  const GAP_AFTER_FOOTER_DIVIDER = 44;
+  const BOTTOM_PAD = 60;
+
+  const totalsRowsHeight = 2 * TOTALS_ROW_HEIGHT + GAP_ABOVE_TOTAL_DIVIDER + TOTALS_ROW_HEIGHT + GAP_ABOVE_DUE_DIVIDER + TOTALS_ROW_HEIGHT;
+  const footerBlockHeight =
+    FOOTER_LINE_HEIGHT + FOOTER_LINE_HEIGHT + GAP_BEFORE_FOOTER_DIVIDER + GAP_AFTER_FOOTER_DIVIDER + FOOTER_LINE_HEIGHT + BOTTOM_PAD;
+  const bottomBlockHeight = totalsRowsHeight + GAP_AFTER_TOTALS + footerBlockHeight;
+
+  const naturalHeight = itemsEndY + GAP_BEFORE_TOTALS_MIN + bottomBlockHeight;
+  const height = Math.max(MIN_HEIGHT, naturalHeight);
+
+  let ty = height - bottomBlockHeight;
+
+  function totalsRow(label, valueLabel, { weight = 500, color = T.inkMuted, valueSize = TOTALS_LABEL_SIZE } = {}) {
+    const rowY = ty + TOTALS_LABEL_SIZE - 4;
+    const svg =
+      `<text x="${totalsBlockX}" y="${rowY}" font-family="${FONT_BODY}" font-size="${TOTALS_LABEL_SIZE}" font-weight="${weight}" fill="${color}">${escapeXml(label)}</text>` +
+      `<text x="${CARD_WIDTH - MARGIN_X}" y="${rowY}" text-anchor="end" fill="${color}">${amountMarkup(valueLabel, { fontSize: valueSize, weight })}</text>`;
+    ty += TOTALS_ROW_HEIGHT;
+    return svg;
+  }
+
+  let totalsSvg = '';
+  totalsSvg += totalsRow('Subtotal', subtotalLabel);
+  totalsSvg += totalsRow('Tax (0%)', taxLabel);
+  ty += GAP_ABOVE_TOTAL_DIVIDER - TOTALS_ROW_HEIGHT;
+  const dividerAboveTotalY = ty;
+  ty += TOTALS_ROW_HEIGHT - (GAP_ABOVE_TOTAL_DIVIDER - TOTALS_ROW_HEIGHT);
+  totalsSvg += totalsRow('Total', totalLabel, { weight: 700, color: T.ink });
+  ty += GAP_ABOVE_DUE_DIVIDER - TOTALS_ROW_HEIGHT;
+  const dividerAboveDueY = ty;
+  ty += TOTALS_ROW_HEIGHT - (GAP_ABOVE_DUE_DIVIDER - TOTALS_ROW_HEIGHT);
+  totalsSvg += totalsRow('Amount due', totalLabel, { weight: 700, color: T.accent, valueSize: 30 });
+
+  const footerTopY = ty + GAP_AFTER_TOTALS - TOTALS_ROW_HEIGHT;
+  const thankYouY = footerTopY + FOOTER_NOTE_SIZE;
+  const payNoteY = thankYouY + FOOTER_LINE_HEIGHT;
+  const footerDividerY = payNoteY + GAP_BEFORE_FOOTER_DIVIDER - FOOTER_LINE_HEIGHT + FOOTER_SUBNOTE_SIZE - 10;
+  const kikaFooterY = footerDividerY + GAP_AFTER_FOOTER_DIVIDER;
+
+  const thinLine = (lineY, x1 = MARGIN_X, x2 = CARD_WIDTH - MARGIN_X, color = T.hairline, strokeWidth = 2) =>
+    `<line x1="${x1}" y1="${lineY}" x2="${x2}" y2="${lineY}" stroke="${color}" stroke-width="${strokeWidth}" />`;
+
+  return `
+<svg width="${CARD_WIDTH}" height="${height}" viewBox="0 0 ${CARD_WIDTH} ${height}" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="${CARD_WIDTH}" height="${height}" fill="${T.background}" />
+
+  ${mastheadSvg}
+  ${thinLine(dividerAfterMastheadY)}
+
+  ${metaSvg}
+  ${thinLine(dividerAfterMetaY)}
+
+  ${headerSvg}
+  ${thinLine(dividerAfterHeaderY)}
+  ${itemsSvg}
+
+  ${thinLine(dividerAboveTotalY, totalsBlockX, CARD_WIDTH - MARGIN_X)}
+  ${thinLine(dividerAboveDueY, totalsBlockX, CARD_WIDTH - MARGIN_X, T.accent, 3)}
+  ${totalsSvg}
+
+  <text x="${MARGIN_X}" y="${thankYouY}" font-family="${FONT_BODY}" font-size="${FOOTER_NOTE_SIZE}" font-weight="700" fill="${T.ink}">Thank you for the business!</text>
+  <text x="${MARGIN_X}" y="${payNoteY}" font-family="${FONT_BODY}" font-size="${FOOTER_SUBNOTE_SIZE}" font-weight="400" fill="${T.inkMuted}">Please arrange payment directly with your customer.</text>
+  ${thinLine(footerDividerY)}
+  <text x="${CARD_WIDTH / 2}" y="${kikaFooterY}" text-anchor="middle" font-family="${FONT_BODY}" font-size="22" font-weight="500" fill="${T.footer}">Powered by Kika</text>
+</svg>`.trim();
+}
+
+/**
+ * Renders an invoice card — its own visual template (see buildInvoiceSvg
+ * above), distinct from the receipt card: an invoice represents money
+ * NOT yet collected, billed to a named customer, with Qty/Rate/Line
+ * total columns and a Subtotal/Tax/Total/Amount-due stack, rather than a
+ * completed-transaction receipt.
+ *
+ * This card is handed to the MERCHANT, never sent directly to the
+ * customer — see worker.js's invoice-flow handling. Kika does not create
+ * a payment link for it; how the customer actually pays the merchant is
+ * arranged directly between them (Paystack is reserved for merchant
+ * subscription upgrades only). Stored in the same `receipts` table as
+ * ordinary receipts (with a NULL ledger_entry_id, since an invoice
+ * doesn't correspond to one) so it gets the same public-token URL scheme
+ * and expiry sweep for free.
+ */
+async function generateInvoiceCard({ merchant, invoiceNumber, customerName, customerPhone, items, totalKobo, dueInDays = 14 }) {
   verifyFontsRenderable();
 
   const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
 
+  // Logo badge is a Standard/Premium perk (see buildInvoiceSvg — Free
+  // tier shows no substitute mark here, unlike the receipt's watermark
+  // which brands every tier). Loading it unconditionally is harmless;
+  // buildInvoiceSvg itself gates on tier before ever using it.
   const logoDataUri = await loadDataUri(merchant.logo_file_path);
-  const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
 
-  // Invoices show the per-unit price in brackets right on the item
-  // line, ahead of the quantity/unit tag, so the customer can see how
-  // the line total was reached instead of just a lump sum — e.g.
-  // "Rice x3 bags (\u20a61,500/unit)". Baked directly into `name` (with
-  // quantity/unit omitted below) so the shared item-label renderer
-  // doesn't also try to append its own qty/unit tag on top of this one.
-  const displayItems = items.map((it) => {
-    const qtyPart = it.quantity != null ? ` x${it.quantity}${it.unit ? ` ${it.unit}` : ''}` : '';
-    const unitPriceLabel = it.unitPriceKobo != null ? ` (${formatNaira(it.unitPriceKobo)}/unit)` : '';
-    return {
-      name: `${it.name}${qtyPart}${unitPriceLabel}`,
-      priceLabel: formatNaira(it.totalKobo),
-    };
-  });
+  const subtotalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
 
-  const svg = buildReceiptSvg({
-    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name,
-    entryTypeLabel: 'Invoice',
-    counterpartyName: customerName,
-    reference: `INV-${String(invoiceNumber).padStart(4, '0')}`,
-    timestampLabel: new Date().toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }),
-    items: displayItems,
-    totalLabel: formatNaira(totalKobo),
-    paidLabel: formatNaira(0),
-    outstandingLabel: formatNaira(totalKobo),
+  const displayItems = items.map((it) => ({
+    name: it.name,
+    // "3 sacks @ ₦1,500/unit" — real per-unit context on its own line,
+    // rather than folded into the item name — since Qty/Rate now have
+    // their own dedicated columns (see buildInvoiceSvg).
+    descriptionLabel:
+      it.quantity != null && it.unitPriceKobo != null
+        ? `${it.quantity}${it.unit ? ` ${it.unit}` : ''} @ ${formatNaira(it.unitPriceKobo)}/unit`
+        : null,
+    qtyLabel: it.quantity != null ? String(it.quantity) : '1',
+    rateLabel: it.unitPriceKobo != null ? formatNaira(it.unitPriceKobo) : formatNaira(it.totalKobo),
+    lineTotalLabel: formatNaira(it.totalKobo),
+  }));
+
+  const now = new Date();
+  const dueDate = new Date(now.getTime() + dueInDays * 24 * 3600 * 1000);
+  const dateFmt = { dateStyle: 'medium' };
+
+  const svg = buildInvoiceSvg({
+    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name || 'Merchant',
+    businessPhone: merchant.whatsapp_number,
+    invoiceNumber: `${String(invoiceNumber).padStart(4, '0')}`,
+    issuedAt: now.toLocaleDateString('en-NG', dateFmt),
+    dueAt: dueDate.toLocaleDateString('en-NG', dateFmt),
+    customerName,
+    customerPhone,
     logoDataUri,
     tier: merchant.plan,
-    kikaWordmarkDataUri,
+    items: displayItems,
+    subtotalLabel: formatNaira(subtotalKobo),
+    taxLabel: formatNaira(0),
+    totalLabel: formatNaira(totalKobo),
   });
 
   const publicToken = crypto.randomBytes(24).toString('hex');

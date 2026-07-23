@@ -94,6 +94,20 @@ async function handleSubscriptionPayment(reference) {
 
   await queries.markPaymentTransactionStatus(reference, 'SUCCESS');
 
+  // The short link sent to the merchant (see paystackService.createUpgradeInvoice)
+  // is a payment_links row same as a customer invoice's, just tagged
+  // with this subscription's own reference — mark it PAID too so a
+  // merchant who taps the same WhatsApp link again after already paying
+  // sees "already paid" instead of being sent through Paystack checkout
+  // a second time. Best-effort: a lookup miss or update failure here
+  // must never block the subscription extension itself.
+  try {
+    const link = await queries.getPaymentLinkByGatewayReference('paystack', reference);
+    if (link && link.status !== 'PAID') await queries.markPaymentLinkStatus(link.id, 'PAID');
+  } catch (err) {
+    logger.warn({ err: err.message, reference }, 'Could not mark upgrade payment link as paid (non-fatal)');
+  }
+
   // A yearly purchase extends the subscription by a full year, not the
   // usual monthly duration — existing.billing_interval was stamped at
   // checkout time (see paystackService.createUpgradeInvoice) precisely
@@ -130,9 +144,17 @@ async function handleSubscriptionPayment(reference) {
  * invoice flow (see worker.js — invoices are now a document only; how
  * the customer actually pays the merchant is arranged between them
  * directly, not through Kika/Paystack). No NEW payment_links rows are
- * ever created anymore, so this only ever fires for an already-existing
- * link a merchant sent out before the change — kept so any such
- * outstanding invoice still resolves correctly if the customer pays it.
+ * ever created this way anymore, so this only ever fires for an
+ * already-existing link a merchant sent out before the change — kept
+ * so any such outstanding invoice still resolves correctly if the
+ * customer pays it.
+ *
+ * The payment_links TABLE itself is still very much live, though — see
+ * handleSubscriptionPayment above and paystackService.createUpgradeInvoice
+ * — it's just that new rows only ever come from the merchant-upgrade
+ * path now, distinguished here by the reference prefix (see the
+ * kika_invoice_ check in the webhook dispatch below), not from this
+ * function.
  */
 async function handleCustomerInvoicePayment(reference) {
   const link = await queries.getPaymentLinkByGatewayReference('paystack', reference);

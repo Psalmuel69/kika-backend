@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
 const queries = require('../db/queries');
+const linkShortenerService = require('./linkShortenerService');
 
 const client = axios.create({
   baseURL: process.env.PAYSTACK_BASE_URL || 'https://api.paystack.co',
@@ -199,7 +200,34 @@ async function createUpgradeInvoice(merchant, tierName, billingInterval = 'month
     authorizationUrl,
   });
 
-  return { authorizationUrl, reference, amountKobo: amountMinorUnits, billingInterval, tier };
+  // Send the merchant a compact https://<domain>/l/<code> link instead
+  // of Paystack's own long checkout.paystack.com/... URL — same
+  // shortener the (now-legacy) customer-invoice feature used, reused
+  // here for its actual intended purpose. No customer identity fields
+  // apply to a merchant paying their own subscription, so those columns
+  // are simply left null; the ttl is set to comfortably outlive
+  // Paystack's own ~1 hour checkout session expiry, since a merchant
+  // may not tap it immediately. Falls back to the raw authorization_url
+  // if the shortener has a hiccup — a working long link beats a broken
+  // short one; upgrading must never fail over a non-essential nicety.
+  let shortUrl = authorizationUrl;
+  try {
+    const link = await linkShortenerService.createShortPaymentLink({
+      merchant,
+      gateway: 'paystack',
+      gatewayReference: reference,
+      fullUrl: authorizationUrl,
+      amountKobo: amountMinorUnits,
+      currency: tier.currency,
+      description: `${tier.name} subscription \u2014 ${billingInterval}`,
+      ttlHours: 24,
+    });
+    shortUrl = link.short_url;
+  } catch (err) {
+    logger.error({ err: err.message, merchantId: merchant.id, reference }, 'Failed to create short payment link for upgrade; falling back to raw Paystack URL');
+  }
+
+  return { authorizationUrl, shortUrl, reference, amountKobo: amountMinorUnits, billingInterval, tier };
 }
 
 /**

@@ -127,10 +127,16 @@ CREATE TABLE IF NOT EXISTS merchants (
     -- Multi-turn invoice creation ("new invoice for Adaeze" -> item
     -- lines -> DONE -> preview -> yes/no). NEVER sent to the customer —
     -- see receiptService.js's generateInvoiceCard and worker.js's
-    -- invoice-flow handling: the finished invoice + payment link are
-    -- handed to the MERCHANT to forward themselves.
+    -- invoice-flow handling: the finished invoice card is handed to the
+    -- MERCHANT to forward themselves; Kika never creates a payment link
+    -- for it (Paystack is reserved for merchant subscription upgrades).
     invoice_awaiting_stage VARCHAR(20) CHECK (invoice_awaiting_stage IN ('AWAITING_NAME', 'ITEMS', 'CONFIRM')),
     invoice_customer_name VARCHAR(160),
+    -- Optional — only set if the merchant included a phone number on
+    -- the trigger message ("new invoice for Adaeze 08012345678") or the
+    -- one-shot INVOICE command. Shown on the card's "Billed to" block
+    -- when present; the card simply omits it otherwise.
+    invoice_customer_phone VARCHAR(20),
     invoice_pending_items JSONB NOT NULL DEFAULT '[]',
     next_invoice_number INTEGER NOT NULL DEFAULT 1,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -754,5 +760,6 @@ ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_invoice_awaiting_stage
 ALTER TABLE merchants ADD CONSTRAINT merchants_invoice_awaiting_stage_check
     CHECK (invoice_awaiting_stage IN ('AWAITING_NAME', 'ITEMS', 'CONFIRM'));
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_customer_name VARCHAR(160);
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_customer_phone VARCHAR(20);
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_pending_items JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS next_invoice_number INTEGER NOT NULL DEFAULT 1;

@@ -33,7 +33,11 @@ async function createShortPaymentLink({
   description,
   ttlHours = 24,
 }) {
-  const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  // A dedicated domain so the link reads as "pay.kikahq.com/l/..." on
+  // WhatsApp rather than the generic API domain — falls back to
+  // PUBLIC_BASE_URL if that subdomain isn't configured for this
+  // deployment yet, so this never produces a broken/empty link.
+  const baseUrl = (process.env.PAYMENT_LINK_BASE_URL || process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
 
   for (let attempt = 0; attempt < 5; attempt++) {

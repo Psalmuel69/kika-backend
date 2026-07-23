@@ -138,7 +138,7 @@ async function handleTierPurchase(merchant, whatsappNumber, tierName, billingInt
   const intervalLabel = billingInterval === 'yearly' ? '/yr' : '/mo';
   await whatsappService.sendPaymentLink(
     whatsappNumber,
-    invoice.authorizationUrl,
+    invoice.shortUrl,
     `${invoice.tier.currency} ${(invoice.amountKobo / 100).toLocaleString('en-NG')}${intervalLabel} (${invoice.tier.name}${billingInterval === 'yearly' ? ' \u2014 Yearly' : ''})`
   );
 }
@@ -250,7 +250,7 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
 // plain deterministic logic, no AI.
 // ---------------------------------------------------------------------------
 
-async function startInvoiceCreation(merchant, whatsappNumber, customerName) {
+async function startInvoiceCreation(merchant, whatsappNumber, customerName, customerPhone) {
   if (!customerName) {
     // Bare "create invoice"/"new invoice" with no name attached — rather
     // than silently starting a flow (or doing nothing at all), tell the
@@ -263,7 +263,7 @@ async function startInvoiceCreation(merchant, whatsappNumber, customerName) {
     );
     return;
   }
-  await queries.startInvoiceFlow(merchant.id, customerName);
+  await queries.startInvoiceFlow(merchant.id, customerName, customerPhone);
   await whatsappService.sendTextMessage(
     whatsappNumber,
     `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price (per item)_\n\nType *done* when finished.`
@@ -347,7 +347,14 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   // or auto-confirm on this side.
   let card;
   try {
-    card = await receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo });
+    card = await receiptService.generateInvoiceCard({
+      merchant,
+      invoiceNumber,
+      customerName: merchant.invoice_customer_name,
+      customerPhone: merchant.invoice_customer_phone,
+      items,
+      totalKobo,
+    });
   } catch (err) {
     logger.error(
       { err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data, merchantId: merchant.id, invoiceNumber },
@@ -818,7 +825,7 @@ const ledgerWorker = new Worker(
 
     const newInvoiceTrigger = ledgerParser.parseNewInvoiceTrigger(rawMessage);
     if (newInvoiceTrigger) {
-      await startInvoiceCreation(merchant, whatsappNumber, newInvoiceTrigger.customerName);
+      await startInvoiceCreation(merchant, whatsappNumber, newInvoiceTrigger.customerName, newInvoiceTrigger.customerPhone);
       return;
     }
 
@@ -1096,7 +1103,14 @@ const ledgerWorker = new Worker(
       const invoiceNumber = await queries.claimNextInvoiceNumber(merchant.id);
       let card;
       try {
-        card = await receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: resolvedName, items: [item], totalKobo: item.totalKobo });
+        card = await receiptService.generateInvoiceCard({
+          merchant,
+          invoiceNumber,
+          customerName: resolvedName,
+          customerPhone: invoiceParsed.customerPhone,
+          items: [item],
+          totalKobo: item.totalKobo,
+        });
       } catch (err) {
         logger.error({ err: err.message, merchantId }, 'One-shot invoice generation failed');
         await whatsappService.sendTextMessage(whatsappNumber, 'Something went wrong generating that invoice \u2014 please try again.');

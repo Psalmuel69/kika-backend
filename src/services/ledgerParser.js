@@ -668,12 +668,24 @@ function parseNewInvoiceTrigger(rawMessage) {
   const trimmed = rawMessage.trim();
   const namedMatch = trimmed.match(NEW_INVOICE_TRIGGER_RE);
   if (namedMatch) {
-    const customerName = namedMatch[1].trim().replace(/[?.!]+$/, '');
-    if (!customerName || customerName.length > 100) return null;
-    return { customerName };
+    let nameRaw = namedMatch[1].trim().replace(/[?.!]+$/, '');
+    // Optional trailing phone — "new invoice for Adaeze 08012345678" —
+    // so the invoice card's "Billed to" can show it when given, without
+    // requiring a separate step. Peeled off the end rather than baked
+    // into the main regex, since a lazy name capture followed by an
+    // optional trailing group interacts unpredictably with names that
+    // themselves contain digits.
+    let customerPhone = null;
+    const phoneTrailMatch = nameRaw.match(/\s+(\+?234\d{10}|0[789]\d{9})$/);
+    if (phoneTrailMatch) {
+      customerPhone = phoneTrailMatch[1].startsWith('+234') ? phoneTrailMatch[1] : `+234${phoneTrailMatch[1].replace(/^0/, '')}`;
+      nameRaw = nameRaw.slice(0, phoneTrailMatch.index).trim();
+    }
+    if (!nameRaw || nameRaw.length > 100) return null;
+    return { customerName: nameRaw, customerPhone };
   }
   if (NEW_INVOICE_BARE_TRIGGER_RE.test(trimmed)) {
-    return { customerName: null };
+    return { customerName: null, customerPhone: null };
   }
   return null;
 }
