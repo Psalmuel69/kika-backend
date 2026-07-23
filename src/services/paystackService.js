@@ -19,6 +19,67 @@ const client = axios.create({
 const SUBSCRIPTION_DURATION_DAYS = Number(process.env.SUBSCRIPTION_DURATION_DAYS || 30);
 
 /**
+ * Paystack's transaction/initialize endpoint requires a syntactically
+ * valid `email`, even though Kika never actually collects one — the
+ * merchant pays by tapping a link, not by typing an email address. This
+ * derives a placeholder that satisfies that requirement without leaking
+ * the merchant's real WhatsApp number (a phone number is personal data;
+ * a raw-digits synthetic email put it in Paystack's systems — dashboard,
+ * logs, support tooling, any downstream export — for no functional
+ * reason, since nothing in this codebase ever reads the email back:
+ * every actual lookup uses the unique `reference` plus
+ * `metadata.merchant_id`, both already present on the same payload).
+ *
+ * Instead: an HMAC-SHA256 of merchant.id (itself just an opaque DB
+ * UUID, not PII) keyed on PAYSTACK_SECRET_KEY, truncated to 12 hex
+ * characters. Properties this gives us:
+ *  - Non-reversible and non-enumerable — knowing the resulting address
+ *    doesn't reveal the merchant.id, let alone a phone number, and the
+ *    HMAC key never leaves this server.
+ *  - Deterministic per merchant — every invoice/subscription payment
+ *    for the same merchant gets the SAME synthetic address, so if
+ *    anyone on the Kika side is ever looking at Paystack's own
+ *    dashboard (which groups transactions into "Customers" by email),
+ *    a merchant's history stays grouped together instead of scattering
+ *    across a new random identity every time.
+ *  - Short and readable enough to eyeball in logs, unlike a full UUID.
+ * 12 hex chars is 48 bits of the underlying HMAC — collision risk is
+ * negligible at any realistic merchant count.
+ */
+function buildSyntheticPaystackEmail(merchantId) {
+  const digest = crypto
+    .createHmac('sha256', process.env.PAYSTACK_SECRET_KEY || 'kika-synthetic-email-fallback')
+    .update(String(merchantId))
+    .digest('hex')
+    .slice(0, 12);
+  return `m${digest}@invoice.kikahq.com`;
+}
+
+// Very light sanity check — merchants.email is already validated at
+// collection time (engagementService's opt-in flow), but this is cheap
+// insurance against sending Paystack something malformed if that ever
+// changes, or if the column is populated by some other path later.
+const LOOKS_LIKE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Resolves the email to hand Paystack for a transaction where the
+ * MERCHANT is the one actually paying (i.e. subscription upgrades,
+ * never customer invoices — see the split explained at each call
+ * site). If the merchant has already opted in with a real email
+ * address, using it is not just harmless but genuinely better: it's
+ * their own payment, their own address, already given voluntarily, and
+ * it means Paystack's own receipt email (if their plan sends one)
+ * reaches the right person. Only synthesize a placeholder when they
+ * haven't provided one.
+ */
+function resolvePayerEmail(merchant) {
+  if (merchant.email && LOOKS_LIKE_EMAIL_RE.test(merchant.email)) {
+    return merchant.email;
+  }
+  return buildSyntheticPaystackEmail(merchant.id);
+}
+
+/**
  * Every call to Paystack's REST API goes through here so it's logged to
  * payment_gateway_logs uniformly — request, response, success/failure —
  * regardless of which higher-level flow (subscription upgrade, customer
@@ -93,7 +154,11 @@ async function createUpgradeInvoice(merchant, tierName, billingInterval = 'month
   const priceMajorUnits = billingInterval === 'yearly' ? tier.price_yearly : tier.price;
   const amountMinorUnits = Math.round(Number(priceMajorUnits) * 100);
   const reference = `kika_${tier.name.toLowerCase()}_${billingInterval}_${uuidv4()}`;
-  const syntheticEmail = `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kikahq.invoice`;
+  // The merchant is the one actually completing this checkout, so their
+  // own opted-in email (if they've given one) is the right address —
+  // see resolvePayerEmail above. Falls back to the non-PII synthetic
+  // placeholder if they haven't provided one.
+  const syntheticEmail = resolvePayerEmail(merchant);
 
   const payload = {
     email: syntheticEmail,
@@ -147,9 +212,18 @@ async function createUpgradeInvoice(merchant, tierName, billingInterval = 'month
 async function createCustomerInvoice(merchant, { amountKobo, description, customerPhone, customerName, ttlHours = 24 }) {
   const reference = `kika_invoice_${uuidv4()}`;
   const currency = merchant.default_currency || 'NGN';
-  const syntheticEmail = customerPhone
-    ? `${customerPhone.replace(/[^\d]/g, '')}@wa.kikahq.invoice`
-    : `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kikahq.invoice`;
+  // Deliberately always synthetic here, never the merchant's real
+  // email even when they have one on file — unlike createUpgradeInvoice
+  // above, the MERCHANT isn't the one paying this transaction, their
+  // CUSTOMER is. Using the merchant's own address would be the wrong
+  // identity attached to someone else's payment, and — since this
+  // becomes the email on Paystack's hosted checkout page, which the
+  // customer is the one looking at — could put the merchant's personal
+  // email in front of their own customer for no reason. We don't
+  // collect a real email for the customer either (only phone/name), so
+  // there's no legitimate real address to use on their behalf.
+  // See buildSyntheticPaystackEmail above.
+  const syntheticEmail = buildSyntheticPaystackEmail(merchant.id);
 
   const payload = {
     email: syntheticEmail,

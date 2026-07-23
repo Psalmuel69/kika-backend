@@ -251,32 +251,22 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
 // ---------------------------------------------------------------------------
 
 async function startInvoiceCreation(merchant, whatsappNumber, customerName) {
+  if (!customerName) {
+    // Bare "create invoice"/"new invoice" with no name attached — rather
+    // than silently starting a flow (or doing nothing at all), tell the
+    // merchant the exact format so their next message succeeds on the
+    // first try. No flow state is started here; invoice_awaiting_stage
+    // stays untouched until they resend with a name.
+    await whatsappService.sendTextMessage(
+      whatsappNumber,
+      `To create an invoice, include the customer's name:\n\n*Create invoice for <customer name>*\nor\n*New invoice <customer name>*`
+    );
+    return;
+  }
   await queries.startInvoiceFlow(merchant.id, customerName);
-  if (!customerName) {
-    await whatsappService.sendTextMessage(whatsappNumber, `Sure \u2014 who's this invoice for?`);
-    return;
-  }
   await whatsappService.sendTextMessage(
     whatsappNumber,
-    `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price_\n\nType *done* when finished.`
-  );
-}
-
-async function handleInvoiceNameReply(merchant, whatsappNumber, rawMessage) {
-  if (/^cancel$/i.test(rawMessage.trim())) {
-    await queries.clearInvoiceFlow(merchant.id);
-    await whatsappService.sendTextMessage(whatsappNumber, 'Invoice cancelled.');
-    return;
-  }
-  const customerName = rawMessage.trim().replace(/[?.!]+$/, '').slice(0, 100);
-  if (!customerName) {
-    await whatsappService.sendTextMessage(whatsappNumber, `Who's this invoice for? Reply with the customer's name, or CANCEL to stop.`);
-    return;
-  }
-  await queries.setInvoiceCustomerNameAndStartItems(merchant.id, customerName);
-  await whatsappService.sendTextMessage(
-    whatsappNumber,
-    `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price_\n\nType *done* when finished.`
+    `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price (per item)_\n\nType *done* when finished.`
   );
 }
 
@@ -309,7 +299,7 @@ async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
     if (items.length === 0) {
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        'You haven\u2019t added any items yet \u2014 send at least one like "2 x iPhone charger x 4500" or "3 bags rice x 15k", or type CANCEL to stop.'
+        'You haven\u2019t added any items yet \u2014 send at least one like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (price is per item), or type CANCEL to stop.'
       );
       return;
     }
@@ -329,7 +319,7 @@ async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
   if (!item) {
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (Quantity + item, then price), or type *done* when finished.'
+      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (Quantity + item, then price PER ITEM), or type *done* when finished.'
     );
     return;
   }
@@ -774,10 +764,6 @@ const ledgerWorker = new Worker(
         if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
         return;
       }
-      if (merchant.invoice_awaiting_stage === 'AWAITING_NAME') {
-        await handleInvoiceNameReply(merchant, whatsappNumber, rawMessage);
-        return;
-      }
       if (merchant.invoice_awaiting_stage === 'ITEMS') {
         await handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage);
         return;
@@ -931,12 +917,12 @@ const ledgerWorker = new Worker(
           // (2-months-free) rate rather than ever displaying "NaN/yr".
           const yearlyMajorUnits = Number(t.price_yearly) > 0 ? Number(t.price_yearly) : Number(t.price) * 10;
           const yearly = `${t.currency} ${yearlyMajorUnits.toLocaleString('en-NG')}/yr`;
-          return `\n*${t.name}* \u2014 ${monthly} (or ${yearly}, 2 months free):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`;
+          return `\n*${t.name}* \u2014 ${monthly} (or ${yearly}):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`;
         })
         .join('\n');
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `*Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below for the monthly price, or type "STANDARD YEARLY" / "PREMIUM YEARLY" to pay yearly and save 2 months`
+        `*Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below for the monthly price, or type "STANDARD YEARLY" / "PREMIUM YEARLY" to pay yearly`
       );
       await whatsappService.sendPlanSelectionButtons(
         whatsappNumber,
