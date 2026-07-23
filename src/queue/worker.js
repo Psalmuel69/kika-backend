@@ -338,28 +338,16 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   const totalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
   const invoiceNumber = await queries.claimNextInvoiceNumber(merchant.id);
 
+  // Invoices are a document only — Kika generates the card and hands it
+  // to the merchant; how the customer actually pays (bank transfer,
+  // cash, their own POS, etc.) is between the two of them. Paystack is
+  // reserved for merchant subscription upgrades only (see
+  // handleTierPurchase / paystackService.createUpgradeInvoice) — no
+  // payment link is created here, so there's nothing for Kika to track
+  // or auto-confirm on this side.
   let card;
-  let link;
   try {
-    // Card generation and the Paystack payment link are independent of
-    // each other, so they run in parallel — but that means if ONE
-    // rejects, Promise.all rejects immediately while the OTHER keeps
-    // running in the background to completion (its result just never
-    // gets used here). That's harmless on its own, but this whole block
-    // used to have no try/catch at all: a Paystack/WhatsApp failure
-    // would throw all the way out, fail the BullMQ job silently from
-    // the merchant's point of view (no error message ever sent) AND
-    // leave invoice_awaiting_stage stuck at 'CONFIRM' with no way
-    // forward except CANCEL. Catching here means the merchant is told
-    // plainly and can just reply *yes* again to retry — their entered
-    // items are still intact since the flow state is untouched below.
-    [card, link] = await Promise.all([
-      receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo }),
-      paystackService.createCustomerInvoice(merchant, {
-        amountKobo: totalKobo,
-        description: `Invoice #${String(invoiceNumber).padStart(4, '0')} \u2014 ${merchant.invoice_customer_name}`,
-      }),
-    ]);
+    card = await receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo });
   } catch (err) {
     logger.error(
       { err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data, merchantId: merchant.id, invoiceNumber },
@@ -375,26 +363,25 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   await queries.clearInvoiceFlow(merchant.id);
 
   // Handed to the MERCHANT only — Kika never messages the customer
-  // directly with an invoice or payment link (same policy as loyalty
-  // milestones — see loyaltyService.js). The merchant forwards it
-  // themselves, on their own terms.
+  // directly with an invoice (same policy as loyalty milestones — see
+  // loyaltyService.js). The merchant forwards it themselves, on their
+  // own terms, and arranges payment directly with the customer.
   try {
     await whatsappService.sendReceiptImage(
       whatsappNumber,
       card.url,
-      `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+      `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this with them. Payment is between you and your customer; once they've paid, just log it here as usual (e.g. "${merchant.invoice_customer_name} paid ${formatNairaShort(totalKobo)}").`
     );
   } catch (err) {
-    // The invoice + payment link ARE generated and saved at this point
+    // The invoice card WAS generated and saved at this point
     // (queries.clearInvoiceFlow already ran) \u2014 only the WhatsApp
-    // delivery of the card image failed. Fall back to the plain-text
-    // link so the merchant still gets something usable instead of
-    // nothing, rather than losing the whole invoice to a media-send
-    // hiccup.
+    // delivery of the image failed. Fall back to the plain-text link so
+    // the merchant still gets something usable instead of nothing,
+    // rather than losing the whole invoice to a media-send hiccup.
     logger.error({ err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data, merchantId: merchant.id, invoiceNumber }, 'Invoice card image failed to send; falling back to text');
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      `Here\u2019s the invoice for ${merchant.invoice_customer_name} (the image didn\u2019t send, here\u2019s the payment link instead):\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+      `Here\u2019s the invoice for ${merchant.invoice_customer_name} (the image didn\u2019t send, here\u2019s the link instead):\n\n${card.url}`
     );
   }
 }
@@ -1082,11 +1069,44 @@ const ledgerWorker = new Worker(
 
     const invoiceParsed = ledgerParser.parseInvoiceCommand(rawMessage);
     if (invoiceParsed) {
-      const link = await paystackService.createCustomerInvoice(merchant, invoiceParsed);
-      await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'payment_link.create', metadata: { paymentLinkId: link.id, amountKobo: link.amount_kobo } });
-      await whatsappService.sendTextMessage(
+      // Same policy as the multi-item flow above — no Paystack, no
+      // payment link. If the phone number given is one Kika already
+      // recognizes, generate the card immediately; otherwise ask the
+      // merchant to use the named format so the invoice isn't sent out
+      // with a blank customer name.
+      const resolvedName = invoiceParsed.customerPhone
+        ? await queries.getCounterpartyNameByPhone(merchantId, invoiceParsed.customerPhone)
+        : null;
+
+      if (!resolvedName) {
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `I don't have a name on file for that number yet \u2014 use *"create invoice for <customer name>"* instead, then add "${invoiceParsed.description}" as an item.`
+        );
+        return;
+      }
+
+      const item = {
+        name: invoiceParsed.description || 'Item',
+        unit: null,
+        quantity: 1,
+        unitPriceKobo: invoiceParsed.amountKobo,
+        totalKobo: invoiceParsed.amountKobo,
+      };
+      const invoiceNumber = await queries.claimNextInvoiceNumber(merchant.id);
+      let card;
+      try {
+        card = await receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: resolvedName, items: [item], totalKobo: item.totalKobo });
+      } catch (err) {
+        logger.error({ err: err.message, merchantId }, 'One-shot invoice generation failed');
+        await whatsappService.sendTextMessage(whatsappNumber, 'Something went wrong generating that invoice \u2014 please try again.');
+        return;
+      }
+      await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'invoice.create', metadata: { invoiceNumber, amountKobo: item.totalKobo } });
+      await whatsappService.sendReceiptImage(
         whatsappNumber,
-        `Payment link ready \u2014 forward this to your customer:\n${link.short_url}\n\nAmount: ${link.currency} ${(link.amount_kobo / 100).toLocaleString('en-NG')}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+        card.url,
+        `Here\u2019s the invoice for ${resolvedName} \u2014 you can share this with them. Payment is between you and your customer; once they've paid, just log it here as usual.`
       );
       return;
     }

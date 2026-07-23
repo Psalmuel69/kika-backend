@@ -59,7 +59,15 @@ app.use('/api/v1', reportsRoutes);
 app.use('/api/v1', pricingRoutes);
 app.use('/api/v1', exportsRoutes);
 app.use('/', shortlinkRoutes); // short.link/l/:code — kept off /api/v1 for a shorter customer-facing URL
-app.use('/api/v1', adminRoutes);
+// Mounted at its own distinct prefix, not the shared '/api/v1' — this
+// router's requireAdminKey guard (see admin.routes.js) is registered
+// with router.use() and has no way to know whether a route further
+// down actually matches, so it fires for EVERY request Express hands
+// it. Sharing '/api/v1' meant any unrelated request that fell through
+// every other router (e.g. Paystack's browser-redirect callback, which
+// has no handler at all) landed here last and got answered with a
+// misleading "Admin API is not configured" 503 instead of a plain 404.
+app.use('/api/v1/admin', adminRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(errorHandler);

@@ -881,6 +881,23 @@ async function getDebtorBreakdown(merchantId) {
 }
 
 /**
+ * Resolves a customer's name from their phone number, using whichever
+ * ledger entry mentioning that phone was recorded most recently — used
+ * by the one-shot "INVOICE <phone> <amount> <description>" command so
+ * it can generate a properly-named invoice card without asking a
+ * follow-up question, when Kika already knows this customer.
+ */
+async function getCounterpartyNameByPhone(merchantId, phone) {
+  const res = await query(
+    `SELECT counterparty_name FROM ledger_entries
+     WHERE merchant_id = $1 AND counterparty_phone = $2 AND counterparty_name IS NOT NULL AND is_voided = false
+     ORDER BY created_at DESC LIMIT 1`,
+    [merchantId, phone]
+  );
+  return res.rows[0]?.counterparty_name || null;
+}
+
+/**
  * Outstanding debtors WITH a phone number attached (most recently
  * mentioned one, if the merchant included it on more than one entry) —
  * powers the Friday Debt Amnesty "send reminders" flow, which can only
@@ -1524,6 +1541,7 @@ module.exports = {
   markReportSent,
   getWeeklyRevenue,
   getDebtorBreakdown,
+  getCounterpartyNameByPhone,
   getOutstandingDebtorsWithPhones,
   getTopProductsByRevenue,
   getTopDebtor,

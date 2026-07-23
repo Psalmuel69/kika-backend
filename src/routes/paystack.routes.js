@@ -14,6 +14,29 @@ const logger = require('../utils/logger');
 const router = express.Router();
 
 /**
+ * Paystack's browser-redirect target after checkout (PAYSTACK_CALLBACK_URL,
+ * passed as callback_url on transaction/initialize — see
+ * paystackService.createUpgradeInvoice). This is a courtesy landing page
+ * for the merchant's own browser tab; it does NOT confirm or record the
+ * payment itself — that's the webhook above (POST /paystack/webhook),
+ * which is independently signature-verified and is the only source of
+ * truth for whether a payment actually succeeded. Before this route
+ * existed, this URL had no handler at all, so the request fell through
+ * to whichever router happened to be mounted last — which, depending on
+ * routing order, could return a confusing internal error instead of a
+ * plain "you can close this tab" page.
+ */
+router.get('/callback', (req, res) => {
+  res.status(200).send(
+    '<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>' +
+      '<body style="font-family: system-ui, sans-serif; text-align: center; padding: 48px 16px;">' +
+      '<h2>Thanks \u2014 processing your payment</h2>' +
+      '<p>You can close this tab and return to WhatsApp. Kika will confirm your upgrade there in a moment.</p>' +
+      '</body></html>'
+  );
+});
+
+/**
  * Paystack webhook: charge.success (and others we ignore). Two layers of
  * trust verification before anything is mutated:
  *   1. HMAC signature over the raw body, using our secret key.
@@ -101,6 +124,16 @@ async function handleSubscriptionPayment(reference) {
   logger.info({ merchantId: merchant.id, reference, planTier: existing.tier_name }, 'Subscription extended');
 }
 
+/**
+ * LEGACY / backward-compat only: handles a webhook for a customer
+ * invoice payment link created before Paystack was removed from the
+ * invoice flow (see worker.js — invoices are now a document only; how
+ * the customer actually pays the merchant is arranged between them
+ * directly, not through Kika/Paystack). No NEW payment_links rows are
+ * ever created anymore, so this only ever fires for an already-existing
+ * link a merchant sent out before the change — kept so any such
+ * outstanding invoice still resolves correctly if the customer pays it.
+ */
 async function handleCustomerInvoicePayment(reference) {
   const link = await queries.getPaymentLinkByGatewayReference('paystack', reference);
   if (!link) {

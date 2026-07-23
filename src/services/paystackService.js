@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
 const queries = require('../db/queries');
-const linkShortenerService = require('./linkShortenerService');
 
 const client = axios.create({
   baseURL: process.env.PAYSTACK_BASE_URL || 'https://api.paystack.co',
@@ -204,74 +203,6 @@ async function createUpgradeInvoice(merchant, tierName, billingInterval = 'month
 }
 
 /**
- * Generates a customer-facing payment link/invoice — the "digital
- * invoice sent directly inside a WhatsApp chat" — tracked in
- * payment_links with a compact short_url instead of Paystack's long
- * authorization_url. Used by the merchant-facing INVOICE command.
- */
-async function createCustomerInvoice(merchant, { amountKobo, description, customerPhone, customerName, ttlHours = 24 }) {
-  const reference = `kika_invoice_${uuidv4()}`;
-  const currency = merchant.default_currency || 'NGN';
-  // Deliberately always synthetic here, never the merchant's real
-  // email even when they have one on file — unlike createUpgradeInvoice
-  // above, the MERCHANT isn't the one paying this transaction, their
-  // CUSTOMER is. Using the merchant's own address would be the wrong
-  // identity attached to someone else's payment, and — since this
-  // becomes the email on Paystack's hosted checkout page, which the
-  // customer is the one looking at — could put the merchant's personal
-  // email in front of their own customer for no reason. We don't
-  // collect a real email for the customer either (only phone/name), so
-  // there's no legitimate real address to use on their behalf.
-  // See buildSyntheticPaystackEmail above.
-  const syntheticEmail = buildSyntheticPaystackEmail(merchant.id);
-
-  const payload = {
-    email: syntheticEmail,
-    amount: amountKobo,
-    currency,
-    reference,
-    callback_url: process.env.PAYSTACK_CALLBACK_URL,
-    metadata: {
-      merchant_id: merchant.id,
-      type: 'CUSTOMER_INVOICE',
-      customer_phone: customerPhone || null,
-      description: description || null,
-    },
-  };
-
-  const data = await callPaystack({
-    method: 'post',
-    path: '/transaction/initialize',
-    payload,
-    merchantId: merchant.id,
-    eventType: 'transaction.initialize',
-    reference,
-  });
-
-  if (!data?.status || !data.data?.authorization_url) {
-    logger.error({ response: data }, 'Paystack initialize returned unexpected payload for customer invoice');
-    throw new Error('Failed to initialize customer invoice');
-  }
-
-  const { authorization_url: fullUrl } = data.data;
-
-  const link = await linkShortenerService.createShortPaymentLink({
-    merchant,
-    gateway: 'paystack',
-    gatewayReference: reference,
-    fullUrl,
-    amountKobo,
-    currency,
-    customerPhone,
-    customerName,
-    description,
-    ttlHours,
-  });
-
-  return link;
-}
-
-/**
  * Verifies the X-Paystack-Signature header using a timing-safe HMAC
  * comparison against the raw request body — the only trustworthy way to
  * confirm a webhook actually originated from Paystack rather than a
@@ -307,7 +238,6 @@ async function verifyTransaction(reference) {
 
 module.exports = {
   createUpgradeInvoice,
-  createCustomerInvoice,
   verifyWebhookSignature,
   verifyTransaction,
   SUBSCRIPTION_DURATION_DAYS,

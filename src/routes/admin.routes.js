@@ -14,7 +14,7 @@ router.use(requireAdminKey);
 // --- Access control ---------------------------------------------------
 
 router.post(
-  '/admin/access-control/blacklist',
+  '/access-control/blacklist',
   [body('phoneNumber').isString().notEmpty(), body('reason').optional().isString()],
   validate,
   asyncHandler(async (req, res) => {
@@ -30,7 +30,7 @@ router.post(
 );
 
 router.post(
-  '/admin/access-control/whitelist',
+  '/access-control/whitelist',
   [body('phoneNumber').isString().notEmpty(), body('reason').optional().isString()],
   validate,
   asyncHandler(async (req, res) => {
@@ -46,7 +46,7 @@ router.post(
 );
 
 router.delete(
-  '/admin/access-control/:phoneNumber',
+  '/access-control/:phoneNumber',
   [param('phoneNumber').isString().notEmpty()],
   validate,
   asyncHandler(async (req, res) => {
@@ -64,7 +64,7 @@ router.delete(
 // --- Conversation labels (human handoff) ----------------------------------
 
 router.post(
-  '/admin/merchants/:merchantId/labels',
+  '/merchants/:merchantId/labels',
   [param('merchantId').isUUID(), body('label').isString().notEmpty()],
   validate,
   asyncHandler(async (req, res) => {
@@ -81,7 +81,7 @@ router.post(
 );
 
 router.delete(
-  '/admin/merchants/:merchantId/labels/:label',
+  '/merchants/:merchantId/labels/:label',
   [param('merchantId').isUUID(), param('label').isString().notEmpty()],
   validate,
   asyncHandler(async (req, res) => {
@@ -100,7 +100,7 @@ router.delete(
 // --- Ledger disputes -------------------------------------------------------
 
 router.post(
-  '/admin/disputes/:disputeId/resolve',
+  '/disputes/:disputeId/resolve',
   [
     param('disputeId').isUUID(),
     body('status').isIn(['RESOLVED', 'REJECTED']),
@@ -127,7 +127,7 @@ router.post(
 );
 
 router.get(
-  '/admin/merchants/:merchantId/disputes',
+  '/merchants/:merchantId/disputes',
   [param('merchantId').isUUID()],
   validate,
   asyncHandler(async (req, res) => {
