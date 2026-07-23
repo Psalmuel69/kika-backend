@@ -45,8 +45,8 @@ async function trackPurchaseAndMaybeNotify({ merchant, counterpartyName, counter
   await queries.markLoyaltyMilestoneNotified(loyaltyRow.id, count);
 
   const milestoneText =
-    `\n\n\ud83c\udf89 *CUSTOMER MILESTONE!* This is ${counterpartyName || 'this customer'}'s *${ordinal(count)} purchase* ` +
-    `at your shop! \ud83d\udca1 Tip: loyal customers keep businesses alive \u2014 a small discount or a tiny free item goes a long way.`;
+    `\n\n*CUSTOMER MILESTONE!* This is ${counterpartyName || 'this customer'}'s *${ordinal(count)} purchase* ` +
+    `at your shop! Tip: loyal customers keep businesses alive \u2014 a small discount or a tiny free item goes a long way.`;
 
   logger.info({ merchantId: merchant.id, counterpartyPhone, count }, 'Loyalty milestone reached');
 

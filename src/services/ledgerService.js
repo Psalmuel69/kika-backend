@@ -200,7 +200,7 @@ async function buildBalanceSummaryText(merchantId) {
   const netKobo = Number(balance.total_in_kobo) - Number(balance.total_out_kobo);
 
   return [
-    '\ud83d\udcca *Kika Balance Summary*',
+    '*Kika Balance Summary*',
     '',
     `Total In:  ${formatNaira(balance.total_in_kobo)}`,
     `Total Out: ${formatNaira(balance.total_out_kobo)}`,
@@ -222,7 +222,7 @@ async function buildDailySunsetReportText(merchantId, dayStart, dayEnd) {
   const netKobo = Number(summary.sales_kobo) - Number(summary.expenses_kobo);
 
   const lines = [
-    '\ud83c\udf05 *Kika Daily Sunset Report*',
+    '*Kika Daily Sunset Report*',
     dayStart.toLocaleDateString('en-NG', { dateStyle: 'medium' }),
     '',
     `Sales:    ${formatNaira(summary.sales_kobo)}`,
@@ -235,14 +235,14 @@ async function buildDailySunsetReportText(merchantId, dayStart, dayEnd) {
   }
 
   if (summary.topItems.length > 0) {
-    lines.push('', '\ud83c\udfc6 Top items today:');
+    lines.push('', '*Top items today:*');
     summary.topItems.forEach((item, i) => {
       lines.push(`${i + 1}. ${item.name} (${item.total_quantity})`);
     });
   }
 
   lines.push('', `Transactions logged: ${summary.entry_count}`);
-  lines.push('', 'Rest well \u2014 see you tomorrow! \ud83c\udf19');
+  lines.push('', 'Rest well \u2014 see you tomorrow!');
 
   return lines.join('\n');
 }
@@ -271,7 +271,7 @@ async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, 
   }
 
   const lines = [
-    '\ud83d\udcc8 *Kika Monthly Insights*',
+    '*Kika Monthly Insights*',
     monthStart.toLocaleDateString('en-NG', { month: 'long', year: 'numeric' }),
     '',
     `Total Sales:    ${formatNaira(current.sales_kobo)}`,
@@ -281,14 +281,14 @@ async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, 
   ];
 
   if (current.topCustomers.length > 0) {
-    lines.push('', '\ud83e\udd47 Top customers this month:');
+    lines.push('', '*Top customers this month:*');
     current.topCustomers.forEach((c, i) => {
       lines.push(`${i + 1}. ${c.counterparty_name} \u2014 ${formatNaira(c.total_value_kobo)}`);
     });
   }
 
   if (current.topItems.length > 0) {
-    lines.push('', '\ud83d\udce6 Best-selling items:');
+    lines.push('', '*Best-selling items:*');
     current.topItems.forEach((item, i) => {
       lines.push(`${i + 1}. ${item.name} (${item.total_quantity})`);
     });

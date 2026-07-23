@@ -756,12 +756,20 @@ async function generateInvoiceCard({ merchant, invoiceNumber, customerName, item
   const logoDataUri = await loadDataUri(merchant.logo_file_path);
   const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
 
-  const displayItems = items.map((it) => ({
-    name: it.name,
-    quantity: it.quantity,
-    unit: it.unit || '',
-    priceLabel: formatNaira(it.totalKobo),
-  }));
+  // Invoices show the per-unit price in brackets right on the item
+  // line, ahead of the quantity/unit tag, so the customer can see how
+  // the line total was reached instead of just a lump sum — e.g.
+  // "Rice x3 bags (\u20a61,500/unit)". Baked directly into `name` (with
+  // quantity/unit omitted below) so the shared item-label renderer
+  // doesn't also try to append its own qty/unit tag on top of this one.
+  const displayItems = items.map((it) => {
+    const qtyPart = it.quantity != null ? ` x${it.quantity}${it.unit ? ` ${it.unit}` : ''}` : '';
+    const unitPriceLabel = it.unitPriceKobo != null ? ` (${formatNaira(it.unitPriceKobo)}/unit)` : '';
+    return {
+      name: `${it.name}${qtyPart}${unitPriceLabel}`,
+      priceLabel: formatNaira(it.totalKobo),
+    };
+  });
 
   const svg = buildReceiptSvg({
     businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name,

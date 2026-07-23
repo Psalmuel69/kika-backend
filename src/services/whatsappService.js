@@ -79,7 +79,7 @@ async function sendButtonMessage(toWhatsappNumber, { bodyText, footerText, butto
  */
 async function sendPlanSelectionButtons(toWhatsappNumber, buttons) {
   return sendButtonMessage(toWhatsappNumber, {
-    bodyText: '\ud83d\ude80 *Upgrade Kika*\n\nChoose a plan to continue:',
+    bodyText: '*Upgrade Kika*\n\nChoose a plan to continue:',
     buttons,
   });
 }
@@ -94,13 +94,13 @@ async function sendPlanSelectionButtons(toWhatsappNumber, buttons) {
  * platform's actual constraints, in a single message.
  */
 async function sendConsentPrompt(toWhatsappNumber) {
-  const termsUrl = process.env.TERMS_URL || 'https://kikahq.com/terms';
+  const termsUrl = process.env.TERMS_URL || 'https://kikahq.com/legal/terms';
   return sendButtonMessage(toWhatsappNumber, {
     bodyText:
       'Welcome to *Kika-Book*! Your automatic business notebook inside WhatsApp. No more lost paper, forgotten customer debts, or manual calculations. Kika records your sales, tracks inventory, and types customer receipts instantly \u2014 just from a normal chat text.\n\n\ud83d\udd12 *Before we start, our security agreement:*\nWe encrypt your customer records and *never* share your shop details with tax collectors or external parties. By using Kika, you agree to our Terms & Privacy Policy:\n' +
       termsUrl,
     footerText: 'Tap I AGREE to activate your free business notebook',
-    buttons: [{ id: 'AGREE_TERMS', title: 'I AGREE \ud83d\udc47' }],
+    buttons: [{ id: 'AGREE_TERMS', title: 'I AGREE' }],
   });
 }
 
@@ -112,9 +112,9 @@ async function sendConsentPrompt(toWhatsappNumber) {
  */
 async function sendFridayAmnestyPrompt(toWhatsappNumber, { debtorCount, totalOwedLabel }) {
   return sendButtonMessage(toWhatsappNumber, {
-    bodyText: `\ud83d\udc4b Happy Friday! You have *${debtorCount}* customer${debtorCount === 1 ? '' : 's'} with an outstanding balance, totalling *${totalOwedLabel}*.\n\nWant Kika to send them a polite, friendly reminder before the weekend?`,
+    bodyText: `Happy Friday! You have *${debtorCount}* customer${debtorCount === 1 ? '' : 's'} with an outstanding balance, totalling *${totalOwedLabel}*.\n\nWant Kika to send them a polite, friendly reminder before the weekend?`,
     buttons: [
-      { id: 'AMNESTY_SEND', title: 'Send Reminders \ud83d\udc4d' },
+      { id: 'AMNESTY_SEND', title: 'Send Reminders' },
       { id: 'AMNESTY_SKIP', title: 'Not Now' },
     ],
   });
@@ -157,7 +157,7 @@ async function sendPaymentLink(toWhatsappNumber, paymentUrl, amountLabel) {
     type: 'text',
     text: {
       preview_url: true,
-      body: `🚀 *Kika Upgrade*\n\nAmount: ${amountLabel}\nComplete your payment securely here:\n${paymentUrl}\n\nYour new features activate instantly the second your payment is verified!`,
+      body: `*Kika Upgrade*\n\nAmount: ${amountLabel}\nComplete your payment securely here:\n${paymentUrl}\n\nYour new features activate instantly the second your payment is verified!`,
     },
   });
 }

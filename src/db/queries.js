@@ -292,10 +292,24 @@ async function resolvePendingReceiptDecision(merchantId, entryIds, { receiptId =
 
 // --- Invoice creation flow (worker.js) --------------------------------------
 
+// customerName may be null — e.g. a bare "create invoice"/"new invoice"
+// with no name attached — in which case the flow starts one step
+// earlier, asking for the name before moving on to items.
 async function startInvoiceFlow(merchantId, customerName) {
+  const stage = customerName ? 'ITEMS' : 'AWAITING_NAME';
   await query(
     `UPDATE merchants
-     SET invoice_awaiting_stage = 'ITEMS', invoice_customer_name = $2, invoice_pending_items = '[]'::jsonb
+     SET invoice_awaiting_stage = $3, invoice_customer_name = $2, invoice_pending_items = '[]'::jsonb
+     WHERE id = $1`,
+    [merchantId, customerName, stage]
+  );
+}
+
+/** Attaches the customer name once it's supplied, then moves the flow on to collecting items. */
+async function setInvoiceCustomerNameAndStartItems(merchantId, customerName) {
+  await query(
+    `UPDATE merchants
+     SET invoice_awaiting_stage = 'ITEMS', invoice_customer_name = $2
      WHERE id = $1`,
     [merchantId, customerName]
   );
@@ -1481,6 +1495,7 @@ module.exports = {
   setReceiptDecisionAwaiting,
   resolvePendingReceiptDecision,
   startInvoiceFlow,
+  setInvoiceCustomerNameAndStartItems,
   addInvoicePendingItem,
   setInvoiceAwaitingStage,
   clearInvoiceFlow,

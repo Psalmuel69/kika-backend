@@ -47,7 +47,7 @@ async function checkNpsTrigger(merchant) {
 }
 
 const NPS_SCORE_QUESTION =
-  '\ud83d\udcca Quick one \u2014 on a scale of 0\u201310, how likely are you to recommend Kika to another business owner?\n\n(Just reply with a number from 0 to 10.)';
+  'Quick one \u2014 on a scale of 0\u201310, how likely are you to recommend Kika to another business owner?\n\n(Just reply with a number from 0 to 10.)';
 
 const NPS_REASON_QUESTION = 'Thanks! What\u2019s the main reason for your score?';
 
@@ -84,12 +84,12 @@ function classifyNpsScore(score) {
 
 function buildNpsScoreTierReply(tier) {
   if (tier === 'low') {
-    return "Thank you for your honesty \u2014 we hear you, and we'll work on making Kika better for you. \ud83d\ude4f";
+    return "Thank you for your honesty \u2014 we hear you, and we'll work on making Kika better for you.";
   }
   if (tier === 'medium') {
     return "Thanks for the feedback! We're always working to make Kika even better for businesses like yours.";
   }
-  return "Thank you! \ud83c\udf89 We're so happy to see Kika is working well for your business \u2014 that really means a lot to us.";
+  return "Thank you! We're so happy to see Kika is working well for your business \u2014 that really means a lot to us.";
 }
 
 /**
@@ -167,7 +167,7 @@ function startOfWeekLagos(date) {
 
 function buildEmailMilestoneMessage(weeklyCount) {
   return (
-    `\ud83c\udf89 You've recorded ${weeklyCount} transactions with Kika this week.\n\n` +
+    `You've recorded ${weeklyCount} transactions with Kika this week.\n\n` +
     `Would you like me to email you:\n` +
     `\u2022 Weekly business reports\n` +
     `\u2022 Product updates\n` +
@@ -239,7 +239,7 @@ async function handleEmailCollectionReply(merchant, rawMessage) {
     await queries.setMerchantEmail(merchant.id, text.toLowerCase());
     await queries.setEmailCollectionAwaitingStage(merchant.id, null);
     logger.info({ merchantId: merchant.id }, 'Merchant email captured via opt-in flow');
-    return `Got it! \u2705 I've saved ${text.toLowerCase()} \u2014 you'll start getting your reports, updates, and tips there.`;
+    return `Got it \u2014 I've saved ${text.toLowerCase()}. You'll start getting your reports, updates, and tips there.`;
   }
 
   await queries.setEmailCollectionAwaitingStage(merchant.id, null);

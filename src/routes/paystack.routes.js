@@ -148,7 +148,7 @@ async function handleCustomerInvoicePayment(reference) {
 
   await whatsappService.sendTextMessage(
     merchant.whatsapp_number,
-    `\ud83d\udcb0 Payment received! ${link.currency} ${(link.amount_kobo / 100).toLocaleString('en-NG')} from ${
+    `Payment received! ${link.currency} ${(link.amount_kobo / 100).toLocaleString('en-NG')} from ${
       link.customer_name || 'your customer'
     } has been recorded automatically.`
   );

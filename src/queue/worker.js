@@ -74,7 +74,7 @@ function buildTimeAwareGreeting(merchant) {
   const timeOfDay = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
   const firstName = name.trim().split(/\s+/)[0];
 
-  return `Good ${timeOfDay}, ${firstName}! \ud83d\udc4b I'm *Kika AI* \u2014 your business ledger assistant right here on WhatsApp. I help you record sales, expenses, and customer debts just by texting me normally, no app needed. How can I help you today?`;
+  return `Good ${timeOfDay}, ${firstName}! I'm *Kika AI* \u2014 your business ledger assistant right here on WhatsApp. I help you record sales, expenses, and customer debts just by texting me normally, no app needed. How can I help you today?`;
 }
 
 function formatNairaShort(kobo) {
@@ -120,7 +120,7 @@ function buildBatchConfirmationText(entries) {
     const balanceKobo = entry.balance_after_kobo != null ? Number(entry.balance_after_kobo) : 0;
     return balanceKobo > 0
       ? `Great! I've recorded the payment of ${formatNairaShort(entry.paid_kobo)} from ${who} to your Kika book. Outstanding balance is now ${formatNairaShort(balanceKobo)}.`
-      : `Great! I've recorded the payment of ${formatNairaShort(entry.paid_kobo)} from ${who} to your Kika book \u2014 fully settled! \ud83c\udf89`;
+      : `Great! I've recorded the payment of ${formatNairaShort(entry.paid_kobo)} from ${who} to your Kika book \u2014 fully settled!`;
   }
 
   const whoPhrase =
@@ -235,7 +235,7 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
     // Minimal caption — what was actually recorded was already described
     // in the confirmation message sent before this Yes/No question (see
     // askReceiptDecision), so the receipt itself doesn't need to repeat it.
-    await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, 'Here\u2019s your receipt! \ud83e\uddfe');
+    await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, 'Here\u2019s your receipt!');
     await maybeSendEngagementNudge(merchant, whatsappNumber);
     return;
   }
@@ -252,16 +252,51 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
 
 async function startInvoiceCreation(merchant, whatsappNumber, customerName) {
   await queries.startInvoiceFlow(merchant.id, customerName);
+  if (!customerName) {
+    await whatsappService.sendTextMessage(whatsappNumber, `Sure \u2014 who's this invoice for?`);
+    return;
+  }
   await whatsappService.sendTextMessage(
     whatsappNumber,
     `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price_\n\nType *done* when finished.`
   );
 }
 
+async function handleInvoiceNameReply(merchant, whatsappNumber, rawMessage) {
+  if (/^cancel$/i.test(rawMessage.trim())) {
+    await queries.clearInvoiceFlow(merchant.id);
+    await whatsappService.sendTextMessage(whatsappNumber, 'Invoice cancelled.');
+    return;
+  }
+  const customerName = rawMessage.trim().replace(/[?.!]+$/, '').slice(0, 100);
+  if (!customerName) {
+    await whatsappService.sendTextMessage(whatsappNumber, `Who's this invoice for? Reply with the customer's name, or CANCEL to stop.`);
+    return;
+  }
+  await queries.setInvoiceCustomerNameAndStartItems(merchant.id, customerName);
+  await whatsappService.sendTextMessage(
+    whatsappNumber,
+    `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price_\n\nType *done* when finished.`
+  );
+}
+
+// Shared invoice item line renderer — used for the running "Added: ..."
+// confirmation, the pre-confirm preview, and (indirectly) the final
+// invoice card. Always shows the per-item price in brackets alongside
+// the line total, so the customer-facing invoice is unambiguous about
+// unit cost vs. total ("3\u00d7 bags rice (\u20a61,500/unit) \u2014 \u20a64,500"),
+// not just a lump sum.
+function formatInvoiceItemLabel(item) {
+  const label = item.unit ? `${item.unit} ${item.name}` : item.name;
+  const unitPrice = formatNairaShort(item.unitPriceKobo);
+  const lineTotal = formatNairaShort(item.totalKobo);
+  return `${item.quantity}\u00d7 ${label} (${unitPrice}/unit) \u2014 ${lineTotal}`;
+}
+
 function buildInvoicePreviewText(customerName, items, totalKobo) {
   const lines = [`Here's your invoice preview:`, '', `*Invoice for ${customerName}*`, ''];
   for (const item of items) {
-    lines.push(`${item.quantity}\u00d7 ${item.name} \u2014 ${formatNairaShort(item.totalKobo)}`);
+    lines.push(formatInvoiceItemLabel(item));
   }
   lines.push('', `*Total: ${formatNairaShort(totalKobo)}*`, '', 'Generate this invoice? Reply *yes* to confirm.');
   return lines.join('\n');
@@ -274,7 +309,7 @@ async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
     if (items.length === 0) {
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        'You haven\u2019t added any items yet \u2014 send at least one like "2 x iPhone charger x 4500", or type CANCEL to stop.'
+        'You haven\u2019t added any items yet \u2014 send at least one like "2 x iPhone charger x 4500" or "3 bags rice x 15k", or type CANCEL to stop.'
       );
       return;
     }
@@ -294,12 +329,12 @@ async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
   if (!item) {
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" (Quantity x Item name x Price), or type *done* when finished.'
+      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (Quantity + item, then price), or type *done* when finished.'
     );
     return;
   }
   await queries.addInvoicePendingItem(merchant.id, item);
-  await whatsappService.sendTextMessage(whatsappNumber, `Added: ${item.quantity}\u00d7 ${item.name} \u2014 ${formatNairaShort(item.totalKobo)}. Send another item or type *done*.`);
+  await whatsappService.sendTextMessage(whatsappNumber, `Added: ${formatInvoiceItemLabel(item)}. Send another item, or type *done*.`);
 }
 
 async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
@@ -330,7 +365,7 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   await whatsappService.sendReceiptImage(
     whatsappNumber,
     card.url,
-    `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n\ud83d\udd17 ${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+    `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
   );
 }
 
@@ -383,7 +418,7 @@ async function handleOnboarding(merchant, whatsappNumber, jobData) {
       await auditLogService.logEvent({ merchantId: merchant.id, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'consent.accepted' });
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        "Account Activated! \ud83c\udf89 Your Kika Free Tier is live. Let's set up your business identity in 5 seconds.\n\n*What is the name of your business/shop?*"
+        "Account Activated! Your Kika Free Tier is live. Let's set up your business identity in 5 seconds.\n\n*What is the name of your business/shop?*"
       );
       return;
     }
@@ -399,7 +434,7 @@ async function handleOnboarding(merchant, whatsappNumber, jobData) {
     await queries.markConsentDeclined(merchant.id);
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      "No worries \u2014 whenever you're ready to get started, just say *Hi* and we'll pick up right where we left off. \ud83d\udc4b"
+      "No worries \u2014 whenever you're ready to get started, just say *Hi* and we'll pick up right where we left off."
     );
     return;
   }
@@ -547,9 +582,9 @@ async function handlePendingDebtNameReply(merchant, whatsappNumber, rawMessage, 
  * The single commit path every successfully-validated entry goes
  * through, regardless of which extractor produced it (regex front door,
  * Gemini escalation, degraded regex, reply-context, or a debt-name
- * follow-up). Records the entry, sends the \u2705 ack, wires up the
- * outbound wamid for future reply-context resolution, and surfaces any
- * operational alerts.
+ * follow-up). Records the entry, sends the per-entry ack (see
+ * ENTRY_ACK_TEXT below), wires up the outbound wamid for future
+ * reply-context resolution, and surfaces any operational alerts.
  */
 async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source }) {
   // The AI path classifies DEBIT expenses itself; the regex path never
@@ -582,18 +617,26 @@ async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMess
     replyToWhatsappMessageId,
   });
 
-  // No descriptive confirmation is sent per entry anymore — see
-  // askReceiptDecision, which sends ONE consolidated confirmation
-  // covering everything logged since the last DONE, right before
-  // asking about a receipt. A bare checkmark here is just enough for
-  // (a) instant "got it" feedback while logging several things in a
-  // row, and (b) an outbound wamid to attach to this entry, which is
-  // what lets a LATER reply ("he paid", tapping Reply on this exact
-  // message) resolve back to it — see queries.
-  // getLedgerEntryByOutboundMessageId and businessContextService's
-  // "Reply context" block.
+  // Per-entry acknowledgment — evaluated three options here: (1) send
+  // nothing after the first entry in a run and only speak again at
+  // DONE, (2) the invoice-flow pattern of a short constant text after
+  // EVERY entry, (3) same as (1). Went with (2), for a reason that's
+  // not just tone: reply-context resolution (see
+  // getLedgerEntryByOutboundMessageId / businessContextService's
+  // "Reply context" block) depends on THIS message's outbound wamid
+  // being attached to THIS specific entry, so a merchant tapping
+  // "Reply" on entry #2 of a five-in-a-row batch resolves back to
+  // entry #2, not whichever entry happened to be last. Option (1) would
+  // only ever produce one outbound message per batch, silently breaking
+  // reply-context for every entry after the first. Sending the same
+  // short line every time isn't the noisy "full description per entry"
+  // problem this used to avoid with a bare checkmark — it's one stable,
+  // constant prompt (not a repeated narrative), and the full "here's
+  // what you logged" description is still deferred to the ONE
+  // consolidated summary at DONE (buildBatchConfirmationText below).
+  const ENTRY_ACK_TEXT = 'Noted \u2014 log another, or type DONE when finished.';
   logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
-  const sendResult = await whatsappService.sendTextMessage(whatsappNumber, '\u2705');
+  const sendResult = await whatsappService.sendTextMessage(whatsappNumber, ENTRY_ACK_TEXT);
 
   const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
   if (ledgerEntry?.id && outboundMessageId) {
@@ -691,6 +734,10 @@ const ledgerWorker = new Worker(
         if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
         return;
       }
+      if (merchant.invoice_awaiting_stage === 'AWAITING_NAME') {
+        await handleInvoiceNameReply(merchant, whatsappNumber, rawMessage);
+        return;
+      }
       if (merchant.invoice_awaiting_stage === 'ITEMS') {
         await handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage);
         return;
@@ -724,7 +771,7 @@ const ledgerWorker = new Worker(
         // embedded in a longer message) is stored silently and normal
         // processing continues below.
         if (rawMessage.trim().length <= introducedName.length + 20) {
-          await whatsappService.sendTextMessage(whatsappNumber, `Nice to meet you, ${introducedName}! \ud83d\ude0a I'll remember that.`);
+          await whatsappService.sendTextMessage(whatsappNumber, `Nice to meet you, ${introducedName}! I'll remember that.`);
           return;
         }
       }
@@ -740,7 +787,7 @@ const ledgerWorker = new Worker(
     if (command === 'HELP') {
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        'Hi! Send me things like:\n"sold rice 5000"\n"Mama Tunde buy 3 carton indomie, she pay 15k remain 12k"\n"Chidi owes 2000"\n"John pay off his debt 5k"\n\nAfter logging, type *DONE* and I\'ll ask if you want a receipt \u2014 works for one entry or several in a row.\n\nWant an invoice for a customer instead? Just say "new invoice for <name>".\n\nYou can also send a voice note or a photo of a receipt/handwritten note.\n\nTip: include a customer\'s phone number (e.g. "Mama Tunde 08012345678 buy...") to enable loyalty milestone tracking.\n\nCommands: BALANCE, SUNSET, INSIGHTS, DISPUTE <reason>, INVOICE <amount>, ADD STOCK: <item>, <qty>, UNDO, CLOSING HOUR <hour>, EXPORT, UPGRADE.'
+        'Hi! Send me things like:\n"sold rice 5000"\n"Mama Tunde buy 3 carton indomie, she pay 15k remain 12k"\n"Chidi owes 2000"\n"John pay off his debt 5k"\n\nAfter logging, type *DONE* and I\'ll ask if you want a receipt \u2014 works for one entry or several in a row.\n\nWant an invoice for a customer instead? Just say "new invoice for <name>".\n\nYou can also send a voice note or a photo of a receipt/handwritten note.\n\nTip: include a customer\'s phone number (e.g. "Mama Tunde 08012345678 buy...") to enable loyalty milestone tracking.\n\nCommands: BALANCE, SUNSET, INSIGHTS, DISPUTE <reason>, INVOICE <amount>, ADD STOCK: <item>, <qty>, UNDO, CLOSING HOUR <hour>, EXPORT, UPGRADE.\n\nNeed a human? support@kikahq.com'
       );
       return;
     }
@@ -809,7 +856,7 @@ const ledgerWorker = new Worker(
 
         await whatsappService.sendTextMessage(
           whatsappNumber,
-          `\ud83e\uddea *Test Digest* (this month so far, not the real monthly send)\n\nMoney Inflow: \u20a6${(digestSummary.moneyInflowKobo / 100).toLocaleString('en-NG')}\nOutstanding: \u20a6${(digestSummary.outstandingKobo / 100).toLocaleString('en-NG')}\nTrade Days: ${digestSummary.tradeDays}\nTop Debtor: ${digestSummary.topDebtor?.counterparty_name || 'None'}`
+          `*Test Digest* (this month so far, not the real monthly send)\n\nMoney Inflow: \u20a6${(digestSummary.moneyInflowKobo / 100).toLocaleString('en-NG')}\nOutstanding: \u20a6${(digestSummary.outstandingKobo / 100).toLocaleString('en-NG')}\nTrade Days: ${digestSummary.tradeDays}\nTop Debtor: ${digestSummary.topDebtor?.counterparty_name || 'None'}`
         );
         await whatsappService.sendMonthlyDigestCard(whatsappNumber, {
           imageUrl: digestCard.url,
@@ -828,7 +875,7 @@ const ledgerWorker = new Worker(
       if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
         await whatsappService.sendTextMessage(
           whatsappNumber,
-          `You're already on *${merchant.plan}* \u2014 the full Kika experience! \ud83c\udf1f There's no higher tier to upgrade to right now. Type BALANCE or HELP if you need anything.`
+          `You're already on *${merchant.plan}* \u2014 the full Kika experience! There's no higher tier to upgrade to right now. Type BALANCE or HELP if you need anything.`
         );
         return;
       }
@@ -838,13 +885,18 @@ const ledgerWorker = new Worker(
       const featureLines = paidTiers
         .map((t) => {
           const monthly = `${t.currency} ${Number(t.price).toLocaleString('en-NG')}/mo`;
-          const yearly = `${t.currency} ${Number(t.price_yearly).toLocaleString('en-NG')}/yr`;
-          return `\n*${t.name}* \u2014 ${monthly} (or ${yearly}, 2 months free \ud83c\udf81):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`;
+          // Guard against a tier row where price_yearly is missing, zero,
+          // or otherwise not a usable number (e.g. a custom tier added
+          // without setting it) — fall back to the standard 10x-monthly
+          // (2-months-free) rate rather than ever displaying "NaN/yr".
+          const yearlyMajorUnits = Number(t.price_yearly) > 0 ? Number(t.price_yearly) : Number(t.price) * 10;
+          const yearly = `${t.currency} ${yearlyMajorUnits.toLocaleString('en-NG')}/yr`;
+          return `\n*${t.name}* \u2014 ${monthly} (or ${yearly}, 2 months free):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`;
         })
         .join('\n');
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\ud83d\ude80 *Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below for the monthly price, or type "STANDARD YEARLY" / "PREMIUM YEARLY" to pay yearly and save 2 months \ud83d\udc47`
+        `*Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below for the monthly price, or type "STANDARD YEARLY" / "PREMIUM YEARLY" to pay yearly and save 2 months`
       );
       await whatsappService.sendPlanSelectionButtons(
         whatsappNumber,
@@ -858,7 +910,7 @@ const ledgerWorker = new Worker(
       if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
         await whatsappService.sendTextMessage(
           whatsappNumber,
-          `You're already on *${merchant.plan}* \u2014 the full Kika experience! \ud83c\udf1f There's no higher tier to upgrade to right now.`
+          `You're already on *${merchant.plan}* \u2014 the full Kika experience! There's no higher tier to upgrade to right now.`
         );
         return;
       }
@@ -912,7 +964,7 @@ const ledgerWorker = new Worker(
         await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'ledger_entry.void', metadata: { ledgerEntryId: result.entry.id } });
         await whatsappService.sendTextMessage(
           whatsappNumber,
-          `Transaction cancelled! \u21a9\ufe0f Kika has deleted your last entry: '${result.entry.raw_message || result.entry.description}' from your sales records. Your balance and stock levels have been restored safely. Type your fresh entry whenever you're ready!`
+          `Transaction cancelled! Kika has deleted your last entry: '${result.entry.raw_message || result.entry.description}' from your sales records. Your balance and stock levels have been restored safely. Type your fresh entry whenever you're ready!`
         );
       }
       return;
@@ -945,7 +997,7 @@ const ledgerWorker = new Worker(
     }
 
     if (rawMessage === 'AMNESTY_SKIP') {
-      await whatsappService.sendTextMessage(whatsappNumber, 'No problem \u2014 maybe next Friday! \ud83d\udc4b');
+      await whatsappService.sendTextMessage(whatsappNumber, 'No problem \u2014 maybe next Friday!');
       return;
     }
 
@@ -968,7 +1020,7 @@ const ledgerWorker = new Worker(
       const skippedCount = debtors.length - messagable.length;
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\u2705 Sent polite reminders to ${sentCount} customer${sentCount === 1 ? '' : 's'}!${skippedCount > 0 ? ` (${skippedCount} skipped \u2014 no phone number on file.)` : ''}`
+        `Sent polite reminders to ${sentCount} customer${sentCount === 1 ? '' : 's'}!${skippedCount > 0 ? ` (${skippedCount} skipped \u2014 no phone number on file.)` : ''}`
       );
       return;
     }
@@ -988,7 +1040,7 @@ const ledgerWorker = new Worker(
       const product = await queries.addProductStock(merchantId, addStockParsed.productName, addStockParsed.quantity, addStockParsed.unit);
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\ud83d\udce6 Stock updated! *${product.name}* now has *${product.current_stock} ${product.unit || 'units'}* in stock.`
+        `Stock updated! *${product.name}* now has *${product.current_stock} ${product.unit || 'units'}* in stock.`
       );
       return;
     }
@@ -998,7 +1050,7 @@ const ledgerWorker = new Worker(
       const reason = disputeMatch[1]?.trim() || 'No reason provided';
       const dispute = await queries.createLedgerDispute({ merchantId, raisedBy: 'MERCHANT', reason });
       await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'dispute.create', metadata: { disputeId: dispute.id, reason } });
-      await whatsappService.sendTextMessage(whatsappNumber, `Got it \u2014 I've logged this for review (ref: ${dispute.id.slice(0, 8).toUpperCase()}). Our team will look into it.`);
+      await whatsappService.sendTextMessage(whatsappNumber, `Got it \u2014 I've logged this for review (ref: ${dispute.id.slice(0, 8).toUpperCase()}). Our team will look into it. Need to reach us directly? support@kikahq.com`);
       return;
     }
 
@@ -1008,7 +1060,7 @@ const ledgerWorker = new Worker(
       await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'payment_link.create', metadata: { paymentLinkId: link.id, amountKobo: link.amount_kobo } });
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\ud83e\uddfe Payment link ready \u2014 forward this to your customer:\n${link.short_url}\n\nAmount: ${link.currency} ${(link.amount_kobo / 100).toLocaleString('en-NG')}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+        `Payment link ready \u2014 forward this to your customer:\n${link.short_url}\n\nAmount: ${link.currency} ${(link.amount_kobo / 100).toLocaleString('en-NG')}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
       );
       return;
     }
@@ -1019,7 +1071,7 @@ const ledgerWorker = new Worker(
       try {
         const logoPath = await mediaService.saveWhatsappImageAsMerchantLogo(job.data.mediaId, merchantId);
         await queries.setMerchantLogo(merchantId, logoPath);
-        await whatsappService.sendTextMessage(whatsappNumber, '\u2705 Logo saved! Your next receipt will carry your new brand look.');
+        await whatsappService.sendTextMessage(whatsappNumber, 'Logo saved! Your next receipt will carry your new brand look.');
       } catch (err) {
         logger.error({ err: err.message }, 'Logo save failed');
         await whatsappService.sendTextMessage(whatsappNumber, "I couldn't save that image as your logo — please try resending it.");
@@ -1082,7 +1134,7 @@ const ledgerWorker = new Worker(
 
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\u2705 Scan complete! Kika AI recorded *${itemLines.length} transaction${itemLines.length === 1 ? '' : 's'}* from your paper log sheet.${rejectedLines > 0 ? `\n(${rejectedLines} line${rejectedLines === 1 ? '' : 's'} couldn't be read clearly enough to record safely \u2014 you can type ${rejectedLines === 1 ? 'it' : 'them'} in manually.)` : ''}\n\n*Quick Summary:*\nTotal Inflows: \u20a6${(totalInflowKobo / 100).toLocaleString('en-NG')}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
+        `Scan complete! Kika AI recorded *${itemLines.length} transaction${itemLines.length === 1 ? '' : 's'}* from your paper log sheet.${rejectedLines > 0 ? `\n(${rejectedLines} line${rejectedLines === 1 ? '' : 's'} couldn't be read clearly enough to record safely \u2014 you can type ${rejectedLines === 1 ? 'it' : 'them'} in manually.)` : ''}\n\n*Quick Summary:*\nTotal Inflows: \u20a6${(totalInflowKobo / 100).toLocaleString('en-NG')}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
       );
       return;
     }
@@ -1269,7 +1321,7 @@ const webhookAlertWorker = new Worker(
 
     await whatsappService.sendTextMessage(
       merchant.whatsapp_number,
-      `\ud83c\udf89 *Payment Received! Welcome to Kika ${planTier || 'Premium'}, ${merchant.business_name || 'friend'}!* Your custom brand settings are unlocked for the next 30 days.\n\n*Want to add your logo to your receipts?* Just send your business logo image directly into this chat right now, and Kika will save it automatically!`
+      `*Payment Received! Welcome to Kika ${planTier || 'Premium'}, ${merchant.business_name || 'friend'}!* Your custom brand settings are unlocked for the next 30 days.\n\n*Want to add your logo to your receipts?* Just send your business logo image directly into this chat right now, and Kika will save it automatically!`
     );
   },
   { connection, concurrency: 5 }

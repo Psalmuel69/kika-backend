@@ -46,19 +46,25 @@
  * avoid floating point drift on money math.
  */
 
-// "INVOICE 5000 for rice" or "INVOICE 08012345678 5000 rice delivery" —
-// generates a customer-facing payment link rather than a ledger entry.
-const INVOICE_PREFIX_RE = /^invoice\b[:\s]+(?:(\+?234\d{10}|0[789]\d{9})\s+)?([\d,]+(?:\.\d{1,2})?)(k)?\s*(.*)$/i;
+// "INVOICE 5000 for rice", "INVOICE 08012345678 2 million rice
+// delivery", "INVOICE $150 supplies" — generates a customer-facing
+// payment link rather than a ledger entry. The amount portion accepts
+// the same money vocabulary as the ledger parser (k/m/h/thousand/
+// million/hundred, ₦/$/naira/dollars) — see MONEY_SUFFIX_MULTIPLIER
+// below, which this shares.
+const INVOICE_PREFIX_RE =
+  /^invoice\b[:\s]+(?:(\+?234\d{10}|0[789]\d{9})\s+)?(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*(.*)$/i;
 
 function parseInvoiceCommand(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
   const match = rawMessage.trim().match(INVOICE_PREFIX_RE);
   if (!match) return null;
 
-  const [, phoneRaw, numberPart, kSuffix, description] = match;
+  const [, phoneRaw, numberPart, suffixRaw, description] = match;
   let amountNaira = parseFloat(numberPart.replace(/,/g, ''));
   if (Number.isNaN(amountNaira) || amountNaira <= 0) return null;
-  if (kSuffix) amountNaira *= 1000;
+  const multiplier = MONEY_SUFFIX_MULTIPLIER[(suffixRaw || '').toLowerCase()];
+  if (multiplier) amountNaira *= multiplier;
 
   const customerPhone = phoneRaw ? (phoneRaw.startsWith('+234') ? phoneRaw : `+234${phoneRaw.replace(/^0/, '')}`) : null;
 
@@ -182,21 +188,34 @@ const DEBT_SETTLE_VERBS = ['pay off', 'clear debt', 'settle debt', 'paid off', '
 const DEBT_VERBS = ['owes', 'owe', 'debt', 'credit sale', 'on credit'];
 
 // Matches "15k", "15,000", "₦15,000.50", "N15000", "15000 naira", "2m",
-// "2 million", "5h", "5 hundred" — Nigerian chat shorthand for
-// thousand/million/hundred multipliers, spelled out or abbreviated.
+// "2 million", "2 milli", "5h", "5 hundred", "$150", "150 dollars" —
+// Nigerian chat shorthand for thousand/million/hundred multipliers
+// (spelled out or abbreviated), plus explicit currency words/symbols.
+// "$"/"usd"/"dollars" are recognized as money markers so an amount
+// written that way is never mistaken for text (e.g. left over as a
+// stray item name) — Kika still records the numeric face value in the
+// ledger's naira fields as-is; it does not perform currency conversion.
 // The bare "n" prefix only matches when glued directly to a digit
 // (lookahead \d, no space) — otherwise it would greedily swallow the
 // trailing "n" of ordinary words like "remain" or "in" as a false
 // currency marker.
-const MONEY_TOKEN = /\b(?:₦\s*|ngn\s*|n(?=\d))?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|hundred)?\b(?!\w)/i;
+const MONEY_TOKEN =
+  /\b(?:₦\s*|\$\s*|ngn\s*|usd\s*|n(?=\d))?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)/i;
 
 const MONEY_SUFFIX_MULTIPLIER = {
   k: 1000,
   thousand: 1000,
   m: 1000000,
   million: 1000000,
+  milli: 1000000,
   h: 100,
   hundred: 100,
+  // Currency words carry no multiplier of their own — they just confirm
+  // the number is money, same role the ₦/$ symbols play as a prefix.
+  naira: 1,
+  dollar: 1,
+  dollars: 1,
+  usd: 1,
 };
 
 function parseMoneyToken(matchGroups) {
@@ -236,7 +255,8 @@ function extractMoneyMentions(text) {
 // amount ("2 bags rice 40k" — the name is "rice", not "rice 40k"),
 // which is what lets the quantity digit be excluded from money-mention
 // detection instead of being misread as a ₦2 total.
-const ITEM_RE_QTY_FIRST = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to | for |\s+(?:\u20a6|ngn\s*|n(?=\d))?\d)/i;
+const ITEM_RE_QTY_FIRST =
+  /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\s+(?:of\s+)?([a-zA-Z][a-zA-Z\s]{1,40}?)(?=,|\.|$| she| he| and | pay| paid| to | for | today| yesterday| tomorrow| last week| last month| last year| this week| this month|\s+(?:\u20a6|\$|ngn|usd)?\s*\d)/i;
 
 // "rice 2 bags", "indomie 3 cartons" — item name BEFORE quantity/unit,
 // equally common phrasing ("bought/sold <item> <qty> <unit>"). Captures
@@ -246,12 +266,33 @@ const ITEM_RE_QTY_FIRST = /(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|pla
 // aren't immediately followed by a digit — and lands on "rice 2 bags").
 const ITEM_RE_NAME_FIRST = /\b([a-zA-Z]+)\s+(\d+)\s*(cartons?|bags?|packs?|pieces?|pcs?|cups?|plates?|dozen|crates?|kegs?|litres?|liters?|kg|tins?)\b/i;
 
+// Trailing words that are never part of an item name even though the
+// item-name capture groups above have no way to know where the noun
+// phrase actually ends — date/time references ("rice TODAY", "maize
+// LAST WEEK") and a bare dangling preposition left behind when its
+// object wasn't captured ("rice YESTERDAY FOR" once "yesterday" itself
+// is peeled off). Applied repeatedly so a chain like "today for" is
+// fully stripped, not just its outermost word.
+const TRAILING_NOISE_RE =
+  /\s+(?:today|yesterday|tomorrow|tonight|this\s+morning|this\s+afternoon|this\s+evening|last\s+night|last\s+week|last\s+month|last\s+year|this\s+week|this\s+month|this\s+year|earlier|just\s+now|now|for|to|from|at)\s*$/i;
+
+function cleanItemName(name) {
+  if (!name) return name;
+  let cleaned = name.trim();
+  let previous;
+  do {
+    previous = cleaned;
+    cleaned = cleaned.replace(TRAILING_NOISE_RE, '').trim();
+  } while (cleaned !== previous && cleaned.length > 0);
+  return cleaned;
+}
+
 function extractItem(text) {
   const qtyFirstMatch = text.match(ITEM_RE_QTY_FIRST);
   if (qtyFirstMatch) {
     const [, quantity, unit, name] = qtyFirstMatch;
     return {
-      name: name.trim(),
+      name: cleanItemName(name),
       quantity: Number(quantity),
       unit: unit.toLowerCase(),
       // Index of the quantity digit within the message, so callers can
@@ -272,7 +313,7 @@ function extractItem(text) {
     if (VERB_BLOCKLIST.includes(name.toLowerCase())) return null;
     const quantityIndex = nameFirstMatch.index + nameFirstMatch[0].indexOf(quantity, name.length);
     return {
-      name: name.trim(),
+      name: cleanItemName(name),
       quantity: Number(quantity),
       unit: unit.toLowerCase(),
       quantityIndex,
@@ -296,7 +337,13 @@ const PHONE_RE = /(?:\+?234|0)([789]\d{9})\b/;
 const BARE_ITEM_LEADING_NAME_RE = /^[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){0,2}\s+/;
 const BARE_ITEM_LEADING_RE =
   /^(?:sold|sell|selling|sale of|bought|buy|purchase of|paid for|spent on|gave|received|owes?|owe)\s*/i;
-const BARE_ITEM_TRAILING_RE = /\s+(?:to|from|for)\s+[A-Z][\s\S]*$|\s*(?:\u20a6|ngn)?\s*[\d][\d,.]*\s*(?:k|m)?\.?\s*[\s\S]*$/i;
+// The currency-symbol alternation here MUST list every prefix
+// MONEY_TOKEN recognizes (₦, $, ngn, usd) — otherwise a symbol that
+// isn't consumed as part of the stripped amount (e.g. "$150" when only
+// "₦"/"ngn" were listed) is left dangling and gets returned as if it
+// were the item name itself.
+const BARE_ITEM_TRAILING_RE =
+  /\s+(?:to|from|for)\s+[A-Z][\s\S]*$|\s*(?:\u20a6|\$|ngn|usd)?\s*[\d][\d,.]*\s*(?:k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\.?\s*[\s\S]*$/i;
 // After stripping verbs/names/amounts, a handful of bare leftover words
 // mean "there was no item at all" (e.g. "Chidi owes 2000" leaves
 // nothing product-like once "Chidi" and "owes" are both gone) — these
@@ -321,7 +368,7 @@ function extractBareItemName(text) {
   core = core.replace(BARE_ITEM_LEADING_NAME_RE, '');
   core = core.replace(BARE_ITEM_LEADING_RE, '');
   core = core.replace(BARE_ITEM_TRAILING_RE, '');
-  core = core.trim();
+  core = cleanItemName(core);
   if (!core || core.length > 60) return null;
   if (BARE_ITEM_REJECT_WORDS.has(core.toLowerCase())) return null;
   return core.charAt(0).toUpperCase() + core.slice(1);
@@ -531,25 +578,78 @@ function parseReplyMessage(rawMessage, replyEntry) {
 // transaction message ("sold 2 phones today") is never mistaken for an
 // invoice line — this parser is only ever consulted while a merchant is
 // already inside the invoice-items step, never against arbitrary text.
-const INVOICE_ITEM_LINE_RE = /^(\d+)\s*x\s*(.+?)\s*x\s*([\d,]+(?:\.\d{1,2})?)(k)?\s*$/i;
+//
+// The quantity may optionally be followed by a unit word before the
+// first "x" ("2 bags x rice x 4500", "3 sacks x maize x 15k") — this is
+// intentionally NOT a fixed list of recognized units (bags, sacks,
+// bundles, packs, boxes, cartons, pieces, pcs, cups, crates, kegs,
+// dozen, ...). Any single word works, since the merchant's own choice
+// of unit is just descriptive text to Kika, never something it needs
+// to interpret numerically — hardcoding a list would only mean some
+// future word the merchant uses ("cans", "rolls", "trays", "kegs",
+// "gallons"...) throws an error for no reason.
+const INVOICE_ITEM_LINE_RE =
+  /^(\d+)\s*(?:([a-zA-Z]+)\s+)?x\s*(.+?)\s*x\s*(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*$/i;
+
+// Fallback for a single-"x" line where the merchant wrote the quantity,
+// unit, and item name as one natural phrase instead of the strict
+// template — "3 bags of rice x 15k", "5 bundles firewood x 2k", "10 pcs
+// biro x 500". No unit word is parsed out here at all; whatever the
+// merchant wrote between the quantity and the price is kept verbatim as
+// the item's display name, so literally any unit word (or none) works
+// without the parser needing to recognize it.
+const INVOICE_ITEM_LINE_FALLBACK_RE =
+  /^(\d+)\s+(.+?)\s*x\s*(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*$/i;
+
+function resolveMoney(numberPart, suffixRaw) {
+  let value = parseFloat(numberPart.replace(/,/g, ''));
+  if (Number.isNaN(value)) return null;
+  const multiplier = MONEY_SUFFIX_MULTIPLIER[(suffixRaw || '').toLowerCase()];
+  if (multiplier) value *= multiplier;
+  return value;
+}
 
 function parseInvoiceItemLine(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
-  const match = rawMessage.trim().match(INVOICE_ITEM_LINE_RE);
-  if (!match) return null;
-  const [, quantityStr, name, priceStr, kSuffix] = match;
-  const quantity = Number(quantityStr);
-  let unitPriceNaira = parseFloat(priceStr.replace(/,/g, ''));
-  if (!name?.trim() || !Number.isFinite(quantity) || quantity <= 0 || Number.isNaN(unitPriceNaira) || unitPriceNaira <= 0) {
-    return null;
+  const trimmed = rawMessage.trim();
+
+  const strict = trimmed.match(INVOICE_ITEM_LINE_RE);
+  if (strict) {
+    const [, quantityStr, unit, name, priceStr, suffixRaw] = strict;
+    const quantity = Number(quantityStr);
+    const unitPriceNaira = resolveMoney(priceStr, suffixRaw);
+    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceNaira != null && unitPriceNaira > 0) {
+      return {
+        name: name.trim(),
+        unit: unit ? unit.toLowerCase() : null,
+        quantity,
+        unitPriceKobo: Math.round(unitPriceNaira * 100),
+        totalKobo: Math.round(unitPriceNaira * 100) * quantity,
+      };
+    }
   }
-  if (kSuffix) unitPriceNaira *= 1000;
-  return {
-    name: name.trim(),
-    quantity,
-    unitPriceKobo: Math.round(unitPriceNaira * 100),
-    totalKobo: Math.round(unitPriceNaira * 100) * quantity,
-  };
+
+  // Only reached when the strict two-"x" template didn't match at all
+  // (not as a second attempt after a valid strict match) — a single "x"
+  // in the message means the merchant phrased quantity+unit+name as one
+  // free-text chunk.
+  const fallback = trimmed.match(INVOICE_ITEM_LINE_FALLBACK_RE);
+  if (fallback) {
+    const [, quantityStr, name, priceStr, suffixRaw] = fallback;
+    const quantity = Number(quantityStr);
+    const unitPriceNaira = resolveMoney(priceStr, suffixRaw);
+    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceNaira != null && unitPriceNaira > 0) {
+      return {
+        name: name.trim(),
+        unit: null,
+        quantity,
+        unitPriceKobo: Math.round(unitPriceNaira * 100),
+        totalKobo: Math.round(unitPriceNaira * 100) * quantity,
+      };
+    }
+  }
+
+  return null;
 }
 
 // "new invoice for Adaeze", "create invoice for Adaeze", "invoice for
@@ -558,14 +658,24 @@ function parseInvoiceItemLine(rawMessage) {
 // which has no customer-name-first phrasing and still works for a
 // quick single-line invoice).
 const NEW_INVOICE_TRIGGER_RE = /^(?:new\s+|create\s+)?invoice\s+for\s+(.+)$/i;
+// The bare command with no name attached ("create invoice", "new
+// invoice", just "invoice") also starts the flow — the caller asks for
+// the customer's name as a separate step instead of doing nothing.
+const NEW_INVOICE_BARE_TRIGGER_RE = /^(?:new\s+|create\s+)?invoice\s*[?.!]*$/i;
 
 function parseNewInvoiceTrigger(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
-  const match = rawMessage.trim().match(NEW_INVOICE_TRIGGER_RE);
-  if (!match) return null;
-  const customerName = match[1].trim().replace(/[?.!]+$/, '');
-  if (!customerName || customerName.length > 100) return null;
-  return { customerName };
+  const trimmed = rawMessage.trim();
+  const namedMatch = trimmed.match(NEW_INVOICE_TRIGGER_RE);
+  if (namedMatch) {
+    const customerName = namedMatch[1].trim().replace(/[?.!]+$/, '');
+    if (!customerName || customerName.length > 100) return null;
+    return { customerName };
+  }
+  if (NEW_INVOICE_BARE_TRIGGER_RE.test(trimmed)) {
+    return { customerName: null };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
