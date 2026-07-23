@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS merchants (
     -- see receiptService.js's generateInvoiceCard and worker.js's
     -- invoice-flow handling: the finished invoice + payment link are
     -- handed to the MERCHANT to forward themselves.
-    invoice_awaiting_stage VARCHAR(10) CHECK (invoice_awaiting_stage IN ('ITEMS', 'CONFIRM')),
+    invoice_awaiting_stage VARCHAR(20) CHECK (invoice_awaiting_stage IN ('AWAITING_NAME', 'ITEMS', 'CONFIRM')),
     invoice_customer_name VARCHAR(160),
     invoice_pending_items JSONB NOT NULL DEFAULT '[]',
     next_invoice_number INTEGER NOT NULL DEFAULT 1,
@@ -744,9 +744,15 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_receipt_decision_pending
 
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS receipt_decision_awaiting BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_awaiting_stage VARCHAR(10);
+-- Widened from VARCHAR(10) to fit 'AWAITING_NAME' (the bare "create
+-- invoice"/"new invoice" trigger with no customer name yet attached) —
+-- a no-op on a fresh database (already created at VARCHAR(20) above),
+-- but required on an existing one where this column was created at the
+-- original, narrower width.
+ALTER TABLE merchants ALTER COLUMN invoice_awaiting_stage TYPE VARCHAR(20);
 ALTER TABLE merchants DROP CONSTRAINT IF EXISTS merchants_invoice_awaiting_stage_check;
 ALTER TABLE merchants ADD CONSTRAINT merchants_invoice_awaiting_stage_check
-    CHECK (invoice_awaiting_stage IN ('ITEMS', 'CONFIRM'));
+    CHECK (invoice_awaiting_stage IN ('AWAITING_NAME', 'ITEMS', 'CONFIRM'));
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_customer_name VARCHAR(160);
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS invoice_pending_items JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS next_invoice_number INTEGER NOT NULL DEFAULT 1;

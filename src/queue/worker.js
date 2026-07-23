@@ -348,13 +348,39 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   const totalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
   const invoiceNumber = await queries.claimNextInvoiceNumber(merchant.id);
 
-  const [card, link] = await Promise.all([
-    receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo }),
-    paystackService.createCustomerInvoice(merchant, {
-      amountKobo: totalKobo,
-      description: `Invoice #${String(invoiceNumber).padStart(4, '0')} \u2014 ${merchant.invoice_customer_name}`,
-    }),
-  ]);
+  let card;
+  let link;
+  try {
+    // Card generation and the Paystack payment link are independent of
+    // each other, so they run in parallel — but that means if ONE
+    // rejects, Promise.all rejects immediately while the OTHER keeps
+    // running in the background to completion (its result just never
+    // gets used here). That's harmless on its own, but this whole block
+    // used to have no try/catch at all: a Paystack/WhatsApp failure
+    // would throw all the way out, fail the BullMQ job silently from
+    // the merchant's point of view (no error message ever sent) AND
+    // leave invoice_awaiting_stage stuck at 'CONFIRM' with no way
+    // forward except CANCEL. Catching here means the merchant is told
+    // plainly and can just reply *yes* again to retry — their entered
+    // items are still intact since the flow state is untouched below.
+    [card, link] = await Promise.all([
+      receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo }),
+      paystackService.createCustomerInvoice(merchant, {
+        amountKobo: totalKobo,
+        description: `Invoice #${String(invoiceNumber).padStart(4, '0')} \u2014 ${merchant.invoice_customer_name}`,
+      }),
+    ]);
+  } catch (err) {
+    logger.error(
+      { err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data, merchantId: merchant.id, invoiceNumber },
+      'Invoice generation failed'
+    );
+    await whatsappService.sendTextMessage(
+      whatsappNumber,
+      "Something went wrong generating that invoice \u2014 nothing was lost, your items are still here. Reply *yes* to try again, or CANCEL to stop."
+    );
+    return;
+  }
 
   await queries.clearInvoiceFlow(merchant.id);
 
@@ -362,11 +388,25 @@ async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
   // directly with an invoice or payment link (same policy as loyalty
   // milestones — see loyaltyService.js). The merchant forwards it
   // themselves, on their own terms.
-  await whatsappService.sendReceiptImage(
-    whatsappNumber,
-    card.url,
-    `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
-  );
+  try {
+    await whatsappService.sendReceiptImage(
+      whatsappNumber,
+      card.url,
+      `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+    );
+  } catch (err) {
+    // The invoice + payment link ARE generated and saved at this point
+    // (queries.clearInvoiceFlow already ran) \u2014 only the WhatsApp
+    // delivery of the card image failed. Fall back to the plain-text
+    // link so the merchant still gets something usable instead of
+    // nothing, rather than losing the whole invoice to a media-send
+    // hiccup.
+    logger.error({ err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data, merchantId: merchant.id, invoiceNumber }, 'Invoice card image failed to send; falling back to text');
+    await whatsappService.sendTextMessage(
+      whatsappNumber,
+      `Here\u2019s the invoice for ${merchant.invoice_customer_name} (the image didn\u2019t send, here\u2019s the payment link instead):\n\n${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
+    );
+  }
 }
 
 /**
@@ -1437,7 +1477,17 @@ const scheduledReportsWorker = new Worker(
 
 for (const worker of [ledgerWorker, webhookAlertWorker, scheduledReportsWorker]) {
   worker.on('failed', (job, err) => {
-    logger.error({ jobId: job?.id, queue: job?.queueName, err: err.message }, 'Job failed');
+    // Axios errors (WhatsApp Cloud API, Paystack) carry the actual
+    // rejection reason in err.response.data — err.message alone is
+    // just "Request failed with status code 400", which tells an
+    // operator nothing about WHY. Logging the response body too means
+    // a 400 is diagnosable straight from these logs instead of needing
+    // a separate query against payment_gateway_activity_log or the
+    // WhatsApp send audit trail.
+    logger.error(
+      { jobId: job?.id, queue: job?.queueName, err: err.message, httpStatus: err.response?.status, responseBody: err.response?.data },
+      'Job failed'
+    );
   });
   worker.on('error', (err) => logger.error({ err }, 'Worker-level error'));
 }
