@@ -94,7 +94,7 @@ async function sendPlanSelectionButtons(toWhatsappNumber, buttons) {
  * platform's actual constraints, in a single message.
  */
 async function sendConsentPrompt(toWhatsappNumber) {
-  const termsUrl = process.env.TERMS_URL || 'https://kika-book.example.com/terms';
+  const termsUrl = process.env.TERMS_URL || 'https://kikahq.com/terms';
   return sendButtonMessage(toWhatsappNumber, {
     bodyText:
       'Welcome to *Kika-Book*! Your automatic business notebook inside WhatsApp. No more lost paper, forgotten customer debts, or manual calculations. Kika records your sales, tracks inventory, and types customer receipts instantly \u2014 just from a normal chat text.\n\n\ud83d\udd12 *Before we start, our security agreement:*\nWe encrypt your customer records and *never* share your shop details with tax collectors or external parties. By using Kika, you agree to our Terms & Privacy Policy:\n' +

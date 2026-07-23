@@ -136,31 +136,6 @@ function formatItemLabel(item) {
 }
 
 /**
- * When there's no structured {name, quantity, unit} item (the common
- * case — see the comment in generateReceipt), the entry's own
- * `description` is used as the item line instead. For a regex-parsed
- * entry that description is the raw merchant message verbatim (e.g.
- * "sold rice 5000"), which reads oddly sitting next to its own price
- * ("sold rice 5000 — ₦5,000"). This strips the leading transaction verb
- * and the trailing amount (already shown in the price column) so it
- * reads as a normal item name ("Rice"). AI-parsed / invoice descriptions
- * are already clean prose ("Fuel purchase") and pass through unchanged
- * — the strips below are no-ops on text that doesn't match them.
- */
-const DESCRIPTION_LEADING_VERB_RE =
-  /^(sold|bought|buy|sell|selling|sale of|purchase of|paid for|spent on|gave|received)\s+/i;
-const DESCRIPTION_TRAILING_AMOUNT_RE = /\s*(?:\u20a6|ngn)?\s*[\d][\d,.]*\s*(?:k|m)?\.?\s*$/i;
-
-function cleanDescriptionForDisplay(description) {
-  let text = String(description || '').trim();
-  text = text.replace(DESCRIPTION_LEADING_VERB_RE, '');
-  text = text.replace(DESCRIPTION_TRAILING_AMOUNT_RE, '');
-  text = text.trim();
-  if (!text) return 'Transaction';
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
-/**
  * Very cheap width estimator (no headless canvas / font-metrics library
  * available in this environment). Fira Code is monospace, so per-glyph
  * width is a fixed fraction of font-size and this estimate is exact.
@@ -419,7 +394,7 @@ function buildReceiptSvg({
   const row1 = [metaCell('DATE', timestampLabel, metaLeftX), metaCell('LABEL', entryTypeLabel, metaRightX)];
   const row2 = [
     metaCell('REF', reference, metaLeftX),
-    metaCell('CUSTOMER', counterpartyName || 'Walk-in customer', metaRightX),
+    metaCell('CUSTOMER', counterpartyName, metaRightX),
   ];
 
   function renderMetaRow(cells, rowTopY) {
@@ -616,43 +591,26 @@ function verifyFontsRenderable() {
 }
 
 /**
- * Renders a receipt PNG for a ledger entry, stores it, and returns a
- * safe, unguessable, expiring URL suitable for handing straight to the
- * WhatsApp message broker as a media attachment.
+ * Resolves the display items (name/quantity/unit + priceLabel) for ONE
+ * ledger entry — extracted out of generateReceipt so a combined,
+ * multi-entry receipt (see below) can apply the exact same per-entry
+ * logic to each entry in a batch before merging them into one item list.
  */
-async function generateReceipt({ merchant, ledgerEntry }) {
-  // Fire-and-forget: don't make every single receipt wait on this, but
-  // do make sure it's running so the warning above shows up promptly.
-  verifyFontsRenderable();
-
-  const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
-  await fs.mkdir(storageDir, { recursive: true });
-
-  const logoDataUri = await loadDataUri(merchant.logo_file_path);
-  const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
-
-  // The upstream parsers (regex and AI) only ever extract AT MOST one
-  // structured {name, quantity, unit} item, and never a per-item price
-  // (there's no concept of itemized pricing yet — the whole message is
-  // one total). Two things follow from that:
-  //   1. A lone structured item's price is that whole entry total —
-  //      it's the only line, so it IS the total.
-  //   2. Most real merchant messages have no quantity+unit at all
-  //      ("sold rice 5000" — no "bags"/"cartons"/etc for the regex
-  //      parser to latch onto), so ledgerEntry.items is simply [].
-  //      Previously that meant the items section of the receipt just...
-  //      didn't render anything, which reads as broken even though it
-  //      was "working as designed" — the fix is to fall back to a
-  //      single display line built from the entry's own description
-  //      (already a merchant-readable summary like "Rice") priced at
-  //      the entry total, so there's always a legible items section.
-  // DEBT_SETTLEMENT entries are the one exception: "Payment from John"
-  // isn't an item being sold, so no synthetic line is added for them —
-  // the Total/Paid summary already says everything there is to say.
+function resolveDisplayItemsForEntry(ledgerEntry) {
+  // Both the AI parser and the regex fallback are now responsible for
+  // always populating a clean, receipt-safe item name (see
+  // aiTransactionParser.js's RECORD_TRANSACTION_TOOL and
+  // ledgerParser.js's extractBareItemName) — a receipt must only ever
+  // show items/units/amounts, never the merchant's raw message text or
+  // an AI-written description sentence. So this simply trusts
+  // ledgerEntry.items completely; the only case with legitimately zero
+  // items is DEBT_SETTLEMENT (a payment against an existing debt isn't
+  // an "item" being sold). If items is somehow still empty for any
+  // other entry type — a bug upstream, not the normal case — "Item" is
+  // a safe, generic last resort that is still never raw merchant text.
   const structuredItems = ledgerEntry.items || [];
-  let items;
   if (structuredItems.length > 0) {
-    items = structuredItems.map((it) => ({
+    return structuredItems.map((it) => ({
       ...it,
       priceLabel:
         it.total_kobo != null
@@ -661,39 +619,82 @@ async function generateReceipt({ merchant, ledgerEntry }) {
             ? formatNaira(Number(it.unit_price_kobo) * Number(it.quantity))
             : formatNaira(ledgerEntry.total_kobo),
     }));
-  } else if (ledgerEntry.entry_type !== 'DEBT_SETTLEMENT') {
-    items = [
-      {
-        name: cleanDescriptionForDisplay(ledgerEntry.description),
-        priceLabel: formatNaira(ledgerEntry.total_kobo),
-      },
-    ];
-  } else {
-    items = [];
   }
+  if (ledgerEntry.entry_type !== 'DEBT_SETTLEMENT') {
+    return [{ name: 'Item', priceLabel: formatNaira(ledgerEntry.total_kobo) }];
+  }
+  return [];
+}
 
-  const outstandingKobo = (() => {
-    // Prefer the customer's rolling total (balance_after_kobo, computed
-    // under an explicit row lock in queries.lockCustomerBalance) over
-    // this single entry's own leftover balance_kobo — the rolling
-    // figure is what's correct when a customer has multiple open debts.
-    const rollingKobo = ledgerEntry.balance_after_kobo != null ? Number(ledgerEntry.balance_after_kobo) : null;
-    const shownKobo = rollingKobo != null ? rollingKobo : Number(ledgerEntry.balance_kobo);
-    return shownKobo > 0 ? shownKobo : null;
-  })();
+/**
+ * Renders a receipt PNG and returns a safe, unguessable, expiring URL
+ * suitable for handing straight to the WhatsApp message broker as a
+ * media attachment.
+ *
+ * Pass EITHER `ledgerEntry` (a single entry — the original, still most
+ * common case) OR `ledgerEntries` (an array — used by worker.js's
+ * DONE-triggered receipt-confirmation flow when a merchant logged
+ * several things before asking for one receipt covering all of them).
+ * A multi-entry receipt merges every entry's own display items into one
+ * list and sums their totals/paid/outstanding — it reads as one
+ * consolidated card, not several stapled together.
+ */
+async function generateReceipt({ merchant, ledgerEntry, ledgerEntries }) {
+  // Fire-and-forget: don't make every single receipt wait on this, but
+  // do make sure it's running so the warning above shows up promptly.
+  verifyFontsRenderable();
+
+  const entries = ledgerEntries && ledgerEntries.length > 0 ? ledgerEntries : [ledgerEntry];
+  const isCombined = entries.length > 1;
+  const primaryEntry = entries[0];
+
+  const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
+  await fs.mkdir(storageDir, { recursive: true });
+
+  const logoDataUri = await loadDataUri(merchant.logo_file_path);
+  const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
+
+  const items = entries.flatMap((e) => resolveDisplayItemsForEntry(e));
+
+  const totalKobo = entries.reduce((sum, e) => sum + Number(e.total_kobo), 0);
+  const paidKobo = entries.reduce((sum, e) => sum + Number(e.paid_kobo), 0);
+
+  // For a single entry, prefer the customer's rolling debt balance
+  // (balance_after_kobo, computed under row lock — the correct figure
+  // when they have multiple open debts) over this one entry's own
+  // leftover balance_kobo. A combined receipt has no single rolling
+  // figure to point to, so it sums each entry's own balance instead —
+  // still an accurate "how much is left outstanding from this batch".
+  const outstandingKobo = isCombined
+    ? entries.reduce((sum, e) => sum + Number(e.balance_kobo), 0) || null
+    : (() => {
+        const rollingKobo = primaryEntry.balance_after_kobo != null ? Number(primaryEntry.balance_after_kobo) : null;
+        const shownKobo = rollingKobo != null ? rollingKobo : Number(primaryEntry.balance_kobo);
+        return shownKobo > 0 ? shownKobo : null;
+      })();
+
+  const allSameType = entries.every((e) => e.entry_type === primaryEntry.entry_type);
+  const allSameCounterparty = entries.every((e) => e.counterparty_name === primaryEntry.counterparty_name);
+  const entryTypeLabel = isCombined
+    ? allSameType
+      ? ENTRY_TYPE_LABELS[primaryEntry.entry_type] || 'Transaction'
+      : 'Transaction Summary'
+    : ENTRY_TYPE_LABELS[primaryEntry.entry_type] || 'Transaction';
+
+  const latestCreatedAt = entries.reduce(
+    (latest, e) => (new Date(e.created_at) > latest ? new Date(e.created_at) : latest),
+    new Date(primaryEntry.created_at)
+  );
 
   const svg = buildReceiptSvg({
     businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name,
-    entryTypeLabel: ENTRY_TYPE_LABELS[ledgerEntry.entry_type] || 'Transaction',
-    counterpartyName: ledgerEntry.counterparty_name,
-    reference: ledgerEntry.id.slice(0, 8).toUpperCase(),
-    timestampLabel: new Date(ledgerEntry.created_at).toLocaleString('en-NG', {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    }),
+    entryTypeLabel,
+    counterpartyName: allSameCounterparty ? primaryEntry.counterparty_name : null,
+    reference: primaryEntry.id.slice(0, 8).toUpperCase(),
+    timestampLabel: latestCreatedAt.toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }),
     items,
-    totalLabel: formatNaira(ledgerEntry.total_kobo),
-    paidLabel: formatNaira(ledgerEntry.paid_kobo),
+    totalLabel: formatNaira(totalKobo),
+    paidLabel: formatNaira(paidKobo),
     outstandingLabel: outstandingKobo != null ? formatNaira(outstandingKobo) : null,
     logoDataUri,
     tier: merchant.plan,
@@ -715,20 +716,90 @@ async function generateReceipt({ merchant, ledgerEntry }) {
 
   const receiptRecord = await queries.createReceiptRecord({
     merchantId: merchant.id,
-    ledgerEntryId: ledgerEntry.id,
+    ledgerEntryId: primaryEntry.id, // for a combined receipt, the anchor entry — worker.js separately links ALL batch entries' receipt_id to this record
     filePath,
     publicToken,
     expiresAt,
   });
 
-  await queries.attachReceiptToLedgerEntry(ledgerEntry.id, receiptRecord.id);
+  await queries.attachReceiptToLedgerEntry(primaryEntry.id, receiptRecord.id);
 
   const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const safeUrl = `${baseUrl}/api/v1/receipts/${publicToken}.png`;
 
-  logger.info({ merchantId: merchant.id, receiptId: receiptRecord.id }, 'Receipt generated');
+  logger.info({ merchantId: merchant.id, receiptId: receiptRecord.id, entryCount: entries.length }, 'Receipt generated');
 
   return { url: safeUrl, receiptId: receiptRecord.id, expiresAt };
 }
 
-module.exports = { generateReceipt, formatNaira };
+/**
+ * Renders an invoice card — visually the same system as a receipt (same
+ * card, same fonts, same tiered watermark), but representing money NOT
+ * YET collected rather than a completed transaction. Reusing
+ * buildReceiptSvg needs no changes to it at all: Total = the invoice
+ * amount, Paid = ₦0, Outstanding = the same amount, which reads exactly
+ * as "this much is owed" — precisely what an invoice is.
+ *
+ * This card (and its payment link, generated separately by
+ * paystackService) is handed to the MERCHANT, never sent directly to
+ * the customer — see worker.js's invoice-flow handling. Stored in the
+ * same `receipts` table as ordinary receipts (with a NULL
+ * ledger_entry_id, since an invoice doesn't correspond to one) so it
+ * gets the same public-token URL scheme and expiry sweep for free.
+ */
+async function generateInvoiceCard({ merchant, invoiceNumber, customerName, items, totalKobo }) {
+  verifyFontsRenderable();
+
+  const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
+  await fs.mkdir(storageDir, { recursive: true });
+
+  const logoDataUri = await loadDataUri(merchant.logo_file_path);
+  const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
+
+  const displayItems = items.map((it) => ({
+    name: it.name,
+    quantity: it.quantity,
+    unit: it.unit || '',
+    priceLabel: formatNaira(it.totalKobo),
+  }));
+
+  const svg = buildReceiptSvg({
+    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name,
+    entryTypeLabel: 'Invoice',
+    counterpartyName: customerName,
+    reference: `INV-${String(invoiceNumber).padStart(4, '0')}`,
+    timestampLabel: new Date().toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }),
+    items: displayItems,
+    totalLabel: formatNaira(totalKobo),
+    paidLabel: formatNaira(0),
+    outstandingLabel: formatNaira(totalKobo),
+    logoDataUri,
+    tier: merchant.plan,
+    kikaWordmarkDataUri,
+  });
+
+  const publicToken = crypto.randomBytes(24).toString('hex');
+  const fileName = `${uuidv4()}.png`;
+  const filePath = path.join(storageDir, fileName);
+  await sharp(Buffer.from(svg)).png({ quality: 92 }).toFile(filePath);
+
+  const ttlHours = Number(process.env.RECEIPT_URL_TTL_HOURS || 72);
+  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
+
+  const record = await queries.createReceiptRecord({
+    merchantId: merchant.id,
+    ledgerEntryId: null,
+    filePath,
+    publicToken,
+    expiresAt,
+  });
+
+  const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const safeUrl = `${baseUrl}/api/v1/receipts/${publicToken}.png`;
+
+  logger.info({ merchantId: merchant.id, invoiceNumber }, 'Invoice card generated');
+
+  return { url: safeUrl, receiptId: record.id, expiresAt };
+}
+
+module.exports = { generateReceipt, generateInvoiceCard, formatNaira };

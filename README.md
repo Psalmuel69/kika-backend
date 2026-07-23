@@ -1,13 +1,24 @@
 # Kika Backend
 
 Zero-signup, multimodal WhatsApp ledger book and automated receipt engine
-for informal merchants. A merchant never "signs up" — their WhatsApp
-number *is* their account, created implicitly on first contact. Kika
-understands typed text, voice notes, and photos, replies in the
-merchant's own language (English, Nigerian Pidgin, Yoruba, Igbo, or
-Hausa), and falls back to an AI safety net whenever its fast regex
-parser doesn't recognize the phrasing — so no message is ever silently
-lost.
+for informal merchants — the operating system for informal commerce. A
+merchant never "signs up": their WhatsApp number *is* their account,
+created implicitly on first contact. Kika understands typed text, voice
+notes, and photos, and replies in the merchant's own language (English,
+Nigerian Pidgin, Yoruba, Igbo, or Hausa).
+
+Under the hood, natural-language understanding and accounting are
+strictly separated. A fast deterministic regex parser is the **front
+door** and, guarded by a confidence gate, handles the ~80–90% of
+messages that follow common logging shapes with zero AI latency or
+cost. The ~10–20% the gate flags as ambiguous escalate honestly to
+**Gemini**, whose only job is to *understand* — it proposes structured
+facts (validated against a strict Zod schema) and conversational
+replies, but never writes to the database and never does accounting the
+backend trusts. Every candidate entry, regex- or AI-produced, passes a
+deterministic **validation & accounting engine** before anything is
+recorded — so Kika stays natural to talk to while the books stay
+deterministic and trustworthy, and no message is ever silently lost.
 
 ## Architecture
 
@@ -28,8 +39,13 @@ lost.
                           └─────────────┘      │  Worker process      │
                                                 │  - media download/   │
                                                 │    transcribe/vision │
-                                                │  - regex parse       │
-                                                │  - AI fallback parse │
+                                                │  - regex front door  │
+                                                │    + confidence gate │
+                                                │  - Gemini escalation │
+                                                │    (extract-only,    │
+                                                │     Zod-validated)   │
+                                                │  - accounting engine │
+                                                │    (entryValidator)  │
                                                 │  - render receipt    │
                                                 │  - Paystack call     │
                                                 │  - WhatsApp send     │
@@ -45,6 +61,66 @@ process. This is what keeps the HTTP path fast enough to absorb
 concurrent bursts without connection pool exhaustion or event-loop
 blocking.
 
+### Message-understanding pipeline (inside the worker)
+
+The layered flow every free-text message walks through. The design goal:
+**80–90% of messages handled deterministically without AI; 10–20%
+escalated to Gemini** — and *nothing* written to Postgres without
+passing the deterministic accounting engine.
+
+```
+ inbound free text / voice transcript / photo caption
+        │
+        ▼
+ ┌───────────────────────────────┐
+ │ Stage 0  Deterministic layer  │  commands (BALANCE, DONE, ADD STOCK…),
+ │          (always regex)       │  invoice flow, receipt yes/no, pending
+ └──────────────┬────────────────┘  debt-name reply, greetings
+                │ not handled
+                ▼
+ ┌───────────────────────────────┐
+ │ Stage 1  Reply-context match  │  "he paid" replying to a debt receipt
+ └──────────────┬────────────────┘  → resolved deterministically
+                │ no match
+                ▼
+ ┌───────────────────────────────┐  confidence ≥ 0.80
+ │ Stage 2  REGEX FRONT DOOR     │ ───────────────────────────────┐
+ │  parseLedgerMessageScored()   │  (~80–90% of traffic:          │
+ │  deterministic confidence     │   no AI call at all)           │
+ │  score from inspectable       │                                │
+ │  signals — see §11            │                                │
+ └──────────────┬────────────────┘                                │
+                │ below threshold, no parse, or image             │
+                ▼                                                 │
+ ┌───────────────────────────────┐                                │
+ │ Stage 3  GEMINI ESCALATION    │  extraction ONLY: proposes     │
+ │  parseWithAI()                │  intent + structured facts, or │
+ │  · full business + reply ctx  │  a conversational reply.       │
+ │  · Zod schema validation      │  Never touches the DB.         │
+ │  · model confidence < 0.65 →  │                                │
+ │    ask ONE clarifying question│                                │
+ └──────┬─────────────┬──────────┘                                │
+        │ extracted   │ provider outage                           │
+        │             ▼                                           │
+        │  ┌────────────────────────┐                             │
+        │  │ Stage 4  Degraded mode │  reuse Stage-2 parse iff    │
+        │  │ (regex ≥ 0.45 floor)   │  it cleared the lower floor │
+        │  └───────────┬────────────┘                             │
+        ▼              ▼                                          ▼
+ ┌────────────────────────────────────────────────────────────────────┐
+ │ Stage 5  VALIDATION & ACCOUNTING ENGINE  (entryValidator.js)       │
+ │  every candidate, regex or AI: recompute paid/balance/total from   │
+ │  first principles, enforce invariants, reclassify label↔money      │
+ │  mismatches, hard-reject nonsense → ask merchant instead of guess  │
+ └──────────────────────────────┬─────────────────────────────────────┘
+                                ▼
+ ┌────────────────────────────────────────────────────────────────────┐
+ │ Stage 6  DEBT-NAME CHECK → COMMIT (ledgerService, Postgres txn)    │
+ │  unnamed DEBT: ask "who owes this?" once (reply name / SKIP)       │
+ │  before writing — settlements must resolve to someone later        │
+ └────────────────────────────────────────────────────────────────────┘
+```
+
 ## Core flows
 
 ### 1. Recording a transaction
@@ -52,13 +128,20 @@ blocking.
    `Mama Tunde buy 3 carton of indomie, she pay 15k remain 12k`.
 2. Webhook verifies Meta's `X-Hub-Signature-256`, finds/creates the
    merchant row, enqueues the raw message, and returns `200` immediately.
-3. Worker parses the message (`ledgerParser.js`), which extracts:
+3. Worker runs the message through the layered pipeline (see the
+   *Message-understanding pipeline* diagram above). This one is a
+   textbook front-door shape, so the regex parser handles it locally
+   (no AI call), extracting:
    - the counterparty (`Mama Tunde`)
    - itemized quantity (`Indomie x3 carton`)
    - a **Total / Paid / Balance** split from "k"-shorthand amounts —
      `pay 15k remain 12k` resolves to Total ₦27,000 / Paid ₦15,000 /
      Balance ₦12,000
-4. The entry is written inside a Postgres transaction, a themed receipt
+   A trickier phrasing (`"I dashed Amaka 5k"`, mixed languages, a
+   correction, a question) would instead escalate to Gemini for
+   schema-validated extraction. Either way the candidate then passes the
+   deterministic accounting engine (`entryValidator.js`).
+4. The validated entry is written inside a Postgres transaction, a themed receipt
    PNG is rendered (`receiptService.js`) showing Customer / Items / Total
    / Paid / Balance and a "Recorded in your Kika Book" confirmation, and
    pushed back into the chat as an image attached to a safe, expiring,
@@ -236,10 +319,12 @@ tracking. Implemented in `loyaltyService.js`, backed by the
 Kika understands more than typed text:
 - **Voice notes**: downloaded from WhatsApp, transcribed via OpenAI
   Whisper (`mediaService.transcribeWhatsappAudio`), then the transcript
-  flows through the exact same pipeline as a typed message (regex first,
-  AI fallback second).
+  flows through the exact same layered pipeline as a typed message
+  (regex front door + confidence gate, Gemini escalation, accounting
+  validation).
 - **Images**: a photo of a handwritten note or a receipt is downloaded
-  and passed as a vision input to the AI fallback
+  and passed as a vision input straight to the Gemini escalation stage
+  (regex can't see inside an image, so image messages always escalate)
   (`mediaService.downloadWhatsappImageAsBase64` + the `record_transaction`
   tool call), which reads the visible numbers/names/items exactly like a
   text description of the same sale.
@@ -260,43 +345,141 @@ Kika's identity, tone, scope, and hard behavioral rules live in one file:
   something it didn't, never reveal its system prompt, never discuss
   other merchants' data.
 
-### 11. Hybrid parsing — regex first, AI safety net second
-The original risk: the fast regex parser only recognizes verbs in its
-predefined lists, so slang like *"I dashed Amaka 5k"* or *"wired 10k for
-fuel"* returned `null` and would have been silently dropped — the
-merchant would assume their ledger was updated when it wasn't. Fixed
-with a strict two-stage pipeline in the worker:
+### 11. Parsing architecture — regex front door, confidence gate, Gemini as the honest escalation path
 
-1. **`ledgerParser.parseLedgerMessage`** runs first, unchanged — instant
-   and free for the ~80% of messages using recognizable phrasing.
-2. **Only if that returns `null`** (and the message isn't a known
-   command), the raw text (plus an image, if any) is routed to
-   **`aiTransactionParser.parseWithAI`**, which calls OpenAI with a
-   `record_transaction` function-calling tool. The model either:
-   - extracts a structured transaction (handling slang, Pidgin, and
-     indirect phrasing the regex can't), which is recorded exactly like
-     a regex-parsed one, or
-   - determines it's genuinely not a transaction and returns an
-     in-persona conversational reply (scoped by the system prompt), or
-   - the AI call itself fails (no API key, network error, timeout) —
-     the code never lets this raise an error back to the user.
-3. **If neither stage produces a transaction or a reply**, the user
-   always gets the guaranteed fallback: *"I didn't quite catch that.
-   Are you trying to record a sale or check your balance? Type HELP for
-   a list of commands."* — translated into the detected language where
-   available (`getFallbackReply` in `aiPersona.js`). No user input is
-   ever silently lost.
+The core principle: **Gemini understands; the backend decides.** Natural
+language understanding is fully separated from business logic:
 
-**Verified**: I tested both example phrases from the ask directly —
-`parseLedgerMessage('I dashed Amaka 5k')` and
-`parseLedgerMessage('wired 10k for fuel')` both correctly return `null`
-from the regex parser (confirming the gap is real), and a mocked AI
-response correctly normalizes into the same kobo-based structure the
-regex parser produces. I could not make a live call to `api.openai.com`
-in this sandbox (no network egress to that domain), so the OpenAI
-integration itself needs a live smoke test in your environment — but the
-surrounding hybrid-routing logic, the "no API key configured" safe
-fallback, and the normalization/kobo-conversion logic are all verified.
+| Layer | Module | Responsibility |
+|---|---|---|
+| Front door | `ledgerParser.js` | Deterministic regex extraction of the common logging shapes, plus a **confidence gate** that decides whether to trust the parse or escalate |
+| NLU escalation | `aiTransactionParser.js` | Gemini reads the escalated ~10–20% (with business + reply context and short-term memory) and **proposes** structured facts (intent + fields) or a conversational reply. It never writes to the database and never performs accounting the backend trusts |
+| Schema contract | `extractionSchema.js` | A strict **Zod schema** validates every Gemini tool-call payload before anything downstream sees it — malformed model output is treated as "the model said nothing usable" |
+| Accounting engine | `entryValidator.js` | The single deterministic authority on the numbers: recomputes paid/balance/total per entry type, enforces invariants, reclassifies label↔money mismatches, hard-rejects nonsense. **Every** candidate entry — regex or AI — passes through it before any write |
+| Business logic | `ledgerService.js` + `queries.js` | Ledger writes, rolling debt balances, FIFO settlement, inventory, loyalty, receipts — all inside Postgres transactions, exactly as before |
+
+#### The confidence gate (Stage 2)
+
+`parseLedgerMessageScored()` scores every regex parse 0–1 from plain,
+inspectable heuristics — the same message always gets the same score,
+and the fired signals are written to the audit log on every escalation
+(`message.escalated_to_ai`), so *"why did this go to the AI?"* is always
+answerable. Signals that lower confidence and trigger escalation:
+
+- conflicting intent verbs (`sold … and bought …` — possibly two transactions)
+- question marks (asking *about* a sale, not logging one) and
+  negations/corrections (`didn't`, `cancel`, `wrong`, `mistake`)
+- Pidgin/Yoruba/Igbo/Hausa markers the English word lists don't cover
+  (`dash`, `don`, `abeg`, `kudi`, `ego`, …) — the parse may be *wrong*,
+  not just incomplete, so Gemini (which reads these natively) takes over
+- multiple untagged money amounts (the parser would be guessing which is
+  the total), and long rambling messages
+- image messages always escalate — the transaction may be *in* the image
+
+Two env-tunable thresholds (see `.env.example`):
+`REGEX_CONFIDENCE_THRESHOLD` (default **0.80**) — at/above, commit
+locally with no AI call; `REGEX_DEGRADED_FLOOR` (default **0.45**) — if
+the Gemini escalation itself fails (outage/quota), a below-threshold
+parse that cleared this floor is still usable as a degraded emergency
+answer, so an AI outage degrades Kika to "less smart about tricky
+phrasing" instead of unusable. Below the floor, the merchant is asked to
+rephrase — too ambiguous to write even in an outage.
+
+#### Gemini's contract (Stage 3)
+
+Every escalated message goes to `parseWithAI()` with full business +
+reply context. Three honest outcomes:
+
+1. **Extraction** — a `record_transaction` tool call, validated against
+   the Zod schema, carrying the model's own `confidence`. Below
+   `AI_MIN_CONFIDENCE_THRESHOLD` (default **0.65**), Kika asks the
+   merchant ONE clarifying question instead of recording anything — a
+   guessed amount never reaches the ledger. Schema-invalid payloads get
+   the same ask-don't-guess treatment.
+2. **Conversational reply** — a clarifying question for an incomplete
+   transaction, an answer about the business, or an in-persona decline;
+   forwarded verbatim, with the exchange stored in short-term memory so
+   the next message can complete the transaction multi-turn.
+3. **Provider failure** — falls through to degraded mode (Stage 4).
+
+The extract → validate → decide machinery is exposed generically as
+`aiTransactionParser.extractStructured({ tool, schema, … })`, so future
+intents (appointment booking, stock queries, price checks…) plug in
+their own tool + Zod schema and reuse the same pipeline — including for
+the Premium logbook-scan batch path, whose every extracted line is
+schema-validated and individually passed through the accounting engine
+(misread lines are skipped and reported, never "best-effort" written).
+
+#### Who classifies intent? (reviewed, decided: both — per path)
+
+`classifyEntryType()` (the keyword classifier) remains authoritative on
+the regex path: for the short, predictable shapes the front door
+handles, it is exactly as accurate as an LLM and free. For escalated
+messages, **Gemini classifies intent itself** (the `entryType` field of
+its extraction) — deliberately, because a message reaches Gemini
+precisely *because* the keyword classifier couldn't be trusted on it;
+re-running the same word lists over `"I dashed Amaka 5k"` would add
+nothing. The accounting engine then cross-checks the chosen label
+against the money facts either way (a `CREDIT` with an outstanding
+balance is deterministically reclassified to `DEBT`, and vice-versa), so
+a mislabeled extraction from *either* path still can't corrupt the ledger.
+
+#### The accounting engine (Stage 5)
+
+`entryValidator.validateAndFinalizeEntry()` treats every extraction —
+regex or AI — as a *proposal* and recomputes the money from first
+principles:
+
+- when a balance was stated (`"she pay 15k remain 12k"`), paid + balance
+  are the merchant's stated facts and the real total is their sum — a
+  model that misreports `total=15000, paid=15000, balance=12000` is
+  repaired to total ₦27,000, never to "remain ₦0"
+- when no balance was stated, total and paid are the facts and balance
+  is recomputed as the difference
+- expenses (`DEBIT`) are normalized to fully-paid money-out; settlements
+  to `total = paid, balance = 0` (how much of the customer's rolling
+  balance the payment clears is decided later, inside the DB
+  transaction, by FIFO settlement — never by an extractor)
+- hard rejects (merchant is asked to clarify, nothing is written):
+  zero/negative totals, amounts above a ₦500m sanity ceiling (a phone
+  number misread as money), paid exceeding the sale price, settlements
+  with no counterparty
+
+Every applied repair is logged (`Entry validator applied deterministic
+repairs`) and every rejection audited (`ledger_entry.rejected`), so the
+books stay both correct *and* explainable.
+
+#### Unnamed debts ask for the customer (Stage 6, decided: yes)
+
+A `DEBT` is the one entry type where a missing name genuinely hurts
+later — `"Chidi paid"` has to resolve back to the same person, and an
+anonymous `Cust-XXXX` code is honest but nearly impossible to reconcile
+against a real face weeks later. So before writing an unnamed debt, Kika
+asks once: *"Who owes this? Reply with the customer's name, or reply
+SKIP to save it without a name."* The fully-validated entry is held in
+Redis (15 min TTL) and the reply is resolved deterministically — a
+name-shaped reply attaches the name; `SKIP` records it anonymously; any
+*other* message (a command, a new transaction) records the held debt
+anonymously **first** and then processes normally, so the debt is never
+lost. `CREDIT`/`DEBIT` never trigger this — there's nothing to reconcile
+later, so a name there is optional noise.
+
+#### Follow-up under consideration: batch-at-DONE
+
+Entries are currently parsed, validated, and committed **per message**
+(real-time), with the receipt decision already batched at `DONE`. An
+alternative is to also batch the *AI escalations* at `DONE` — buffer
+low-confidence messages and resolve them in one Gemini call when the
+merchant closes the session. That would cut escalation cost by roughly
+the average messages-per-session, but trades away real-time correction:
+a misread amount would surface minutes later (after the merchant's
+mental context is gone) instead of immediately, and reply-context
+resolution ("he paid" on a receipt) depends on entries existing when the
+reply arrives. Decision deferred until production escalation-rate data
+exists (the audit log's `message.escalated_to_ai` events measure exactly
+this); with the gate keeping escalations at 10–20% of traffic, per-message
+Gemini calls on a flash-tier model are expected to be cheap enough that
+real-time correction wins. Revisit if measured escalation cost says otherwise.
 
 ### 12. Access control — blacklist, whitelist, and human handoff
 - **Blacklist**: a number in `access_control_list` (list_type=`BLACKLIST`)
@@ -387,7 +570,7 @@ routed back through onboarding.
   `"2 mangoes"` never get misread as `500` or `2,000,000`.
 - **Greetings** ("Hi", "Hey", "Hello", "Howfar", "Wassup", "Hi Kika"...)
   are matched deterministically (`GREETING` command, zero AI cost) and
-  get a fixed in-persona intro — never routed through the AI fallback.
+  get a fixed in-persona intro — never routed through the AI at all.
 
 ### 17. AI provider flexibility — Gemini, OpenRouter, or OpenAI
 `openaiService.js` resolves providers in order: **`GEMINI_API_KEY`** (if
@@ -452,6 +635,16 @@ job — caught and fixed a real regex bug along the way (see below).
 
 ## Safety & reliability properties
 
+- **AI trust boundary**: Gemini can only *propose* — every tool-call
+  payload it returns is validated against a strict Zod schema
+  (`extractionSchema.js`), every proposed entry passes the deterministic
+  accounting engine (`entryValidator.js`) that recomputes all money math
+  and enforces business invariants, and only the backend ever writes to
+  Postgres. A hallucinated field, an impossible amount (₦500m sanity
+  ceiling), or inconsistent arithmetic is repaired deterministically or
+  bounced back to the merchant as a clarifying question — never recorded
+  as-is. Low-confidence extractions (below `AI_MIN_CONFIDENCE_THRESHOLD`)
+  always ask instead of guessing.
 - **SQL injection**: every query in the codebase is parameterized
   (`$1, $2, ...`) via `pg`; `src/db/queries.js` is the single place SQL
   text is written, so the entire attack surface is auditable in one file.
@@ -571,9 +764,11 @@ See `.env.example` for the full list. Key ones:
 | `PAYSTACK_SECRET_KEY` | Used both to call Paystack and verify its webhooks |
 | `SUBSCRIPTION_DURATION_DAYS` | Defaults to `30`, applies to every tier |
 | `LOYALTY_MILESTONE_INTERVAL` | Defaults to `5` — ping every Nth purchase |
-| `OPENAI_API_KEY` | Required for the hybrid AI fallback parser and multimodal (image/audio) support. Without it, unparseable messages get the fixed fallback reply instead of crashing. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | Powers the AI escalation stage and multimodal (image/audio) support — Gemini is the current deployment target, OpenAI the alternative (see §17). With neither set, escalated messages get the degraded regex parse or the fixed fallback reply instead of crashing. |
 | `OPENAI_BASE_URL` | Unset = OpenAI direct. Set to `https://openrouter.ai/api/v1` to route through OpenRouter instead (note: Whisper transcription isn't proxied by OpenRouter — see `.env.example`). |
-| `AI_MIN_CONFIDENCE_THRESHOLD` | Defaults to `0.65` — below this, an AI-extracted transaction is treated as unclear rather than recorded |
+| `AI_MIN_CONFIDENCE_THRESHOLD` | Defaults to `0.65` — below this, an AI-extracted transaction triggers one clarifying question to the merchant instead of being recorded |
+| `REGEX_CONFIDENCE_THRESHOLD` | Defaults to `0.80` — at/above this, a regex front-door parse is committed locally with no AI call; below it, the message escalates to Gemini |
+| `REGEX_DEGRADED_FLOOR` | Defaults to `0.45` — if the Gemini escalation itself fails, a below-threshold regex parse that cleared this floor is still usable as a degraded emergency answer |
 | `SKIP_BOT_LABELS` | Comma-separated conversation labels that pause the bot for human handoff |
 | `WHITELIST_MODE_ENABLED` | `true` restricts the bot to explicitly whitelisted numbers only |
 | `ADMIN_API_KEY` | Shared secret for the admin endpoints (`X-Admin-Key` header) |
@@ -606,7 +801,7 @@ redeploy.
 
 | Command | Behavior |
 |---|---|
-| *(free text, voice note, or photo)* | Parsed as a ledger entry — regex first, AI fallback second |
+| *(free text, voice note, or photo)* | Parsed as a ledger entry — regex front door with confidence gate first (~80–90%), Gemini escalation for the ambiguous rest, deterministic accounting validation always |
 | *(greeting: "Hi", "Hello", "Howfar"...)* | Deterministic in-persona intro, no AI call |
 | `BALANCE` | Live in/out/net + outstanding debt snapshot |
 | `SUNSET` | Today's recap, on demand |
@@ -631,6 +826,29 @@ merchant creation, pidgin-English parsing, phone number extraction, FIFO
 debt settlement, tier upgrades, loyalty milestones, the Monthly Digest +
 full report, and the `subscription_tiers` foreign keys were all verified
 in earlier passes (see git history / prior notes). This pass additionally verified:
+- **This refactor's pass — the confidence gate + validator pipeline,
+  verified by direct execution** (no live DB/AI needed for these units):
+  the five canonical merchant phrasings (`sold rice 5000`, the full
+  Mama-Tunde pay/remain shape, `bought fuel 3000`, `Chidi owes 2000`,
+  `John pay off his debt 5k`) all score ≥ 0.95 and stay on the local
+  regex path with correct kobo math; Pidgin (`I dashed Amaka 5k`,
+  `e don pay finish`), questions, corrections, and multi-transaction
+  messages all score below the 0.80 threshold and escalate; the
+  previously-silent money bug where a tagged balance without a "pay" tag
+  (`sold rice to Amaka 50k, balance 20k`) recorded as fully paid was
+  caught by these tests and fixed (now Total ₦50k / Paid ₦30k /
+  Balance ₦20k, reclassified to DEBT by the validator); the validator
+  repairs a model that misreports `total=15000, paid=15000,
+  balance=12000` to Total ₦27,000 (trusting stated paid+balance) and
+  hard-rejects zero totals, nameless settlements, and out-of-range
+  amounts; and the Zod schema accepts a well-formed extraction
+  (normalizing `08012345678` → `+2348012345678`) while rejecting bad
+  enum values, empty descriptions, negative and non-numeric amounts
+  with precise per-field issues. The Gemini escalation itself needs a
+  live smoke test in your environment (no egress to the provider from
+  this sandbox), but everything around it — routing, gating, schema
+  rejection handling, degraded mode selection, validator math — is
+  exercised for real.
 - The hybrid parser gap is real: both `"I dashed Amaka 5k"` and `"wired
   10k for fuel"` confirmed to return `null` from the regex parser, and a
   mocked AI response correctly normalizes into the same kobo-based

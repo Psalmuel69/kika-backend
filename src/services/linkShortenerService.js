@@ -17,7 +17,7 @@ function generateShortCode(length = 8) {
 /**
  * Creates a payment_links record for a gateway checkout URL and returns
  * the compact short_url that actually gets texted to the customer, e.g.
- * https://api.kika-book.example.com/l/aB3xQ9kM instead of Paystack's
+ * https://api.kikahq.com/l/aB3xQ9kM instead of Paystack's
  * long authorization_url. Retries on the astronomically unlikely
  * short_code collision.
  */

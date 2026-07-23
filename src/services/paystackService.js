@@ -67,20 +67,33 @@ async function callPaystack({ method, path, payload, merchantId, paymentLinkId, 
  * Price and currency are read live from subscription_tiers — never
  * hardcoded — so a price change in that table takes effect immediately
  * with no code deploy.
+ *
+ * `billingInterval` selects monthly (tier.price) or yearly
+ * (tier.price_yearly — 10x the monthly rate, i.e. 2 months free, to
+ * reward the longer commitment) billing. The chosen interval is stamped
+ * on both the Paystack metadata and the local payment_transactions row,
+ * so the webhook handler (paystack.routes.js) knows whether to extend
+ * the subscription by 30 or 365 days once payment is verified.
  */
-async function createUpgradeInvoice(merchant, tierName) {
+async function createUpgradeInvoice(merchant, tierName, billingInterval = 'monthly') {
+  if (billingInterval !== 'monthly' && billingInterval !== 'yearly') {
+    throw new Error(`Invalid billingInterval: ${billingInterval}`);
+  }
+
   const tier = await queries.getSubscriptionTierByName(tierName);
   if (!tier) {
     throw new Error(`Unknown or inactive subscription tier: ${tierName}`);
   }
 
-  // subscription_tiers.price is stored in major currency units (e.g.
-  // 5000.00 NGN); Paystack's `amount` field wants the minor unit (kobo
-  // for NGN, cents for USD) — both are x100, so this conversion holds
-  // for any 2-decimal ISO currency this table might hold in future.
-  const amountMinorUnits = Math.round(Number(tier.price) * 100);
-  const reference = `kika_${tier.name.toLowerCase()}_${uuidv4()}`;
-  const syntheticEmail = `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kika-book.invoice`;
+  // subscription_tiers.price / price_yearly are stored in major currency
+  // units (e.g. 5000.00 NGN); Paystack's `amount` field wants the minor
+  // unit (kobo for NGN, cents for USD) — both are x100, so this
+  // conversion holds for any 2-decimal ISO currency this table might
+  // hold in future.
+  const priceMajorUnits = billingInterval === 'yearly' ? tier.price_yearly : tier.price;
+  const amountMinorUnits = Math.round(Number(priceMajorUnits) * 100);
+  const reference = `kika_${tier.name.toLowerCase()}_${billingInterval}_${uuidv4()}`;
+  const syntheticEmail = `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kikahq.invoice`;
 
   const payload = {
     email: syntheticEmail,
@@ -93,6 +106,7 @@ async function createUpgradeInvoice(merchant, tierName) {
       whatsapp_number: merchant.whatsapp_number,
       subscription_tier_id: tier.id,
       plan_tier: tier.name,
+      billing_interval: billingInterval,
     },
   };
 
@@ -116,11 +130,12 @@ async function createUpgradeInvoice(merchant, tierName) {
     merchantId: merchant.id,
     reference,
     subscriptionTierId: tier.id,
+    billingInterval,
     amountKobo: amountMinorUnits,
     authorizationUrl,
   });
 
-  return { authorizationUrl, reference, amountKobo: amountMinorUnits, tier };
+  return { authorizationUrl, reference, amountKobo: amountMinorUnits, billingInterval, tier };
 }
 
 /**
@@ -133,8 +148,8 @@ async function createCustomerInvoice(merchant, { amountKobo, description, custom
   const reference = `kika_invoice_${uuidv4()}`;
   const currency = merchant.default_currency || 'NGN';
   const syntheticEmail = customerPhone
-    ? `${customerPhone.replace(/[^\d]/g, '')}@wa.kika-book.invoice`
-    : `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kika-book.invoice`;
+    ? `${customerPhone.replace(/[^\d]/g, '')}@wa.kikahq.invoice`
+    : `${merchant.whatsapp_number.replace(/[^\d]/g, '')}@wa.kikahq.invoice`;
 
   const payload = {
     email: syntheticEmail,

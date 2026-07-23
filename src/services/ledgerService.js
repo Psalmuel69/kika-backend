@@ -1,10 +1,24 @@
 'use strict';
 
+const crypto = require('crypto');
 const { pool } = require('../config/db');
 const queries = require('../db/queries');
-const { generateReceipt, formatNaira } = require('./receiptService');
+const { formatNaira } = require('./receiptService');
 const loyaltyService = require('./loyaltyService');
 const logger = require('../utils/logger');
+
+/**
+ * A DEBT genuinely needs SOME identifier to be tracked and later settled
+ * against — "who owes this?" has to resolve to the same value next time
+ * that customer pays. A CREDIT (fully paid, nothing to track) doesn't
+ * need one at all. Rather than fabricating a generic "Walk-in customer"
+ * label (indistinguishable from every other unnamed walk-in, and wrongly
+ * implying a name was given), an unnamed debt gets a short, unique code
+ * instead — distinguishable, and honest about being a placeholder.
+ */
+function generateAnonymousCustomerCode() {
+  return `Cust-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+}
 
 /**
  * Records a parsed ledger entry (or applies it as a debt settlement) and
@@ -20,6 +34,12 @@ const logger = require('../utils/logger');
  * customer within seconds of each other from producing a lost update.
  */
 async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, whatsappMessageId, replyToWhatsappMessageId }) {
+  // See generateAnonymousCustomerCode's comment above for why this only
+  // applies to DEBT (never CREDIT/DEBIT, which have nothing to track).
+  if (parsedEntry.entryType === 'DEBT' && !parsedEntry.counterpartyName) {
+    parsedEntry = { ...parsedEntry, counterpartyName: generateAnonymousCustomerCode() };
+  }
+
   if (parsedEntry.entryType === 'DEBT_SETTLEMENT' && parsedEntry.counterpartyName) {
     return recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsappMessageId, replyToWhatsappMessageId });
   }
@@ -63,7 +83,14 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, 
     // above and released only at COMMIT.
   });
 
-  const receipt = await generateReceipt({ merchant, ledgerEntry });
+  // Receipts are no longer generated here automatically — see worker.js's
+  // DONE-triggered confirmation flow. This entry is recorded with
+  // receipt_decision_pending=true (the column's own default), and stays
+  // that way until the merchant explicitly says yes/no to a receipt for
+  // it (possibly bundled with other entries logged in the same session).
+  // Generating eagerly here would waste a render+storage write for every
+  // entry someone declines a receipt for, which is now expected to be
+  // common — the whole point of asking first.
 
   // Smart Customer Loyalty Flags — a CREDIT or DEBT entry represents an
   // actual purchase by this counterparty, so it counts toward their
@@ -107,7 +134,6 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, 
 
   return {
     ledgerEntry,
-    receipt,
     outstandingDebtKobo: ledgerEntry.balance_after_kobo != null ? Number(ledgerEntry.balance_after_kobo) : parsedEntry.balanceKobo,
     loyaltyMilestoneText,
     lowStockAlerts,
@@ -153,11 +179,10 @@ async function recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsap
     return { settlementResult, ledgerEntry };
   });
 
-  const receipt = await generateReceipt({ merchant, ledgerEntry });
+  // Same deferred-receipt policy as the main recording path above.
 
   return {
     ledgerEntry,
-    receipt,
     // The customer's remaining total after this payment — not
     // necessarily 0, if the payment only partially cleared what they owed.
     outstandingDebtKobo: settlementResult.rollingBalanceKobo,

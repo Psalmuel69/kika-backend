@@ -71,11 +71,13 @@ async function handleSubscriptionPayment(reference) {
 
   await queries.markPaymentTransactionStatus(reference, 'SUCCESS');
 
-  const merchant = await queries.extendMerchantSubscription(
-    existing.merchant_id,
-    existing.tier_name,
-    paystackService.SUBSCRIPTION_DURATION_DAYS
-  );
+  // A yearly purchase extends the subscription by a full year, not the
+  // usual monthly duration — existing.billing_interval was stamped at
+  // checkout time (see paystackService.createUpgradeInvoice) precisely
+  // so this webhook, running independently and later, still knows which
+  // one the merchant actually paid for.
+  const durationDays = existing.billing_interval === 'yearly' ? 365 : paystackService.SUBSCRIPTION_DURATION_DAYS;
+  const merchant = await queries.extendMerchantSubscription(existing.merchant_id, existing.tier_name, durationDays);
 
   await webhookAlertQueue.add(
     'onboarding-victory',

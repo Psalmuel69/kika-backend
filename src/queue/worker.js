@@ -7,6 +7,7 @@ const logger = require('../utils/logger');
 const queries = require('../db/queries');
 const ledgerParser = require('../services/ledgerParser');
 const ledgerService = require('../services/ledgerService');
+const receiptService = require('../services/receiptService');
 const whatsappService = require('../services/whatsappService');
 const paystackService = require('../services/paystackService');
 const brokerAlertService = require('../services/brokerAlertService');
@@ -14,6 +15,7 @@ const monthlyDigestService = require('../services/monthlyDigestService');
 const fullReportService = require('../services/fullReportService');
 const mediaService = require('../services/mediaService');
 const aiTransactionParser = require('../services/aiTransactionParser');
+const entryValidator = require('../services/entryValidator');
 const categorizationService = require('../services/categorizationService');
 const conversationMemory = require('../services/conversationMemory');
 const engagementService = require('../services/engagementService');
@@ -79,41 +81,256 @@ function formatNairaShort(kobo) {
   return `\u20a6${(Number(kobo) / 100).toLocaleString('en-NG')}`;
 }
 
+const ENTRY_ACTION_WORD = { CREDIT: 'sale', DEBT: 'credit sale', DEBIT: 'expense', DEBT_SETTLEMENT: 'payment' };
+
 /**
- * Warm, specific confirmation copy instead of a robotic "Transaction
- * recorded." — names the actual customer and actual figures, since
- * that's what makes it feel like Kika actually understood what happened,
- * not just logged a row.
+ * Describes the item(s) for one ledger entry the way a person would say
+ * it out loud — "2 bags of rice", "3 cartons of indomie", or just
+ * "Fuel" when there's no quantity/unit at all. Entries always have a
+ * clean item name by this point (see ledgerParser.js /
+ * aiTransactionParser.js) except DEBT_SETTLEMENT, which has none.
  */
-function buildTransactionConfirmationCaption(parsed, outstandingDebtKobo) {
-  const amountLabel = formatNairaShort(parsed.totalKobo);
-
-  if (parsed.entryType === 'DEBIT') {
-    return `Got it! I've logged your ${amountLabel} expense for ${parsed.description}.`;
-  }
-
-  if (parsed.entryType === 'DEBT_SETTLEMENT') {
-    const who = parsed.counterpartyName || 'Your customer';
-    return Number(outstandingDebtKobo) > 0
-      ? `Nice one! ${who} just paid ${formatNairaShort(parsed.paidKobo)}. Outstanding balance is now ${formatNairaShort(outstandingDebtKobo)}.`
-      : `Nice one! ${who} just paid ${formatNairaShort(parsed.paidKobo)} \u2014 fully settled, no balance left. \ud83c\udf89`;
-  }
-
-  const who = parsed.counterpartyName ? ` from ${parsed.counterpartyName}` : '';
-  let caption = `Great! I've recorded the sale of ${amountLabel}${who}.`;
-  if (Number(outstandingDebtKobo) > 0) {
-    const possessive = parsed.counterpartyName ? `${parsed.counterpartyName}'s` : 'Their';
-    caption += ` ${possessive} outstanding balance is now ${formatNairaShort(outstandingDebtKobo)}.`;
-  }
-  return caption;
+function describeEntryItems(entry) {
+  const items = entry.items || [];
+  if (items.length === 0) return null;
+  return items
+    .map((it) => (it.quantity != null && it.unit ? `${it.quantity} ${it.unit} of ${it.name.toLowerCase()}` : it.name))
+    .join(', ');
 }
 
-async function handleTierPurchase(merchant, whatsappNumber, tierName) {
-  const invoice = await paystackService.createUpgradeInvoice(merchant, tierName);
+/**
+ * Warm, specific confirmation copy for what was just logged — named the
+ * actual customer/items/figures, since that's what makes it feel like
+ * Kika actually understood what happened, not just logged a row. Sent
+ * ONCE, covering everything logged since the last DONE — see
+ * askReceiptDecision, which calls this before asking about a receipt.
+ */
+function buildBatchConfirmationText(entries) {
+  if (entries.length > 1) {
+    const totalKobo = entries.reduce((sum, e) => sum + Number(e.total_kobo), 0);
+    return `Great! I've recorded your ${entries.length} entries (${formatNairaShort(totalKobo)} total) to your Kika book.`;
+  }
+
+  const entry = entries[0];
+  const action = ENTRY_ACTION_WORD[entry.entry_type] || 'transaction';
+  const itemPhrase = describeEntryItems(entry);
+
+  if (entry.entry_type === 'DEBT_SETTLEMENT') {
+    const who = entry.counterparty_name || 'Your customer';
+    const balanceKobo = entry.balance_after_kobo != null ? Number(entry.balance_after_kobo) : 0;
+    return balanceKobo > 0
+      ? `Great! I've recorded the payment of ${formatNairaShort(entry.paid_kobo)} from ${who} to your Kika book. Outstanding balance is now ${formatNairaShort(balanceKobo)}.`
+      : `Great! I've recorded the payment of ${formatNairaShort(entry.paid_kobo)} from ${who} to your Kika book \u2014 fully settled! \ud83c\udf89`;
+  }
+
+  const whoPhrase =
+    entry.entry_type === 'DEBIT'
+      ? ''
+      : entry.counterparty_name
+        ? ` for ${entry.counterparty_name}`
+        : '';
+
+  return `Great! I've recorded the ${action} of ${itemPhrase || formatNairaShort(entry.total_kobo)}${whoPhrase} to your Kika book.`;
+}
+
+async function handleTierPurchase(merchant, whatsappNumber, tierName, billingInterval = 'monthly') {
+  const invoice = await paystackService.createUpgradeInvoice(merchant, tierName, billingInterval);
+  const intervalLabel = billingInterval === 'yearly' ? '/yr' : '/mo';
   await whatsappService.sendPaymentLink(
     whatsappNumber,
     invoice.authorizationUrl,
-    `${invoice.tier.currency} ${(invoice.amountKobo / 100).toLocaleString('en-NG')} (${invoice.tier.name})`
+    `${invoice.tier.currency} ${(invoice.amountKobo / 100).toLocaleString('en-NG')}${intervalLabel} (${invoice.tier.name}${billingInterval === 'yearly' ? ' \u2014 Yearly' : ''})`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Receipt confirmation batching — a transaction is recorded immediately as
+// always, but the receipt image is no longer auto-sent. A merchant can log
+// one thing or several in a row; typing DONE is what asks "want a receipt
+// for what you just logged?", covering everything logged since the last
+// time that question was answered. Plain deterministic logic, no AI.
+// ---------------------------------------------------------------------------
+
+async function askReceiptDecision(merchant, whatsappNumber) {
+  const pending = await queries.getPendingReceiptDecisionEntries(merchant.id);
+  if (pending.length === 0) {
+    await whatsappService.sendTextMessage(whatsappNumber, "There's nothing new to log right now.");
+    return;
+  }
+
+  // The descriptive "here's what I recorded" message — sent once,
+  // covering everything logged since the last DONE, and always BEFORE
+  // the receipt question (not attached to the receipt itself — see
+  // handleReceiptDecisionReply, whose "yes" caption is deliberately
+  // minimal now that this has already said what's in it).
+  await whatsappService.sendTextMessage(whatsappNumber, buildBatchConfirmationText(pending));
+
+  await queries.setReceiptDecisionAwaiting(merchant.id, true);
+  const totalKobo = pending.reduce((sum, e) => sum + Number(e.total_kobo), 0);
+  const summary =
+    pending.length === 1
+      ? `that last entry (${formatNairaShort(totalKobo)})`
+      : `these ${pending.length} entries (${formatNairaShort(totalKobo)} total)`;
+  await whatsappService.sendButtonMessage(whatsappNumber, {
+    bodyText: `Want a receipt for ${summary}?`,
+    buttons: [
+      { id: 'YES', title: 'Yes' },
+      { id: 'NO', title: 'No' },
+    ],
+  });
+}
+
+/**
+ * Engagement nudges (NPS survey, weekly email-collection nudge) are
+ * checked here — once the receipt decision for a logging session has
+ * fully resolved — rather than per entry or alongside the receipt
+ * question itself. Firing one here would stack awkwardly with the
+ * receipt Y/N prompt (whose button the merchant might tap only after
+ * answering an NPS question first, or vice versa); waiting until this
+ * flow is completely done keeps exactly one open question at a time.
+ * Plain deterministic checks (engagementService.js), not AI-assisted.
+ */
+async function maybeSendEngagementNudge(merchant, whatsappNumber) {
+  try {
+    const npsTriggerReason = await engagementService.checkNpsTrigger(merchant);
+    if (npsTriggerReason) {
+      const npsQuestion = await engagementService.triggerNpsSurvey(merchant.id, npsTriggerReason);
+      await whatsappService.sendTextMessage(whatsappNumber, npsQuestion);
+      return;
+    }
+    const weeklyCount = await engagementService.checkEmailMilestoneTrigger(merchant);
+    if (weeklyCount) {
+      const emailNudge = await engagementService.triggerEmailMilestone(merchant.id, weeklyCount);
+      await whatsappService.sendTextMessage(whatsappNumber, emailNudge);
+    }
+  } catch (err) {
+    logger.error({ err: err.message, merchantId: merchant.id }, 'Engagement nudge check failed (non-fatal)');
+  }
+}
+
+async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) {
+  const text = String(rawMessage || '').trim();
+
+  if (engagementService.isNegative(text)) {
+    const pending = await queries.getPendingReceiptDecisionEntries(merchant.id);
+    await queries.resolvePendingReceiptDecision(merchant.id, pending.map((e) => e.id));
+    await queries.setReceiptDecisionAwaiting(merchant.id, false);
+    await whatsappService.sendTextMessage(whatsappNumber, 'No problem \u2014 no receipt sent. Keep logging whenever you\'re ready!');
+    await maybeSendEngagementNudge(merchant, whatsappNumber);
+    return;
+  }
+
+  if (engagementService.isAffirmative(text)) {
+    const pending = await queries.getPendingReceiptDecisionEntries(merchant.id);
+    await queries.setReceiptDecisionAwaiting(merchant.id, false);
+    if (pending.length === 0) {
+      await whatsappService.sendTextMessage(whatsappNumber, "Looks like there's nothing pending anymore \u2014 nothing to send.");
+      return;
+    }
+    const receipt =
+      pending.length === 1
+        ? await receiptService.generateReceipt({ merchant, ledgerEntry: pending[0] })
+        : await receiptService.generateReceipt({ merchant, ledgerEntries: pending });
+    await queries.resolvePendingReceiptDecision(merchant.id, pending.map((e) => e.id), { receiptId: receipt.receiptId });
+    // Minimal caption — what was actually recorded was already described
+    // in the confirmation message sent before this Yes/No question (see
+    // askReceiptDecision), so the receipt itself doesn't need to repeat it.
+    await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, 'Here\u2019s your receipt! \ud83e\uddfe');
+    await maybeSendEngagementNudge(merchant, whatsappNumber);
+    return;
+  }
+
+  await whatsappService.sendTextMessage(whatsappNumber, 'Just reply YES or NO \u2014 want a receipt for what you logged?');
+}
+
+// ---------------------------------------------------------------------------
+// Multi-item invoice creation ("new invoice for Adaeze" -> item lines ->
+// DONE -> preview -> yes/no). The finished invoice card + payment link are
+// handed to the MERCHANT only — never sent to the customer directly. Also
+// plain deterministic logic, no AI.
+// ---------------------------------------------------------------------------
+
+async function startInvoiceCreation(merchant, whatsappNumber, customerName) {
+  await queries.startInvoiceFlow(merchant.id, customerName);
+  await whatsappService.sendTextMessage(
+    whatsappNumber,
+    `Creating invoice for ${customerName}. Add your items \u2014 type each one like:\n\n_Quantity x Item name x Price_\n\nType *done* when finished.`
+  );
+}
+
+function buildInvoicePreviewText(customerName, items, totalKobo) {
+  const lines = [`Here's your invoice preview:`, '', `*Invoice for ${customerName}*`, ''];
+  for (const item of items) {
+    lines.push(`${item.quantity}\u00d7 ${item.name} \u2014 ${formatNairaShort(item.totalKobo)}`);
+  }
+  lines.push('', `*Total: ${formatNairaShort(totalKobo)}*`, '', 'Generate this invoice? Reply *yes* to confirm.');
+  return lines.join('\n');
+}
+
+async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
+  const command = ledgerParser.detectCommand(rawMessage);
+  if (command === 'DONE') {
+    const items = merchant.invoice_pending_items || [];
+    if (items.length === 0) {
+      await whatsappService.sendTextMessage(
+        whatsappNumber,
+        'You haven\u2019t added any items yet \u2014 send at least one like "2 x iPhone charger x 4500", or type CANCEL to stop.'
+      );
+      return;
+    }
+    const totalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
+    await queries.setInvoiceAwaitingStage(merchant.id, 'CONFIRM');
+    await whatsappService.sendTextMessage(whatsappNumber, buildInvoicePreviewText(merchant.invoice_customer_name, items, totalKobo));
+    return;
+  }
+
+  if (/^cancel$/i.test(rawMessage.trim())) {
+    await queries.clearInvoiceFlow(merchant.id);
+    await whatsappService.sendTextMessage(whatsappNumber, 'Invoice cancelled.');
+    return;
+  }
+
+  const item = ledgerParser.parseInvoiceItemLine(rawMessage);
+  if (!item) {
+    await whatsappService.sendTextMessage(
+      whatsappNumber,
+      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" (Quantity x Item name x Price), or type *done* when finished.'
+    );
+    return;
+  }
+  await queries.addInvoicePendingItem(merchant.id, item);
+  await whatsappService.sendTextMessage(whatsappNumber, `Added: ${item.quantity}\u00d7 ${item.name} \u2014 ${formatNairaShort(item.totalKobo)}. Send another item or type *done*.`);
+}
+
+async function handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage) {
+  if (!engagementService.isAffirmative(rawMessage)) {
+    await queries.clearInvoiceFlow(merchant.id);
+    await whatsappService.sendTextMessage(whatsappNumber, 'No problem \u2014 invoice discarded. Say "new invoice for <name>" any time to start another.');
+    return;
+  }
+
+  const items = merchant.invoice_pending_items || [];
+  const totalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
+  const invoiceNumber = await queries.claimNextInvoiceNumber(merchant.id);
+
+  const [card, link] = await Promise.all([
+    receiptService.generateInvoiceCard({ merchant, invoiceNumber, customerName: merchant.invoice_customer_name, items, totalKobo }),
+    paystackService.createCustomerInvoice(merchant, {
+      amountKobo: totalKobo,
+      description: `Invoice #${String(invoiceNumber).padStart(4, '0')} \u2014 ${merchant.invoice_customer_name}`,
+    }),
+  ]);
+
+  await queries.clearInvoiceFlow(merchant.id);
+
+  // Handed to the MERCHANT only — Kika never messages the customer
+  // directly with an invoice or payment link (same policy as loyalty
+  // milestones — see loyaltyService.js). The merchant forwards it
+  // themselves, on their own terms.
+  await whatsappService.sendReceiptImage(
+    whatsappNumber,
+    card.url,
+    `Here\u2019s the invoice for ${merchant.invoice_customer_name} \u2014 you can share this and the payment link below with them.\n\n\ud83d\udd17 ${link.short_url}\nExpires: ${new Date(link.expires_at).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}`
   );
 }
 
@@ -243,6 +460,157 @@ async function handleOnboarding(merchant, whatsappNumber, jobData) {
 // wrong. Logged to ledger_disputes for a human to review and resolve.
 const DISPUTE_PREFIX_RE = /^dispute\b[:\s]*(.*)$/i;
 
+// ---------------------------------------------------------------------------
+// Pending debt-name clarification — a DEBT is the one entry type where a
+// missing customer name genuinely hurts later: settlement ("Chidi paid")
+// has to resolve back to the same person, and an auto-generated
+// anonymous code (Cust-XXXX) is honest but nearly impossible for a
+// merchant to reconcile against a real face weeks later. So instead of
+// silently recording a nameless debt, Kika asks ONE deterministic
+// question ("Who owes this?") and holds the fully-validated entry in
+// Redis for a short window. The merchant can reply with a name, reply
+// SKIP to record it anonymously, or just move on — any non-name message
+// records the held debt anonymously first (never lost) and then
+// processes normally. CREDIT/DEBIT never trigger this: there's nothing
+// to reconcile later, so a name is optional noise.
+// ---------------------------------------------------------------------------
+
+const PENDING_DEBT_NAME_TTL_SECONDS = 15 * 60;
+const pendingDebtNameKey = (merchantId) => `kika:pendingdebtname:${merchantId}`;
+const PENDING_NAME_LIKE_RE = /^[A-Za-z][A-Za-z' -]{0,59}$/;
+const PENDING_SKIP_WORDS = new Set(['skip', 'no', 'none', 'nobody', 'no name', 'idk', "i don't know", 'i dont know']);
+
+async function stashPendingDebtAndAskName({ merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source }) {
+  await connection.set(
+    pendingDebtNameKey(merchant.id),
+    JSON.stringify({ entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source }),
+    'EX',
+    PENDING_DEBT_NAME_TTL_SECONDS
+  );
+  await whatsappService.sendTextMessage(
+    whatsappNumber,
+    `Got it \u2014 \u20a6${(entry.balanceKobo / 100).toLocaleString('en-NG')} owed on *${entry.description}*. Who owes this? Reply with the customer's name so you can track it, or reply *SKIP* to save it without a name.`
+  );
+}
+
+/**
+ * Consumes a merchant's reply while a debt-name question is pending.
+ * Returns true if the inbound message was fully handled here (a name or
+ * SKIP), false if the message should continue through the normal
+ * pipeline (in which case the held debt has ALREADY been committed
+ * anonymously — it is never dropped).
+ */
+async function handlePendingDebtNameReply(merchant, whatsappNumber, rawMessage, job) {
+  const raw = await connection.get(pendingDebtNameKey(merchant.id));
+  if (!raw) return false;
+
+  let pending;
+  try {
+    pending = JSON.parse(raw);
+  } catch {
+    await connection.del(pendingDebtNameKey(merchant.id));
+    return false;
+  }
+  await connection.del(pendingDebtNameKey(merchant.id));
+
+  const text = rawMessage.trim();
+  const lower = text.toLowerCase();
+  const isSkip = PENDING_SKIP_WORDS.has(lower);
+  const looksLikeName =
+    !isSkip &&
+    PENDING_NAME_LIKE_RE.test(text) &&
+    text.split(/\s+/).length <= 4 &&
+    !ledgerParser.detectCommand(text) &&
+    !ledgerParser.classifyEntryType(lower);
+
+  if (looksLikeName) pending.entry.counterpartyName = text;
+  // else: name stays null -> ledgerService generates an anonymous code.
+
+  await commitParsedEntry({
+    job,
+    merchant,
+    whatsappNumber,
+    entry: pending.entry,
+    rawMessage: pending.rawMessage,
+    whatsappMessageId: pending.whatsappMessageId,
+    replyToWhatsappMessageId: pending.replyToWhatsappMessageId,
+    source: `${pending.source}+name-reply`,
+  });
+
+  // A name or an explicit SKIP was the whole message — done. Anything
+  // else (a command, a brand-new transaction) still needs its own
+  // processing after the held debt was committed above.
+  return looksLikeName || isSkip;
+}
+
+/**
+ * The single commit path every successfully-validated entry goes
+ * through, regardless of which extractor produced it (regex front door,
+ * Gemini escalation, degraded regex, reply-context, or a debt-name
+ * follow-up). Records the entry, sends the \u2705 ack, wires up the
+ * outbound wamid for future reply-context resolution, and surfaces any
+ * operational alerts.
+ */
+async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source }) {
+  // The AI path classifies DEBIT expenses itself; the regex path never
+  // does — backfill via the same keyword/AI classifier either way.
+  if (entry.entryType === 'DEBIT' && !entry.expenseCategory) {
+    entry.expenseCategory = await categorizationService.categorizeExpense(entry.description, entry.items?.[0]?.name);
+  }
+
+  await auditLogService.logEvent({
+    merchantId: merchant.id,
+    actorType: 'MERCHANT',
+    actorId: whatsappNumber,
+    action: 'ledger_entry.parsed',
+    metadata: { source, entryType: entry.entryType },
+  });
+
+  // This transaction is now fully resolved and committed to Postgres —
+  // the source of truth from here on. Any earlier clarifying-question
+  // exchange still sitting in conversation memory is now stale and, if
+  // left there, could wrongly bleed into a LATER, unrelated message.
+  // Clearing here covers every path uniformly — regex, reply-context,
+  // and AI alike.
+  await conversationMemory.clearHistory(merchant.id);
+
+  const { ledgerEntry, loyaltyMilestoneText, lowStockAlerts } = await ledgerService.recordLedgerEntryAndReceipt({
+    merchant,
+    parsedEntry: entry,
+    rawMessage,
+    whatsappMessageId,
+    replyToWhatsappMessageId,
+  });
+
+  // No descriptive confirmation is sent per entry anymore — see
+  // askReceiptDecision, which sends ONE consolidated confirmation
+  // covering everything logged since the last DONE, right before
+  // asking about a receipt. A bare checkmark here is just enough for
+  // (a) instant "got it" feedback while logging several things in a
+  // row, and (b) an outbound wamid to attach to this entry, which is
+  // what lets a LATER reply ("he paid", tapping Reply on this exact
+  // message) resolve back to it — see queries.
+  // getLedgerEntryByOutboundMessageId and businessContextService's
+  // "Reply context" block.
+  logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
+  const sendResult = await whatsappService.sendTextMessage(whatsappNumber, '\u2705');
+
+  const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
+  if (ledgerEntry?.id && outboundMessageId) {
+    await queries.setLedgerEntryOutboundMessageId(ledgerEntry.id, outboundMessageId);
+  }
+
+  // Low-stock warnings and loyalty milestones are urgent/operational,
+  // not part of the "here's what you logged" narrative — they still
+  // surface immediately rather than waiting for DONE.
+  for (const alert of lowStockAlerts || []) {
+    await whatsappService.sendTextMessage(whatsappNumber, alert);
+  }
+  if (loyaltyMilestoneText) {
+    await whatsappService.sendTextMessage(whatsappNumber, loyaltyMilestoneText.trim());
+  }
+}
+
 /**
  * kika-ledger-processing — routes onboarding first, then resolves
  * multimodal content, tries the fast regex parser, falls back to the AI
@@ -298,13 +666,21 @@ const ledgerWorker = new Worker(
       return;
     }
 
-    // In-progress NPS survey or email-collection reply takes priority over
-    // everything else — a bare "8" or an email address should never be
-    // mistaken for a transaction attempt or sent to the AI fallback. Both
-    // flows are plain deterministic state machines (engagementService.js),
-    // not AI-assisted, on purpose: a score or an email address is either a
-    // clean match or it isn't.
+    // In-progress NPS survey, email-collection reply, invoice creation,
+    // or a pending receipt yes/no takes priority over everything else —
+    // a bare "8", an email address, an invoice item line, or "yes"/"no"
+    // should never be mistaken for a transaction attempt or sent to the
+    // AI fallback. All of these are plain deterministic state machines,
+    // not AI-assisted, on purpose.
     if (job.data.mediaType === 'text' && rawMessage) {
+      // A pending "who owes this?" question outranks everything below:
+      // the merchant's very next text is most plausibly the answer. If
+      // it ISN'T a name (a command, a new transaction), the held debt
+      // is committed anonymously inside the handler and this message
+      // falls through to normal processing — the debt is never lost.
+      const consumedByPendingDebtName = await handlePendingDebtNameReply(merchant, whatsappNumber, rawMessage, job);
+      if (consumedByPendingDebtName) return;
+
       if (merchant.nps_awaiting_stage) {
         const reply = await engagementService.handleNpsReply(merchant, rawMessage);
         if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
@@ -313,6 +689,18 @@ const ledgerWorker = new Worker(
       if (merchant.email_collection_awaiting_stage) {
         const reply = await engagementService.handleEmailCollectionReply(merchant, rawMessage);
         if (reply) await whatsappService.sendTextMessage(whatsappNumber, reply);
+        return;
+      }
+      if (merchant.invoice_awaiting_stage === 'ITEMS') {
+        await handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage);
+        return;
+      }
+      if (merchant.invoice_awaiting_stage === 'CONFIRM') {
+        await handleInvoiceConfirmReply(merchant, whatsappNumber, rawMessage);
+        return;
+      }
+      if (merchant.receipt_decision_awaiting) {
+        await handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage);
         return;
       }
     }
@@ -352,8 +740,25 @@ const ledgerWorker = new Worker(
     if (command === 'HELP') {
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        'Hi! Send me things like:\n"sold rice 5000"\n"Mama Tunde buy 3 carton indomie, she pay 15k remain 12k"\n"Chidi owes 2000"\n"John pay off his debt 5k"\n\nYou can also send a voice note or a photo of a receipt/handwritten note.\n\nTip: include a customer\'s phone number (e.g. "Mama Tunde 08012345678 buy...") to enable loyalty milestone tracking.\n\nCommands: BALANCE, SUNSET, INSIGHTS, DISPUTE <reason>, INVOICE <amount>, ADD STOCK: <item>, <qty>, UNDO, CLOSING HOUR <hour>, EXPORT, UPGRADE.'
+        'Hi! Send me things like:\n"sold rice 5000"\n"Mama Tunde buy 3 carton indomie, she pay 15k remain 12k"\n"Chidi owes 2000"\n"John pay off his debt 5k"\n\nAfter logging, type *DONE* and I\'ll ask if you want a receipt \u2014 works for one entry or several in a row.\n\nWant an invoice for a customer instead? Just say "new invoice for <name>".\n\nYou can also send a voice note or a photo of a receipt/handwritten note.\n\nTip: include a customer\'s phone number (e.g. "Mama Tunde 08012345678 buy...") to enable loyalty milestone tracking.\n\nCommands: BALANCE, SUNSET, INSIGHTS, DISPUTE <reason>, INVOICE <amount>, ADD STOCK: <item>, <qty>, UNDO, CLOSING HOUR <hour>, EXPORT, UPGRADE.'
       );
+      return;
+    }
+
+    if (command === 'DONE') {
+      // Outside any active flow, DONE is what closes a regular logging
+      // session and asks "want a receipt for what you logged?" — see
+      // askReceiptDecision. (DONE while INSIDE the invoice-items flow is
+      // handled earlier, at the interrupt-priority checks above, since
+      // it means something different there — finishing item entry, not
+      // asking about a receipt.)
+      await askReceiptDecision(merchant, whatsappNumber);
+      return;
+    }
+
+    const newInvoiceTrigger = ledgerParser.parseNewInvoiceTrigger(rawMessage);
+    if (newInvoiceTrigger) {
+      await startInvoiceCreation(merchant, whatsappNumber, newInvoiceTrigger.customerName);
       return;
     }
 
@@ -431,11 +836,15 @@ const ledgerWorker = new Worker(
       const tiers = await queries.listActiveSubscriptionTiers();
       const paidTiers = tiers.filter((t) => Number(t.price) > 0 && t.name.toLowerCase() !== merchant.plan.toLowerCase());
       const featureLines = paidTiers
-        .map((t) => `\n*${t.name}* (${t.currency} ${Number(t.price).toLocaleString('en-NG')}/mo):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`)
+        .map((t) => {
+          const monthly = `${t.currency} ${Number(t.price).toLocaleString('en-NG')}/mo`;
+          const yearly = `${t.currency} ${Number(t.price_yearly).toLocaleString('en-NG')}/yr`;
+          return `\n*${t.name}* \u2014 ${monthly} (or ${yearly}, 2 months free \ud83c\udf81):\n${(t.feature_list || []).map((f) => `\u2022 ${f}`).join('\n')}`;
+        })
         .join('\n');
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\ud83d\ude80 *Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below to get your secure payment link \ud83d\udc47`
+        `\ud83d\ude80 *Let's upgrade your business profile!*\n${featureLines}\n\nTap a plan below for the monthly price, or type "STANDARD YEARLY" / "PREMIUM YEARLY" to pay yearly and save 2 months \ud83d\udc47`
       );
       await whatsappService.sendPlanSelectionButtons(
         whatsappNumber,
@@ -444,7 +853,7 @@ const ledgerWorker = new Worker(
       return;
     }
 
-    if (command === 'STANDARD' || command === 'PREMIUM') {
+    if (command === 'STANDARD' || command === 'PREMIUM' || command === 'STANDARD_YEARLY' || command === 'PREMIUM_YEARLY') {
       const highestTier = await queries.getHighestActiveSubscriptionTier();
       if (highestTier && merchant.plan.toLowerCase() === highestTier.name.toLowerCase()) {
         await whatsappService.sendTextMessage(
@@ -453,7 +862,9 @@ const ledgerWorker = new Worker(
         );
         return;
       }
-      await handleTierPurchase(merchant, whatsappNumber, command);
+      const isYearly = command.endsWith('_YEARLY');
+      const tierName = isYearly ? command.replace('_YEARLY', '') : command;
+      await handleTierPurchase(merchant, whatsappNumber, tierName, isYearly ? 'yearly' : 'monthly');
       return;
     }
 
@@ -634,8 +1045,19 @@ const ledgerWorker = new Worker(
 
       let totalInflowKobo = 0;
       let debtCount = 0;
+      let rejectedLines = 0;
       const itemLines = [];
-      for (const t of transactions) {
+      for (const candidate of transactions) {
+        // Same trust boundary as the single-message path: every AI-read
+        // line passes the deterministic accounting engine or is skipped
+        // (skipping a misread line beats writing a wrong number).
+        const verdict = entryValidator.validateAndFinalizeEntry(candidate, { source: 'ai-scan' });
+        if (!verdict.ok) {
+          rejectedLines += 1;
+          logger.warn({ reason: verdict.reason }, 'Scanned logbook line rejected by validator — skipped');
+          continue;
+        }
+        const t = verdict.entry;
         await queries.withTransaction(async (client) => {
           let balanceAfterKobo = null;
           if (t.entryType === 'DEBT' && t.counterpartyName) {
@@ -650,32 +1072,83 @@ const ledgerWorker = new Worker(
         itemLines.push(`\u2022 ${t.description} \u2014 \u20a6${(t.totalKobo / 100).toLocaleString('en-NG')}`);
       }
 
+      if (itemLines.length === 0) {
+        await whatsappService.sendTextMessage(whatsappNumber, "I couldn't read any line on that page clearly enough to record safely. Could you resend a clearer photo, or type the entries instead?");
+        return;
+      }
+
       await connection.set(`kika:lastscan:${merchantId}`, JSON.stringify(itemLines), 'EX', 3600);
-      await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'logbook_scan.completed', metadata: { count: transactions.length } });
+      await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'logbook_scan.completed', metadata: { recorded: itemLines.length, rejected: rejectedLines } });
 
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `\u2705 Scan complete! Kika AI successfully extracted *${transactions.length} transaction${transactions.length === 1 ? '' : 's'}* from your paper log sheet and entered them cleanly into your database.\n\n*Quick Summary:*\nTotal Inflows: \u20a6${(totalInflowKobo / 100).toLocaleString('en-NG')}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
+        `\u2705 Scan complete! Kika AI recorded *${itemLines.length} transaction${itemLines.length === 1 ? '' : 's'}* from your paper log sheet.${rejectedLines > 0 ? `\n(${rejectedLines} line${rejectedLines === 1 ? '' : 's'} couldn't be read clearly enough to record safely \u2014 you can type ${rejectedLines === 1 ? 'it' : 'them'} in manually.)` : ''}\n\n*Quick Summary:*\nTotal Inflows: \u20a6${(totalInflowKobo / 100).toLocaleString('en-NG')}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
       );
       return;
     }
 
-    // --- Hybrid parsing: reply-context bare payments first (fastest,
-    // most deterministic — see the long comment in ledgerParser.js),
-    // then the fast regex parser, then the AI fallback. ---
-    let parsed = ledgerParser.parseReplyMessage(rawMessage, replyEntry);
-    let source = parsed ? 'reply-context' : 'regex';
-    if (!parsed) parsed = ledgerParser.parseLedgerMessage(rawMessage);
+    // ========================================================================
+    // Free-text transaction pipeline — the layered front door:
+    //
+    //   Stage 1  reply-context resolution (deterministic, regex)
+    //   Stage 2  regex front door + confidence gate  (~80-90% of traffic
+    //            ends here: no AI call, no AI cost, instant)
+    //   Stage 3  Gemini escalation (the honest path for the ~10-20% the
+    //            gate flags: Pidgin/other languages, ambiguity,
+    //            corrections, questions, images) — extraction only,
+    //            schema-validated, confidence-gated
+    //   Stage 4  degraded regex fallback (ONLY if the Gemini call itself
+    //            failed AND the regex parse cleared the lower floor)
+    //   Stage 5  entryValidator — the deterministic accounting engine
+    //            every surviving candidate must pass before any write
+    //   Stage 6  debt-name clarification, then commit
+    // ========================================================================
 
-    // --- AI safety net: only reached when neither of the above parsers
-    // can make sense of the message (unfamiliar slang, indirect
-    // phrasing, an image, or a transcribed voice note) ---
+    let parsed = null;
+    let source = null;
+    let regexScored = null;
     let aiConversationalReply = null;
     let aiDetectedLanguage = null;
     let aiCallFailed = false;
+    let aiAskedClarification = null;
+
+    // --- Stage 1: a WhatsApp reply of "he paid" / "she don pay 3k" on a
+    // debt receipt is fully unambiguous once resolved against the entry
+    // being replied to — no scoring or AI needed.
+    const replyParsed = ledgerParser.parseReplyMessage(rawMessage, replyEntry);
+    if (replyParsed) {
+      parsed = replyParsed;
+      source = 'regex-reply';
+    }
+
+    // --- Stage 2: regex front door with the confidence gate. Skipped
+    // entirely for image messages — the transaction may be IN the image,
+    // which regex cannot see, so those always escalate.
+    if (!parsed && !imageBase64) {
+      regexScored = ledgerParser.parseLedgerMessageScored(rawMessage);
+      if (regexScored.confident) {
+        parsed = regexScored.parsed;
+        source = 'regex';
+      }
+    }
+
+    // --- Stage 3: honest escalation to Gemini for everything the gate
+    // didn't trust (or couldn't parse at all, or that carries an image).
     if (!parsed) {
-      logger.info({ jobId: job.id }, 'WORKER_STARTING_AI_CALL');
+      await auditLogService.logEvent({
+        merchantId,
+        actorType: 'MERCHANT',
+        actorId: whatsappNumber,
+        action: 'message.escalated_to_ai',
+        metadata: {
+          regexConfidence: regexScored?.confidence ?? null,
+          regexSignals: regexScored?.signals ?? (imageBase64 ? ['image_message'] : ['no_parse']),
+          hadImage: !!imageBase64,
+        },
+      });
+      logger.info({ jobId: job.id, regexConfidence: regexScored?.confidence ?? null }, 'WORKER_STARTING_AI_CALL');
       const aiResult = await aiTransactionParser.parseWithAI(merchant, rawMessage, { imageBase64, replyEntry });
+
       if (aiResult.parsed) {
         parsed = aiResult.parsed;
         source = 'ai';
@@ -686,94 +1159,93 @@ const ledgerWorker = new Worker(
         // own reply is the clarifying question itself (see aiPersona's
         // tool-calling rules), which we forward verbatim.
         aiConversationalReply = aiResult.conversationalReply;
+      } else if (aiResult.lowConfidence) {
+        // Schema-valid extraction, but the model's own confidence was
+        // below AI_MIN_CONFIDENCE_THRESHOLD (or the payload failed the
+        // Zod schema outright) — per policy, ask instead of guessing.
+        aiAskedClarification = aiResult.clarify || null;
+        aiDetectedLanguage = aiResult.detectedLanguage;
       } else if (aiResult.error) {
         aiCallFailed = true;
+      }
+
+      // --- Stage 4: degraded mode. ONLY reached when the AI call itself
+      // failed outright (network error, provider outage, exhausted
+      // quota) — never when the AI validly declined or asked to clarify.
+      // The regex candidate from Stage 2 is reused if it cleared the
+      // lower REGEX_DEGRADED_FLOOR; a Gemini outage thus degrades Kika
+      // to "less smart about tricky phrasing" instead of unusable.
+      if (!parsed && aiCallFailed) {
+        if (regexScored?.usableInDegradedMode) {
+          logger.warn({ jobId: job.id, confidence: regexScored.confidence }, 'AI call failed — using degraded-mode regex parse');
+          parsed = regexScored.parsed;
+          source = 'regex-degraded';
+        } else {
+          logger.warn({ jobId: job.id }, 'AI call failed and no degraded-mode regex parse available');
+        }
       }
     }
 
     if (!parsed) {
-      await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'message.unparsed', metadata: { rawMessage, hadImage: !!imageBase64, aiCallFailed } });
+      await auditLogService.logEvent({
+        merchantId,
+        actorType: 'MERCHANT',
+        actorId: whatsappNumber,
+        action: 'message.unparsed',
+        metadata: { rawMessage, hadImage: !!imageBase64, aiCallFailed, aiLowConfidence: !!aiAskedClarification || undefined },
+      });
       logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        aiConversationalReply || (aiCallFailed ? AI_ERROR_FALLBACK_REPLY : getFallbackReply(aiDetectedLanguage))
+        aiConversationalReply || aiAskedClarification || (aiCallFailed ? AI_ERROR_FALLBACK_REPLY : getFallbackReply(aiDetectedLanguage))
       );
       return;
     }
 
-    // The fast regex path doesn't classify expenses (keeps it simple and
-    // dependency-free) — backfill via the same keyword/AI classifier the
-    // AI path already uses for itself. Bare reply-payments and the AI
-    // path never need this (they're never a fresh DEBIT).
-    if (parsed.entryType === 'DEBIT' && !parsed.expenseCategory) {
-      parsed.expenseCategory = await categorizationService.categorizeExpense(parsed.description, parsed.items?.[0]?.name);
+    // --- Stage 5: the deterministic accounting engine. EVERY candidate —
+    // regex or Gemini — has its money math recomputed and business rules
+    // enforced here. Gemini proposes understanding; this decides.
+    const verdict = entryValidator.validateAndFinalizeEntry(parsed, { source });
+    if (!verdict.ok) {
+      await auditLogService.logEvent({
+        merchantId,
+        actorType: 'MERCHANT',
+        actorId: whatsappNumber,
+        action: 'ledger_entry.rejected',
+        metadata: { source, reason: verdict.reason, rawMessage },
+      });
+      logger.info({ jobId: job.id, reason: verdict.reason }, 'Entry rejected by validator — asking merchant to clarify');
+      await whatsappService.sendTextMessage(whatsappNumber, getFallbackReply(aiDetectedLanguage));
+      return;
+    }
+    const entry = verdict.entry;
+
+    // --- Stage 6: a DEBT with no customer name is worth one question
+    // before it's written — see stashPendingDebtAndAskName for why (and
+    // for the guarantees that the held entry is never lost).
+    if (entry.entryType === 'DEBT' && !entry.counterpartyName) {
+      await stashPendingDebtAndAskName({
+        merchant,
+        whatsappNumber,
+        entry,
+        rawMessage,
+        whatsappMessageId,
+        replyToWhatsappMessageId,
+        source,
+      });
+      return;
     }
 
-    await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'ledger_entry.parsed', metadata: { source, entryType: parsed.entryType } });
-
-    // This transaction is now fully resolved and committed to Postgres —
-    // the source of truth from here on. Any earlier clarifying-question
-    // exchange still sitting in conversation memory (e.g. "How much did
-    // John owe?" from a minute ago) is now stale and, if left there,
-    // could wrongly bleed into a LATER, unrelated message. Clearing here
-    // (not just skipping the write, which aiTransactionParser already
-    // does on success) is what actually closes the loop, and covers
-    // every path uniformly — regex, reply-context, and AI alike.
-    await conversationMemory.clearHistory(merchantId);
-
-    const { ledgerEntry, receipt, outstandingDebtKobo, loyaltyMilestoneText, lowStockAlerts } = await ledgerService.recordLedgerEntryAndReceipt({
+    await commitParsedEntry({
+      job,
       merchant,
-      parsedEntry: parsed,
+      whatsappNumber,
+      entry,
       rawMessage,
       whatsappMessageId,
       replyToWhatsappMessageId,
+      source,
     });
-
-    const debtNote = Number(outstandingDebtKobo) > 0 ? '\n\nSend BALANCE anytime for a full summary.' : '';
-    let caption = buildTransactionConfirmationCaption(parsed, outstandingDebtKobo) + debtNote;
-    if (loyaltyMilestoneText) caption += loyaltyMilestoneText;
-
-    logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
-    const sendResult = await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, caption);
-
-    // Persist the wamid of THIS receipt against the entry — this is
-    // what lets a later "he paid" reply (tapping Reply on this exact
-    // WhatsApp message) resolve straight back to it. See
-    // ledgerParser.parseReplyMessage and businessContextService's
-    // "Reply context" block for where this pays off.
-    const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
-    if (ledgerEntry?.id && outboundMessageId) {
-      await queries.setLedgerEntryOutboundMessageId(ledgerEntry.id, outboundMessageId);
-    }
-
-    for (const alert of lowStockAlerts || []) {
-      await whatsappService.sendTextMessage(whatsappNumber, alert);
-    }
-
-    // Engagement nudges — checked after every successful recording, since
-    // that's the moment we know an up-to-date transaction count. Both are
-    // plain deterministic checks (engagementService.js), not AI-assisted.
-    // At most one fires per message: NPS is the rarer, more significant
-    // ask (once every ~3 months at most) and takes priority over the
-    // weekly email nudge on the off chance both conditions line up on the
-    // same transaction.
-    try {
-      const npsTriggerReason = await engagementService.checkNpsTrigger(merchant);
-      if (npsTriggerReason) {
-        const npsQuestion = await engagementService.triggerNpsSurvey(merchantId, npsTriggerReason);
-        await whatsappService.sendTextMessage(whatsappNumber, npsQuestion);
-      } else {
-        const weeklyCount = await engagementService.checkEmailMilestoneTrigger(merchant);
-        if (weeklyCount) {
-          const emailNudge = await engagementService.triggerEmailMilestone(merchantId, weeklyCount);
-          await whatsappService.sendTextMessage(whatsappNumber, emailNudge);
-        }
-      }
-    } catch (err) {
-      // Never let an engagement-nudge failure affect the transaction that
-      // was just successfully recorded and confirmed above.
-      logger.error({ err: err.message, merchantId }, 'Engagement nudge check failed (non-fatal)');
-    }
   },
   { connection, concurrency: CONCURRENCY }
 );

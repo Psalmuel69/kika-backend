@@ -263,6 +263,78 @@ async function setEmailCollectionAwaitingStage(merchantId, stage, { bumpPrompted
   }
 }
 
+// --- Receipt confirmation batching (worker.js's DONE-triggered flow) ------
+
+/** All not-yet-decided entries for this merchant, oldest first — the "batch" a DONE resolves. */
+async function getPendingReceiptDecisionEntries(merchantId) {
+  const res = await query(
+    `SELECT * FROM ledger_entries
+     WHERE merchant_id = $1 AND receipt_decision_pending = true AND is_voided = false
+     ORDER BY created_at ASC`,
+    [merchantId]
+  );
+  return res.rows;
+}
+
+async function setReceiptDecisionAwaiting(merchantId, awaiting) {
+  await query('UPDATE merchants SET receipt_decision_awaiting = $2 WHERE id = $1', [merchantId, awaiting]);
+}
+
+/** Marks a batch of entries as decided (no longer pending) — called whether the merchant said yes or no. */
+async function resolvePendingReceiptDecision(merchantId, entryIds, { receiptId = null } = {}) {
+  if (!entryIds || entryIds.length === 0) return;
+  await query(
+    `UPDATE ledger_entries SET receipt_decision_pending = false, receipt_id = COALESCE($3, receipt_id)
+     WHERE merchant_id = $1 AND id = ANY($2::uuid[])`,
+    [merchantId, entryIds, receiptId]
+  );
+}
+
+// --- Invoice creation flow (worker.js) --------------------------------------
+
+async function startInvoiceFlow(merchantId, customerName) {
+  await query(
+    `UPDATE merchants
+     SET invoice_awaiting_stage = 'ITEMS', invoice_customer_name = $2, invoice_pending_items = '[]'::jsonb
+     WHERE id = $1`,
+    [merchantId, customerName]
+  );
+}
+
+async function addInvoicePendingItem(merchantId, item) {
+  const res = await query(
+    `UPDATE merchants
+     SET invoice_pending_items = invoice_pending_items || $2::jsonb
+     WHERE id = $1
+     RETURNING invoice_pending_items`,
+    [merchantId, JSON.stringify([item])]
+  );
+  return res.rows[0].invoice_pending_items;
+}
+
+async function setInvoiceAwaitingStage(merchantId, stage) {
+  await query('UPDATE merchants SET invoice_awaiting_stage = $2 WHERE id = $1', [merchantId, stage]);
+}
+
+/** Clears all invoice-flow state — called after the invoice is generated, or if the merchant cancels. */
+async function clearInvoiceFlow(merchantId) {
+  await query(
+    `UPDATE merchants
+     SET invoice_awaiting_stage = NULL, invoice_customer_name = NULL, invoice_pending_items = '[]'::jsonb
+     WHERE id = $1`,
+    [merchantId]
+  );
+}
+
+/** Atomically claims the next invoice number for this merchant (e.g. "#0047") and increments the counter. */
+async function claimNextInvoiceNumber(merchantId) {
+  const res = await query(
+    'UPDATE merchants SET next_invoice_number = next_invoice_number + 1 WHERE id = $1 RETURNING next_invoice_number - 1 AS claimed',
+    [merchantId]
+  );
+  return res.rows[0].claimed;
+}
+
 async function setMerchantClosingHour(merchantId, hour) {
   const res = await query(
     'UPDATE merchants SET closing_hour_local = $2 WHERE id = $1 RETURNING id',
@@ -383,7 +455,9 @@ async function createLedgerEntry(client, entry) {
  * called right after the outbound WhatsApp send succeeds. This is what
  * lets a later inbound reply (its `context.id` matching this value) be
  * resolved back to the exact entry it's responding to — see
- * getLedgerEntryByOutboundMessageId and ledgerParser.parseReplyMessage.
+ * getLedgerEntryByOutboundMessageId, whose result is fed to Gemini as
+ * "Reply context" (businessContextService.js) so it can resolve
+ * pronoun-only replies like "he paid" to the right customer/entry.
  * Fire-and-forget safe: a failure here never blocks the send itself,
  * it just means that specific message can't be used as a reply anchor.
  */
@@ -1102,12 +1176,12 @@ async function markDigestCardFileDeleted(id) {
 
 // --- Payment transactions --------------------------------------------------
 
-async function createPaymentTransaction({ merchantId, reference, subscriptionTierId, amountKobo, authorizationUrl }) {
+async function createPaymentTransaction({ merchantId, reference, subscriptionTierId, billingInterval = 'monthly', amountKobo, authorizationUrl }) {
   const res = await query(
-    `INSERT INTO payment_transactions (merchant_id, paystack_reference, subscription_tier_id, amount_kobo, authorization_url)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO payment_transactions (merchant_id, paystack_reference, subscription_tier_id, billing_interval, amount_kobo, authorization_url)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
-    [merchantId, reference, subscriptionTierId, amountKobo, authorizationUrl]
+    [merchantId, reference, subscriptionTierId, billingInterval, amountKobo, authorizationUrl]
   );
   return res.rows[0];
 }
@@ -1403,6 +1477,14 @@ module.exports = {
   getLatestReasonlessNpsResponse,
   setMerchantEmail,
   setEmailCollectionAwaitingStage,
+  getPendingReceiptDecisionEntries,
+  setReceiptDecisionAwaiting,
+  resolvePendingReceiptDecision,
+  startInvoiceFlow,
+  addInvoicePendingItem,
+  setInvoiceAwaitingStage,
+  clearInvoiceFlow,
+  claimNextInvoiceNumber,
   setMerchantClosingHour,
   setMerchantLogo,
   setAwaitingLogoWindow,

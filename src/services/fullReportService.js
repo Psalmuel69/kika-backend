@@ -25,11 +25,42 @@ function escapeHtml(unsafe) {
  * top-debtor callout when the same customer has led the debt list for
  * multiple consecutive months.
  */
-function buildAiInsightText({ growthPct, topProducts, totalRevenueKobo, topDebtor, debtorStreakMonths }) {
+function formatShortNaira(kobo) {
+  const naira = Number(kobo) / 100;
+  const abs = Math.abs(naira);
+  if (abs >= 1000000) return `\u20a6${(naira / 1000000).toFixed(abs % 1000000 === 0 ? 0 : 1)}m`;
+  if (abs >= 1000) return `\u20a6${Math.round(naira / 1000)}k`;
+  return `\u20a6${Math.round(naira).toLocaleString('en-NG')}`;
+}
+
+/**
+ * "(+₦15k from July)" / "(-₦3k from July)" — the absolute-terms bracket
+ * shown just under a percentage-growth note. Returns '' (nothing to
+ * render) when there's no prior-month figure to compare against yet.
+ */
+function formatDeltaBracket(currentKobo, previousKobo, prevMonthLabel) {
+  if (previousKobo == null) return '';
+  const deltaKobo = Number(currentKobo) - Number(previousKobo);
+  const sign = deltaKobo >= 0 ? '+' : '-';
+  return `(${sign}${formatShortNaira(Math.abs(deltaKobo))} from ${prevMonthLabel})`;
+}
+
+function buildAiInsightText({ totalRevenueKobo, previousRevenueKobo, topProducts, topDebtor, debtorStreakMonths }) {
   const sentences = [];
 
-  if (growthPct != null) {
-    sentences.push(`Your revenue ${growthPct >= 0 ? 'grew' : 'declined'} ${Math.abs(growthPct).toFixed(0)}% month-over-month.`);
+  // Absolute terms read far more concretely to a merchant than a
+  // percentage — "You made ₦15,000 more than last month!" is instantly
+  // visualizable in a way "+12.5%" isn't, especially for someone who
+  // doesn't habitually think in percentages.
+  if (previousRevenueKobo != null) {
+    const deltaKobo = Number(totalRevenueKobo) - Number(previousRevenueKobo);
+    if (deltaKobo > 0) {
+      sentences.push(`You made ${formatNaira(deltaKobo)} more than last month!`);
+    } else if (deltaKobo < 0) {
+      sentences.push(`You made ${formatNaira(Math.abs(deltaKobo))} less than last month.`);
+    } else {
+      sentences.push('Your revenue held exactly steady with last month.');
+    }
   }
 
   if (topProducts.length >= 2 && Number(totalRevenueKobo) > 0) {
@@ -78,11 +109,21 @@ async function buildReportSnapshot({ merchant, periodKey, monthStart, monthEnd, 
   }).filter((w, idx) => idx < 4 || w.revenueKobo > 0); // show a 5th bar only if it has data
 
   const totalRevenueKobo = Number(current.sales_kobo);
+  const totalExpenseKobo = Number(current.expenses_kobo);
   const totalOutstandingKobo = debtors.reduce((sum, d) => sum + Number(d.balance_kobo), 0);
-  const netCashflowKobo = totalRevenueKobo - Number(current.expenses_kobo);
+  const netProfitKobo = totalRevenueKobo - totalExpenseKobo;
 
   const previousRevenueKobo = Number(previous.sales_kobo);
+  const previousExpenseKobo = Number(previous.expenses_kobo);
+  const hasPriorPeriodData = previousRevenueKobo > 0 || previousExpenseKobo > 0;
   const growthPct = previousRevenueKobo > 0 ? ((totalRevenueKobo - previousRevenueKobo) / previousRevenueKobo) * 100 : null;
+  const expenseGrowthPct = previousExpenseKobo > 0 ? ((totalExpenseKobo - previousExpenseKobo) / previousExpenseKobo) * 100 : null;
+
+  // "Standard Intl.DateTimeFormat month name for the PRIOR calendar
+  // month — this is what "(+₦15k from July)" refers to.
+  const prevMonthLabel = prevMonthStart.toLocaleDateString('en-NG', { month: 'long' });
+  const revenueDeltaBracket = hasPriorPeriodData ? formatDeltaBracket(totalRevenueKobo, previousRevenueKobo, prevMonthLabel) : '';
+  const expenseDeltaBracket = hasPriorPeriodData ? formatDeltaBracket(totalExpenseKobo, previousExpenseKobo, prevMonthLabel) : '';
 
   // Debtor streak: how many consecutive prior months also had this same
   // top debtor, based on previously-saved report snapshots.
@@ -101,16 +142,26 @@ async function buildReportSnapshot({ merchant, periodKey, monthStart, monthEnd, 
 
   const bestWeek = weeklyRevenue.reduce((best, w) => (w.revenueKobo > (best?.revenueKobo || 0) ? w : best), null);
 
-  const aiInsight = buildAiInsightText({ growthPct, topProducts, totalRevenueKobo, topDebtor, debtorStreakMonths });
+  const aiInsight = buildAiInsightText({
+    totalRevenueKobo,
+    previousRevenueKobo: hasPriorPeriodData ? previousRevenueKobo : null,
+    topProducts,
+    topDebtor,
+    debtorStreakMonths,
+  });
 
   return {
     periodKey,
     businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name || 'Merchant',
     totalRevenueKobo,
     growthPct,
+    revenueDeltaBracket,
+    totalExpenseKobo,
+    expenseGrowthPct,
+    expenseDeltaBracket,
     totalOutstandingKobo,
     debtorCount: debtors.length,
-    netCashflowKobo,
+    netProfitKobo,
     tradeDays,
     weeklyRevenue,
     bestWeek,
@@ -141,6 +192,7 @@ async function buildReportSnapshot({ merchant, periodKey, monthStart, monthEnd, 
 // TrendingUp / AlertTriangle / Zap / BookOpen used in FullReport.tsx.
 const ICON_PATHS = {
   trendingUp: ['M16 7h6v6', 'm22 7-8.5 8.5-5-5L2 17'],
+  trendingDown: ['M16 17h6v-6', 'm22 17-8.5-8.5-5 5L2 7'],
   alertTriangle: [
     'm21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3',
     'M12 9v4',
@@ -160,15 +212,16 @@ function lucideIcon(name, { size = 18, color = 'currentColor', strokeWidth = 2.3
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
 }
 
-const STAT_ICON_BY_ID = { revenue: 'trendingUp', outstanding: 'alertTriangle', cashflow: 'zap' };
+const STAT_ICON_BY_ID = { revenue: 'trendingUp', expense: 'trendingDown', outstanding: 'alertTriangle', cashflow: 'zap' };
 
-function renderStatCard({ id, icon, label, value, tone, note }) {
+function renderStatCard({ id, icon, label, value, tone, note, bracket }) {
   return `
     <div class="stat-card">
-      <div class="stat-icon">${lucideIcon(icon, { size: 18, color: tone === 'green' ? 'var(--tone-green)' : 'var(--tone-amber)', strokeWidth: 2.3 })}</div>
+      <div class="stat-icon">${lucideIcon(icon, { size: 18, color: tone === 'green' ? 'var(--tone-green)' : tone === 'red' ? 'var(--tone-red)' : 'var(--tone-amber)', strokeWidth: 2.3 })}</div>
       <p class="stat-label">${escapeHtml(label)}</p>
       <div class="stat-value ${tone}">${value}</div>
       <p class="stat-note">${escapeHtml(note)}</p>
+      ${bracket ? `<p class="stat-bracket">${escapeHtml(bracket)}</p>` : ''}
     </div>`;
 }
 
@@ -221,6 +274,15 @@ function renderReportHtml(snapshot) {
       value: formatNaira(snapshot.totalRevenueKobo),
       tone: 'green',
       note: snapshot.growthPct == null ? 'No prior data' : `${snapshot.growthPct >= 0 ? '+' : ''}${snapshot.growthPct.toFixed(0)}% vs last month`,
+      bracket: snapshot.revenueDeltaBracket,
+    },
+    {
+      id: 'expense',
+      label: 'Total Expense',
+      value: formatNaira(snapshot.totalExpenseKobo),
+      tone: 'red',
+      note: snapshot.expenseGrowthPct == null ? 'No prior data' : `${snapshot.expenseGrowthPct >= 0 ? '+' : ''}${snapshot.expenseGrowthPct.toFixed(0)}% vs last month`,
+      bracket: snapshot.expenseDeltaBracket,
     },
     {
       id: 'outstanding',
@@ -231,10 +293,10 @@ function renderReportHtml(snapshot) {
     },
     {
       id: 'cashflow',
-      label: 'Net Cashflow',
-      value: formatNaira(snapshot.netCashflowKobo),
+      label: 'Net Profit',
+      value: formatNaira(snapshot.netProfitKobo),
       tone: 'green',
-      note: snapshot.netCashflowKobo >= 0 ? 'Clean profit' : 'Running at a loss',
+      note: snapshot.netProfitKobo >= 0 ? 'Clean profit' : 'Running at a loss',
     },
   ];
 
@@ -269,15 +331,17 @@ function renderReportHtml(snapshot) {
   .header .subtitle { margin: 2px 0 0; font-size: 12.5px; color: #7d7d85; }
 
   /* ===== Stat cards ===== */
-  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 16px 24px 0; }
-  @media (max-width: 560px) { .stat-grid { grid-template-columns: 1fr; } }
+  .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding: 16px 24px 0; }
+  @media (max-width: 420px) { .stat-grid { grid-template-columns: 1fr; } }
   .stat-card { border-radius: 12px; border: 1px solid #232328; background: #1a1a1d; padding: 16px; }
   .stat-icon { line-height: 0; }
   .stat-label { margin: 14px 0 0; font-size: 12px; font-weight: 500; color: #9a9aa3; }
   .stat-value { margin: 6px 0 0; font-size: 21px; font-weight: 700; letter-spacing: -0.2px; line-height: 1; }
   .stat-value.green { color: var(--tone-green); }
   .stat-value.amber { color: var(--tone-amber); }
+  .stat-value.red { color: var(--tone-red); }
   .stat-note { margin: 8px 0 0; font-size: 11.5px; color: #6b6b73; }
+  .stat-bracket { margin: 2px 0 0; font-size: 11px; color: #7d7d85; }
 
   /* ===== Shared section card ===== */
   .section-card { border-radius: 16px; border: 1px solid #232328; background: #1a1a1d; margin: 16px 24px 0; padding: 20px; }
