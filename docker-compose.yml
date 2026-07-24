@@ -1,21 +1,43 @@
-version: "3.9"
+# version: "3.9"
 
 services:
+  # Fronts the api container for every Kika subdomain (api./pay./digest.
+  # kikahq.com — see Caddyfile) with automatic Let's Encrypt HTTPS. The
+  # api container itself is no longer published on the host (see below)
+  # — it's only reachable through Caddy now, so there's no way to
+  # accidentally hit it over plain HTTP bypassing TLS.
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
+    # No host port mapping — only reachable from other containers on
+    # this compose network (i.e. from caddy, by service name `api`).
+    # If you need direct access for local debugging, temporarily add
+    # back `ports: ["8080:8080"]`, but don't leave it on in production
+    # alongside Caddy — that would let anyone reach the app directly
+    # over plain HTTP, skipping TLS entirely.
+    expose:
+      - "8080"
+    # DATABASE_URL (Neon) and REDIS_URL (Upstash) come from .env
+    # unmodified — no PGHOST/REDIS_URL override here. This app doesn't
+    # run local Postgres/Redis containers; both live off-VM. See
+    # src/config/db.js and src/config/redis.js for how each is
+    # auto-selected from DATABASE_URL / REDIS_URL alone.
     env_file: .env
-    environment:
-      PGHOST: postgres
-      REDIS_URL: redis://redis:6379
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
       - receipts-data:/data/receipts
     restart: unless-stopped
@@ -31,14 +53,7 @@ services:
       dockerfile: Dockerfile.worker
     env_file: .env
     environment:
-      PGHOST: postgres
-      REDIS_URL: redis://redis:6379
       WORKER_CONCURRENCY: 10
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
       - receipts-data:/data/receipts
     restart: unless-stopped
@@ -49,34 +64,7 @@ services:
           cpus: "1.0"
           memory: 512M
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: kika
-      POSTGRES_USER: kika_app
-      POSTGRES_PASSWORD: changeme
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kika_app -d kika"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    command: >
-      postgres -c max_connections=200 -c shared_buffers=256MB
-
-  redis:
-    image: redis:7-alpine
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
 volumes:
-  pg-data:
-  redis-data:
   receipts-data:
+  caddy-data:
+  caddy-config:

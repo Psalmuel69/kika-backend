@@ -1,0 +1,21 @@
+# Reverse proxy for all Kika backend subdomains — every one of these
+# is served by the SAME `api` container (Express doesn't check the
+# Host header anywhere in this app), so this file is just "which
+# hostnames should Caddy accept and automatically get a Let's Encrypt
+# certificate for," not separate routing per domain.
+#
+# Requires each hostname's DNS to already point at this VM's IP before
+# Caddy can issue a certificate for it (see README's deployment
+# section) — if a domain's DNS isn't live yet, comment it out below
+# rather than leaving it in and failing cert issuance for the others.
+
+api.kikahq.com, pay.kikahq.com, digest.kikahq.com {
+	reverse_proxy api:8080
+
+	encode gzip
+
+	log {
+		output stdout
+		format json
+	}
+}

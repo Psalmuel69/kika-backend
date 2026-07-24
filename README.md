@@ -729,17 +729,60 @@ Postgres and Redis differs, and that's auto-detected (see
 5. Deploy. `db.js` logs `mode: "cloud (DATABASE_URL)"` on startup —
    check the Render logs to confirm it picked up the right path.
 
-### Docker (self-hosted alternative)
+### Docker (self-hosted app, Neon + Upstash for data)
+This repo's `docker-compose.yml` runs Caddy, the API, and 2 worker
+replicas — Postgres and Redis are **not** containers here; the app
+connects out to Neon and Upstash exactly as in the Cloud path above
+(`DATABASE_URL` / `REDIS_URL` in `.env`). This is the right setup if
+you want to self-host the app itself (e.g. on your own VM) while still
+using managed, off-VM Postgres/Redis — see the "which database should
+this run on" reasoning in the project notes if you're deciding between
+this and fully self-hosting the database too.
 ```bash
-cp .env.example .env
-# In .env: comment out DATABASE_URL and REDIS_URL, uncomment the
-# PGHOST/PGPORT/... and REDIS_URL=redis://redis:6379 lines instead
-# (both are pre-written in .env.example, just swapped in/out).
+cp .env.example .env        # fill in DATABASE_URL (Neon) and REDIS_URL (Upstash)
 docker compose up --build
 docker compose exec api node src/db/migrate.js
 ```
-This starts Postgres, Redis, the API, and 2 worker replicas locally —
-useful for development or a fully self-hosted deployment.
+If you'd rather self-host Postgres/Redis too, `.env.example` documents
+the fallback vars (`PGHOST`/`PGPORT`/... and a plain `redis://` URL) —
+but you'll need to add your own `postgres`/`redis` services back into
+`docker-compose.yml` first; they aren't present in this file by
+default.
+
+#### Subdomains (api./pay./digest.kikahq.com) on a single VM
+
+All three domains — the general API (`PUBLIC_BASE_URL`), payment links
+(`PAYMENT_LINK_BASE_URL`), and digest cards (`DIGEST_BASE_URL`) — are
+served by the exact same `api` container. Express never inspects the
+Host header anywhere in this app, so there's no per-domain routing to
+configure in code; a hostname only needs to (a) have DNS pointed at
+this VM and (b) get an HTTPS certificate, both handled outside the app
+itself:
+
+1. **DNS** — at your registrar or DNS provider (e.g. Netlify DNS, if
+   that's where kikahq.com's nameservers point), add an A record for
+   each subdomain pointing at this VM's public IP:
+   ```
+   A    api      <VM IP>
+   A    pay      <VM IP>
+   A    digest   <VM IP>
+   ```
+2. **Reverse proxy + HTTPS** — `docker-compose.yml` includes a `caddy`
+   service (see the `Caddyfile`) that reverse-proxies all three
+   hostnames to the `api` container and automatically issues/renews a
+   Let's Encrypt certificate for each — nothing to configure beyond the
+   Caddyfile already listing the three domains. The `api` container
+   itself is `expose`d, not `ports`-published, so it's only reachable
+   through Caddy — there's no way to accidentally hit it over plain
+   HTTP, bypassing TLS.
+3. **Firewall** — only ports 80 and 443 need to be open on the VM
+   (Caddy needs 80 briefly for the Let's Encrypt HTTP-01 challenge, then
+   redirects to 443). Port 8080 does not need to be open at all now
+   that Caddy fronts it.
+4. If a subdomain's DNS isn't live yet, comment its name out of the
+   Caddyfile's site block before starting Caddy — an unresolvable
+   domain in that list will fail certificate issuance for the whole
+   block, not just that one domain.
 
 ### Running without Docker (local Node, either DB target)
 

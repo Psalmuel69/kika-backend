@@ -29,4 +29,13 @@ USER kika
 ENV NODE_ENV=production \
     RECEIPT_STORAGE_DIR=/data/receipts
 
+# The worker has no HTTP server to health-check (unlike the api image —
+# see Dockerfile), so this checks the one thing that actually matters
+# for it to be useful: can it reach Redis, where BullMQ's queue lives.
+# Reuses the same REDIS_URL env var the app itself connects with, so
+# this checks the real configured target (Upstash in production) rather
+# than a hardcoded local address.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD node -e "const R=require('ioredis'); const c=new R(process.env.REDIS_URL,{maxRetriesPerRequest:1,lazyConnect:true}); c.connect().then(()=>c.ping()).then(()=>{c.disconnect();process.exit(0)}).catch(()=>process.exit(1))"
+
 CMD ["node", "src/queue/worker.js"]
