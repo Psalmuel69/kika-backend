@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # Fronts the api container for every Kika subdomain (api./pay./digest.
   # kikahq.com — see Caddyfile) with automatic Let's Encrypt HTTPS. The
@@ -13,7 +11,7 @@ services:
   # first time you visit it, and don't publish this port directly (see
   # `expose`, not `ports`, below — same pattern as `api`).
   portainer:
-    image: portainer/portainer-ce:2.21-alpine
+    image: portainer/portainer-ce:lts
     expose:
       - "9000"
     volumes:
