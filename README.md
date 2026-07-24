@@ -784,6 +784,16 @@ itself:
    domain in that list will fail certificate issuance for the whole
    block, not just that one domain.
 
+#### Monitoring: Portainer
+
+`docker-compose.yml` includes Portainer — a web UI for container
+status, health, resource usage, and live log streaming, at
+`portainer.kikahq.com` once its own DNS A record is added (same as the
+other three) and Caddy has issued it a certificate. On first visit it
+prompts you to create the admin account — use a strong, unique
+password: Portainer needs the Docker socket to function, so its login
+is equivalent to root on the VM, not just a read-only dashboard.
+
 ### Running without Docker (local Node, either DB target)
 
 ```bash

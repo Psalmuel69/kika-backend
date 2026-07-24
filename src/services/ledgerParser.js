@@ -657,7 +657,23 @@ function parseInvoiceItemLine(rawMessage) {
 // (distinct from the one-shot "INVOICE 5000 for rice" command above,
 // which has no customer-name-first phrasing and still works for a
 // quick single-line invoice).
-const NEW_INVOICE_TRIGGER_RE = /^(?:new\s+|create\s+)?invoice\s+for\s+(.+)$/i;
+// "for" is optional — "new invoice for Adaeze" and "new invoice Adaeze"
+// both work, matching what the HELP text and startInvoiceCreation's own
+// no-name prompt tell merchants they can type (that instruction text
+// showed the no-"for" form without this regex actually accepting it —
+// this was a real bug, not just wording: a merchant following the
+// instructions literally would get no response at all).
+//
+// The (?!\d) guard is load-bearing, not decorative: with "for" now
+// optional, "INVOICE 5000 for rice" (the one-shot payment-amount
+// command, parsed separately by parseInvoiceCommand below) would
+// otherwise ALSO match here first — "invoice " + "5000 for rice"
+// captured as if it were a customer name — since this trigger is
+// checked before the one-shot command in worker.js's dispatch order.
+// A real customer name never starts with a digit, so this excludes
+// exactly the one-shot command's shape without needing to hardcode
+// anything about its syntax here.
+const NEW_INVOICE_TRIGGER_RE = /^(?:new\s+|create\s+)?invoice\s+(?:for\s+)?(?!\d)(.+)$/i;
 // The bare command with no name attached ("create invoice", "new
 // invoice", just "invoice") also starts the flow — the caller asks for
 // the customer's name as a separate step instead of doing nothing.

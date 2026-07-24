@@ -1,4 +1,4 @@
-# version: "3.9"
+version: "3.9"
 
 services:
   # Fronts the api container for every Kika subdomain (api./pay./digest.
@@ -6,6 +6,21 @@ services:
   # api container itself is no longer published on the host (see below)
   # — it's only reachable through Caddy now, so there's no way to
   # accidentally hit it over plain HTTP bypassing TLS.
+  # Web UI for container status/health/logs — see portainer.kikahq.com
+  # once DNS + Caddy are set up. Needs the Docker socket to observe (and
+  # restart, if you use that button) every container on this VM, which
+  # makes its own login a high-value target: set a strong password the
+  # first time you visit it, and don't publish this port directly (see
+  # `expose`, not `ports`, below — same pattern as `api`).
+  portainer:
+    image: portainer/portainer-ce:2.21-alpine
+    expose:
+      - "9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer-data:/data
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     ports:
@@ -68,3 +83,4 @@ volumes:
   receipts-data:
   caddy-data:
   caddy-config:
+  portainer-data:

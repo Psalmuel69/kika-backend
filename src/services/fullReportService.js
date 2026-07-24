@@ -488,10 +488,16 @@ async function generateFullReport({ merchant, periodKey, monthStart, monthEnd, p
     expiresAt,
   });
 
-  const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  // Only ever generated as part of the monthly digest send (see the two
+  // call sites in worker.js — TESTDIGEST and the real monthly-insights-
+  // tick), where this link rides alongside the digest CARD's image in
+  // the exact same WhatsApp message as its "View Full Report" button.
+  // Uses the same DIGEST_BASE_URL as the card itself for that reason,
+  // rather than the generic PUBLIC_BASE_URL — falls back to it if unset.
+  const baseUrl = (process.env.DIGEST_BASE_URL || process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const reportUrl = `${baseUrl}/api/v1/reports/${publicToken}`;
 
-  logger.info({ merchantId: merchant.id, periodKey }, 'Full monthly report generated');
+  logger.info({ merchantId: merchant.id, periodKey, url: reportUrl }, 'Full monthly report generated');
 
   return { reportUrl, snapshot };
 }

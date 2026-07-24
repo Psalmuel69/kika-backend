@@ -261,7 +261,7 @@ async function generateDigestCard({ merchant, periodKey, moneyInflowKobo, growth
   const baseUrl = (process.env.DIGEST_BASE_URL || process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
   const safeUrl = `${baseUrl}/api/v1/digest-cards/${publicToken}.png`;
 
-  logger.info({ merchantId: merchant.id, periodKey }, 'Monthly digest card generated');
+  logger.info({ merchantId: merchant.id, periodKey, url: safeUrl }, 'Monthly digest card generated');
 
   return { url: safeUrl, expiresAt };
 }

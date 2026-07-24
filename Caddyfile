@@ -19,3 +19,16 @@ api.kikahq.com, pay.kikahq.com, digest.kikahq.com {
 		format json
 	}
 }
+
+# Portainer gets its own site block (not bundled into the list above)
+# so a DNS/cert hiccup on this domain can never take down api/pay/
+# digest — see the note in docker-compose.yml about what's at stake if
+# this login is ever compromised.
+portainer.kikahq.com {
+	reverse_proxy portainer:9000
+
+	log {
+		output stdout
+		format json
+	}
+}
