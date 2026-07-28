@@ -48,16 +48,22 @@ const nairaAmount = z
   .min(0)
   .max(MAX_SINGLE_TRANSACTION_NAIRA);
 
-// Nigerian E.164 (+234 + 10 digits). The model is told to return E.164;
-// a couple of near-miss formats it commonly emits anyway (leading 0,
-// bare 234) are normalized rather than rejected, since the intent is
-// unambiguous.
-const nigerianPhone = z
+// International E.164 phone (+ followed by 8-15 digits, the ITU-T
+// E.164 range) — accepts any country's number the model returns in
+// proper E.164 form, not just Nigeria's. A bare Nigerian domestic-format
+// shorthand (leading 0, 11 digits total) is ALSO normalized to +234,
+// since Nigeria remains Kika's largest market and both merchants and
+// the model frequently drop the country code for it — that's a
+// convenience for the historically dominant case, not a restriction on
+// any other country's numbers (a customer phone that previously fell
+// outside +234 was silently dropped to null here, breaking loyalty
+// milestone tracking for every non-Nigerian merchant's customers).
+const internationalPhone = z
   .string()
   .trim()
   .transform((v) => {
     const digits = v.replace(/[^\d+]/g, '');
-    if (/^\+234\d{10}$/.test(digits)) return digits;
+    if (/^\+\d{8,15}$/.test(digits)) return digits;
     if (/^234\d{10}$/.test(digits)) return `+${digits}`;
     if (/^0[789]\d{9}$/.test(digits)) return `+234${digits.slice(1)}`;
     return null; // unparseable phone -> dropped, never guessed
@@ -66,18 +72,30 @@ const nigerianPhone = z
 
 const shortText = (max) => z.string().trim().min(1).max(max);
 
+// The currencies Kika's parsers can recognize an EXPLICIT statement of
+// in merchant text at all (see MONEY_TOKEN/CURRENCY_MARKER_TO_CODE in
+// ledgerParser.js — this list must stay in sync with that one).
+// Anything the model reports outside this set is treated as
+// unspecified (null) by the transform below — the same "don't guess,
+// assume the merchant's own account currency" posture as every other
+// unrecognized field in this schema.
+const SUPPORTED_ENTRY_CURRENCIES = ['NGN', 'USD', 'GBP', 'EUR'];
+
 /**
  * One extracted transaction, exactly as the model proposes it. This is
- * intentionally the model's *understanding*, still in naira and still
- * unrepaired — conversion to kobo and arithmetic enforcement happen in
- * entryValidator.js, on the backend's authority, after this passes.
+ * intentionally the model's *understanding*, still in the currency the
+ * merchant actually used (see `currency` below) and still unrepaired —
+ * conversion to NGN kobo and arithmetic enforcement happen later:
+ * currency conversion in utils/currency.js (called from worker.js right
+ * after extraction), then accounting enforcement in entryValidator.js,
+ * on the backend's authority, after both of those pass.
  */
 const ExtractedTransactionSchema = z
   .object({
     entryType: z.enum(['CREDIT', 'DEBIT', 'DEBT', 'DEBT_SETTLEMENT']),
     description: shortText(140),
     counterpartyName: shortText(80).nullable().optional().default(null),
-    counterpartyPhone: nigerianPhone.optional().default(null),
+    counterpartyPhone: internationalPhone.optional().default(null),
     // Receipt-facing: a short noun phrase, never a sentence. The 60-char
     // cap is the schema-level enforcement of that rule.
     itemName: z.string().trim().max(60).nullable().optional().default(null),
@@ -89,6 +107,28 @@ const ExtractedTransactionSchema = z
       .optional()
       .default(null)
       .transform((v) => (v && EXPENSE_CATEGORIES.includes(v) ? v : null)),
+    // Which currency totalNaira/paidNaira/balanceNaira are actually
+    // denominated in — despite the field names below (kept as
+    // "…Naira" for backward compatibility with the accounting engine's
+    // input contract), a merchant who wrote "$500" or "500 dollars"
+    // should have this set to 'USD', with totalNaira etc. carrying the
+    // face value 500 (NOT converted). null (the default, when the
+    // model doesn't report an explicit foreign currency) means
+    // "unspecified — assume the merchant's own account currency", NOT
+    // "assume NGN": worker.js checks this against merchant.default_currency
+    // (see src/config/countryCurrency.js) and only asks the merchant to
+    // clarify on a genuine mismatch. Defaulting this to 'NGN' instead of
+    // null would wrongly flag every AI-parsed entry from a non-Nigerian
+    // merchant as a currency mismatch.
+    currency: z
+      .string()
+      .nullable()
+      .optional()
+      .default(null)
+      .transform((v) => {
+        const upper = String(v || '').toUpperCase();
+        return SUPPORTED_ENTRY_CURRENCIES.includes(upper) ? upper : null;
+      }),
     totalNaira: nairaAmount,
     paidNaira: nairaAmount,
     balanceNaira: nairaAmount,
@@ -136,4 +176,5 @@ module.exports = {
   ExtractedScanBatchSchema,
   validateExtraction,
   MAX_SINGLE_TRANSACTION_NAIRA,
+  SUPPORTED_ENTRY_CURRENCIES,
 };

@@ -1,5 +1,7 @@
 'use strict';
 
+const { CURRENCY_INFO_BY_CODE } = require('../config/countryCurrency');
+
 /**
  * Two different kinds of parsing live in this file:
  *
@@ -46,30 +48,87 @@
  * avoid floating point drift on money math.
  */
 
+// Currency prefix/suffix -> ISO code, shared by every money-parsing site
+// in this file (the free-text ledger parser, the one-shot INVOICE
+// command, and the multi-item invoice line parser).
+//
+// This is NOT the full list of currencies Kika supports — a merchant's
+// actual account currency is resolved from their WhatsApp number's
+// country calling code (see src/config/countryCurrency.js, which covers
+// every ISO 4217 currency in the world) at signup, and the overwhelming
+// majority of messages just use a bare number with no symbol at all
+// (correctly assumed to be in THAT currency — see resolveCurrencyCode's
+// null return below). This table only covers the handful of currencies
+// a merchant anywhere might explicitly type the SYMBOL/WORD for, even
+// outside their own country — Naira, Dollars, Pounds, Euros — so an
+// amount stated in one of THESE is recognized and checked against the
+// merchant's own account currency (see worker.js), asking for
+// clarification on a genuine mismatch rather than silently misreading
+// "$500" as five hundred of the merchant's own currency.
+const CURRENCY_MARKER_TO_CODE = {
+  '\u20a6': 'NGN',
+  ngn: 'NGN',
+  naira: 'NGN',
+  '$': 'USD',
+  usd: 'USD',
+  dollar: 'USD',
+  dollars: 'USD',
+  '\u00a3': 'GBP',
+  gbp: 'GBP',
+  pound: 'GBP',
+  pounds: 'GBP',
+  '\u20ac': 'EUR',
+  eur: 'EUR',
+  euro: 'EUR',
+  euros: 'EUR',
+};
+
+/**
+ * Resolves the EXPLICIT currency a money token was written in, from
+ * whichever of its prefix ("$", "₦", "usd"...) or suffix ("dollars",
+ * "naira"...) markers actually matched — prefix wins if both somehow
+ * fired. Returns null (meaning "no explicit currency stated — assume
+ * whatever currency the merchant's account is already set up in") for
+ * the overwhelming common case of a bare number with no symbol/word at
+ * all — this is NOT a default currency guess, it's "unspecified." See
+ * worker.js for how a null vs. an explicit-but-mismatched currency are
+ * handled differently.
+ */
+function resolveCurrencyCode(prefixRaw, suffixRaw) {
+  const prefixKey = String(prefixRaw || '').trim().toLowerCase();
+  const suffixKey = String(suffixRaw || '').trim().toLowerCase();
+  return CURRENCY_MARKER_TO_CODE[prefixKey] || CURRENCY_MARKER_TO_CODE[suffixKey] || null;
+}
+
 // "INVOICE 5000 for rice", "INVOICE 08012345678 2 million rice
 // delivery", "INVOICE $150 supplies" — generates a customer-facing
 // payment link rather than a ledger entry. The amount portion accepts
 // the same money vocabulary as the ledger parser (k/m/h/thousand/
-// million/hundred, ₦/$/naira/dollars) — see MONEY_SUFFIX_MULTIPLIER
-// below, which this shares.
+// million/hundred, ₦/$/£/€/naira/dollars/pounds/euros) — see
+// MONEY_SUFFIX_MULTIPLIER below, which this shares.
 const INVOICE_PREFIX_RE =
-  /^invoice\b[:\s]+(?:(\+?234\d{10}|0[789]\d{9})\s+)?(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*(.*)$/i;
+  /^invoice\b[:\s]+(?:(\+\d{8,15}|0[789]\d{9})\s+)?(\u20a6\s*|\$\s*|\u00a3\s*|\u20ac\s*|ngn\s*|usd\s*|gbp\s*|eur\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd|pounds?|gbp|euros?|eur)?\b(?!\w)\s*(.*)$/i;
 
 function parseInvoiceCommand(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
   const match = rawMessage.trim().match(INVOICE_PREFIX_RE);
   if (!match) return null;
 
-  const [, phoneRaw, numberPart, suffixRaw, description] = match;
-  let amountNaira = parseFloat(numberPart.replace(/,/g, ''));
-  if (Number.isNaN(amountNaira) || amountNaira <= 0) return null;
+  const [, phoneRaw, prefixRaw, numberPart, suffixRaw, description] = match;
+  let amountFace = parseFloat(numberPart.replace(/,/g, ''));
+  if (Number.isNaN(amountFace) || amountFace <= 0) return null;
   const multiplier = MONEY_SUFFIX_MULTIPLIER[(suffixRaw || '').toLowerCase()];
-  if (multiplier) amountNaira *= multiplier;
+  if (multiplier) amountFace *= multiplier;
 
-  const customerPhone = phoneRaw ? (phoneRaw.startsWith('+234') ? phoneRaw : `+234${phoneRaw.replace(/^0/, '')}`) : null;
+  const customerPhone = phoneRaw ? (phoneRaw.startsWith('+') ? phoneRaw : `+234${phoneRaw.replace(/^0/, '')}`) : null;
 
   return {
-    amountKobo: Math.round(amountNaira * 100),
+    // NOTE: this is the face value in whatever `currency` is (x100),
+    // NOT necessarily Naira kobo — an invoice is free to be in any
+    // currency (see the note on buildInvoiceSvgForMerchant in
+    // receiptService.js); this is never auto-converted.
+    amountKobo: Math.round(amountFace * 100),
+    currency: resolveCurrencyCode(prefixRaw, suffixRaw),
     description: description?.trim() || 'Invoice',
     customerPhone,
   };
@@ -110,6 +169,12 @@ function detectCommand(rawMessage) {
 
 // "ADD STOCK: rice, 50" or "ADD STOCK rice 50 bags"
 const ADD_STOCK_RE = /^add\s*stock\s*:?\s*([a-zA-Z][a-zA-Z\s]{0,60}?)\s*[,]?\s*(\d+(?:\.\d{1,2})?)\s*([a-zA-Z]+)?\s*$/i;
+// Recognizes the command was clearly AIMED at ADD STOCK even when
+// ADD_STOCK_RE above didn't fully match (no item name, no quantity, or
+// both) — lets worker.js ask for exactly what's missing instead of
+// silently ignoring the message or escalating it to the AI parser as if
+// it were an ordinary transaction.
+const ADD_STOCK_PREFIX_RE = /^add\s*stock\b/i;
 
 function parseAddStockCommand(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
@@ -121,8 +186,18 @@ function parseAddStockCommand(rawMessage) {
   return { productName: name.trim(), quantity, unit: unit?.trim() || null };
 }
 
+/** True if the message is clearly an attempt at ADD STOCK that's missing the item name and/or quantity — see ADD_STOCK_PREFIX_RE above. */
+function isIncompleteAddStockCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return false;
+  const text = rawMessage.trim();
+  return ADD_STOCK_PREFIX_RE.test(text) && !parseAddStockCommand(text);
+}
+
 // "CLOSING HOUR 20" or "CLOSING HOUR: 7PM" (24hr or simple AM/PM)
 const CLOSING_HOUR_RE = /^closing\s*hour\s*:?\s*(\d{1,2})\s*(am|pm)?\s*$/i;
+// Same idea as ADD_STOCK_PREFIX_RE — the command was clearly aimed at
+// CLOSING HOUR but has no (valid) hour attached.
+const CLOSING_HOUR_PREFIX_RE = /^closing\s*hour\b/i;
 
 function parseClosingHourCommand(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
@@ -134,6 +209,41 @@ function parseClosingHourCommand(rawMessage) {
   if (meridiem === 'am' && hour === 12) hour = 0;
   if (hour < 0 || hour > 23) return null;
   return { hour };
+}
+
+/** True if the message is clearly an attempt at CLOSING HOUR that's missing a valid hour — see CLOSING_HOUR_PREFIX_RE above. */
+function isIncompleteClosingHourCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return false;
+  const text = rawMessage.trim();
+  return CLOSING_HOUR_PREFIX_RE.test(text) && !parseClosingHourCommand(text);
+}
+
+// "SET CURRENCY GHS" / "CURRENCY GHS" — lets a merchant correct the
+// currency their account was auto-assigned at signup (see
+// src/config/countryCurrency.js's phone-calling-code guess). That guess
+// is a heuristic, not ground truth — a merchant using a relative's
+// foreign-registered SIM, or genuinely running a cross-border business,
+// needs a way to fix it rather than being permanently stuck with a
+// wrong assumption with no recourse.
+const SET_CURRENCY_RE = /^(?:set\s+)?currency\s*:?\s*([a-zA-Z]{3})\s*$/i;
+// Same idea as the other command-completeness checks — the merchant
+// clearly meant this command but gave no (valid) 3-letter code.
+const SET_CURRENCY_PREFIX_RE = /^(?:set\s+)?currency\b/i;
+
+function parseSetCurrencyCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return null;
+  const match = rawMessage.trim().match(SET_CURRENCY_RE);
+  if (!match) return null;
+  const code = match[1].toUpperCase();
+  if (!CURRENCY_INFO_BY_CODE[code]) return null; // not a currency Kika recognizes at all
+  return { currencyCode: code };
+}
+
+/** True if the message is clearly an attempt at SET CURRENCY with a missing or unrecognized code. */
+function isIncompleteSetCurrencyCommand(rawMessage) {
+  if (typeof rawMessage !== 'string') return false;
+  const text = rawMessage.trim();
+  return SET_CURRENCY_PREFIX_RE.test(text) && !parseSetCurrencyCommand(text);
 }
 
 // "I'm Samuel", "I am Samuel", "My name is Samuel", "This is Samuel",
@@ -177,6 +287,107 @@ function extractSelfIntroduction(rawMessage) {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding's "What is the name of your business/shop?" reply — a
+// merchant very often answers in a full sentence ("my business name is
+// Ebuka & Sons Ltd", "Ebuka & Sons Ltd is the name") rather than just
+// the name on its own ("Ebuka & Sons Ltd"). Since this name gets printed
+// on every receipt/invoice going forward, silently saving the WHOLE
+// sentence would be a lasting, visible mistake — so it's stripped of any
+// recognized lead-in/trailing filler before being saved. Deliberately a
+// short, explicit list rather than a single greedy regex — a phrase
+// that isn't on this list is left untouched (see looksLikeCleanName
+// below, which flags that case for the AI fallback in
+// nameExtractionService.js instead of guessing at a stripping rule that
+// might cut into the actual name).
+// ---------------------------------------------------------------------------
+const BUSINESS_NAME_LEADING_RES = [
+  /^(?:the|my|our)\s+business\s+name\s+is\s+/i,
+  /^(?:the|my|our)\s+shop\s+name\s+is\s+/i,
+  /^(?:the|my|our)\s+store\s+name\s+is\s+/i,
+  /^business\s+name\s*:?\s*is\s+/i,
+  /^(?:the\s+)?name\s+is\s+/i,
+  /^name\s*:\s*/i,
+  /^(?:we're|we\s+are|it'?s|it\s+is)\s+called\s+/i,
+  /^(?:my|our)\s+business\s+is\s+called\s+/i,
+  /^(?:my|our)\s+shop\s+is\s+called\s+/i,
+  /^(?:my|our)\s+store\s+is\s+called\s+/i,
+  /^(?:we|i)\s+call\s+it\s+/i,
+];
+const BUSINESS_NAME_TRAILING_RES = [
+  /\s+is\s+(?:the|my|our)\s+business(?:'s)?\s+name\.?$/i,
+  /\s+is\s+(?:the|my|our)\s+shop(?:'s)?\s+name\.?$/i,
+  /\s+is\s+(?:the|my|our)\s+store(?:'s)?\s+name\.?$/i,
+  /\s+is\s+(?:the|my|our)\s+name\.?$/i,
+  /\s+is\s+what\s+(?:we're|we\s+are|it'?s|it\s+is)\s+called\.?$/i,
+  /\s+is\s+my\s+business\.?$/i,
+  /\s+is\s+our\s+business\.?$/i,
+];
+
+/**
+ * Strips a recognized lead-in ("my business name is ...") or trailing
+ * ("... is the name") filler phrase from a merchant's answer to the
+ * business-name onboarding question, leaving just the name itself. If
+ * NEITHER pattern matches, the text is returned completely unchanged
+ * (most merchants just type the plain name, which is exactly the
+ * common case this must not disturb) — see looksLikeCleanName for how
+ * the caller decides whether the result still needs the AI fallback.
+ */
+function extractBusinessNameFromReply(rawMessage) {
+  if (typeof rawMessage !== 'string') return null;
+  let text = rawMessage.trim();
+  if (!text) return null;
+
+  for (const re of BUSINESS_NAME_LEADING_RES) {
+    if (re.test(text)) {
+      text = text.replace(re, '').trim();
+      break;
+    }
+  }
+  for (const re of BUSINESS_NAME_TRAILING_RES) {
+    if (re.test(text)) {
+      text = text.replace(re, '').trim();
+      break;
+    }
+  }
+  // Leftover surrounding quotes/punctuation from a phrase like `It's
+  // called "Ebuka Stores".` — cosmetic cleanup, not a stripping rule.
+  text = text
+    .replace(/^["'\u201c]+|["'\u201d]+$/g, '')
+    .replace(/[.!]+$/, '')
+    .trim();
+  return text || null;
+}
+
+// Words that, if the text STILL contains/starts with them after
+// extractBusinessNameFromReply's stripping attempt, mean it's very
+// likely still a sentence rather than a clean name — e.g. a phrasing
+// this file's explicit pattern list didn't anticipate ("you can call my
+// shop Ebuka Stores", "Ebuka Stores, that's what we go by"). A real
+// business name occasionally legitimately contains a short connector
+// word ("Bread & Butter", "House of Ankara"), so this only flags the
+// small set of words that are near-never part of an actual business
+// name on their own.
+const SUSPICIOUS_NAME_WORD_RE = /\b(is|called|name|business|shop|store)\b/i;
+const MAX_PLAUSIBLE_NAME_WORDS = 7;
+
+/**
+ * Heuristic: does `text` look like a clean, already-extracted name
+ * rather than a leftover sentence fragment? Used to decide whether
+ * extractBusinessNameFromReply's result is trustworthy on its own, or
+ * whether it's worth the one-off AI fallback call (see
+ * nameExtractionService.extractNameWithAI) — never blocks onboarding
+ * either way, since the caller falls back to the raw reply if the AI
+ * call itself doesn't return anything usable.
+ */
+function looksLikeCleanName(text) {
+  if (!text) return false;
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  if (wordCount === 0 || wordCount > MAX_PLAUSIBLE_NAME_WORDS) return false;
+  if (SUSPICIOUS_NAME_WORD_RE.test(text)) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Front-door free-text transaction parser. Runs FIRST on every free-text
 // message; its output is only trusted when scoreRegexParse (further
 // down) clears the confidence threshold — see the file-level comment.
@@ -188,19 +399,34 @@ const DEBT_SETTLE_VERBS = ['pay off', 'clear debt', 'settle debt', 'paid off', '
 const DEBT_VERBS = ['owes', 'owe', 'debt', 'credit sale', 'on credit'];
 
 // Matches "15k", "15,000", "₦15,000.50", "N15000", "15000 naira", "2m",
-// "2 million", "2 milli", "5h", "5 hundred", "$150", "150 dollars" —
-// Nigerian chat shorthand for thousand/million/hundred multipliers
-// (spelled out or abbreviated), plus explicit currency words/symbols.
-// "$"/"usd"/"dollars" are recognized as money markers so an amount
-// written that way is never mistaken for text (e.g. left over as a
-// stray item name) — Kika still records the numeric face value in the
-// ledger's naira fields as-is; it does not perform currency conversion.
-// The bare "n" prefix only matches when glued directly to a digit
-// (lookahead \d, no space) — otherwise it would greedily swallow the
-// trailing "n" of ordinary words like "remain" or "in" as a false
-// currency marker.
+// "2 million", "2 milli", "5h", "5 hundred", "$150", "150 dollars",
+// "£20", "20 pounds", "€50", "50 euros" — Nigerian chat shorthand for
+// thousand/million/hundred multipliers (spelled out or abbreviated),
+// plus explicit currency words/symbols. Foreign-currency markers are
+// recognized as money markers so an amount written that way is never
+// mistaken for text (e.g. left over as a stray item name) — the prefix
+// is now a CAPTURING group (see resolveCurrencyCode above) so
+// extractMoneyMentions can tag which currency each mention was actually
+// stated in; worker.js converts any non-NGN mention to its NGN
+// equivalent, at the current market rate, before anything is validated
+// or written — see utils/currency.js. The bare "n" prefix only matches
+// when glued directly to a digit (lookahead \d, no space) — otherwise it
+// would greedily swallow the trailing "n" of ordinary words like
+// "remain" or "in" as a false currency marker.
+// The prefix group is written as a MANDATORY alternation (no trailing
+// `?`) whose last branch, `\b(?=\d)`, is a zero-width "no currency
+// symbol here, just a plain boundary before a digit" match — this is
+// what replaces a naive leading `\b` before the whole optional group.
+// A plain leading `\b` doesn't work here: `\b` asserts a transition
+// between a word and non-word character, and a currency SYMBOL ($, ₦,
+// £, €) is itself a non-word character — so "rice $500" (space, then
+// $) has a non-word-to-non-word run and never satisfies `\b` right
+// before the "$", silently making the whole prefix fail to match and
+// defaulting every symbol-prefixed foreign amount to NGN. Each
+// word-based alternative (ngn/usd/gbp/eur/n) keeps its own `\b` since
+// those genuinely are word characters and need the boundary check.
 const MONEY_TOKEN =
-  /\b(?:₦\s*|\$\s*|ngn\s*|usd\s*|n(?=\d))?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)/i;
+  /(\u20a6\s*|\$\s*|\u00a3\s*|\u20ac\s*|\bngn\s*|\busd\s*|\bgbp\s*|\beur\s*|\bn(?=\d)|\b(?=\d))([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd|pounds?|gbp|euros?|eur)?\b(?!\w)/i;
 
 const MONEY_SUFFIX_MULTIPLIER = {
   k: 1000,
@@ -211,40 +437,56 @@ const MONEY_SUFFIX_MULTIPLIER = {
   h: 100,
   hundred: 100,
   // Currency words carry no multiplier of their own — they just confirm
-  // the number is money, same role the ₦/$ symbols play as a prefix.
+  // the number is money (and, via resolveCurrencyCode, which currency),
+  // same role the ₦/$/£/€ symbols play as a prefix.
   naira: 1,
   dollar: 1,
   dollars: 1,
   usd: 1,
+  pound: 1,
+  pounds: 1,
+  gbp: 1,
+  euro: 1,
+  euros: 1,
+  eur: 1,
 };
 
 function parseMoneyToken(matchGroups) {
-  const [, numberPart, suffixRaw] = matchGroups;
+  const [, prefixRaw, numberPart, suffixRaw] = matchGroups;
   let value = parseFloat(numberPart.replace(/,/g, ''));
   if (Number.isNaN(value)) return null;
   const multiplier = MONEY_SUFFIX_MULTIPLIER[(suffixRaw || '').toLowerCase()];
   if (multiplier) value *= multiplier;
-  return Math.round(value * 100); // -> kobo
+  return {
+    // NOTE: for a non-NGN currency this is the face value's minor units
+    // (x100) in THAT currency, not real Naira kobo — see the MONEY_TOKEN
+    // comment above. Kept as `amountKobo` (rather than a more generic
+    // name) since that's what every caller in this file already expects;
+    // the currency conversion happens downstream, in worker.js.
+    amountKobo: Math.round(value * 100),
+    currency: resolveCurrencyCode(prefixRaw, suffixRaw),
+  };
 }
 
 /**
  * Finds every money mention in the text, in order of appearance, tagged
  * with which keyword (if any) immediately preceded it — "pay", "remain",
  * or none — so the caller can assign total/paid/balance correctly instead
- * of guessing by position alone.
+ * of guessing by position alone. Each mention also carries the currency
+ * it was actually stated in (see parseMoneyToken/resolveCurrencyCode).
  */
 function extractMoneyMentions(text) {
   const mentions = [];
   const re = new RegExp(MONEY_TOKEN.source, 'gi');
   let match;
   while ((match = re.exec(text)) !== null) {
-    const amountKobo = parseMoneyToken(match);
-    if (!amountKobo) continue;
+    const parsedToken = parseMoneyToken(match);
+    if (!parsedToken || !parsedToken.amountKobo) continue;
     const precedingText = text.slice(Math.max(0, match.index - 20), match.index).toLowerCase();
     let tag = null;
     if (/\b(pay|paid|pays)\s*$/.test(precedingText)) tag = 'PAID';
     else if (/\b(remain|remaining|balance|owing|left|bal)\s*$/.test(precedingText)) tag = 'BALANCE';
-    mentions.push({ amountKobo, tag, index: match.index });
+    mentions.push({ amountKobo: parsedToken.amountKobo, currency: parsedToken.currency, tag, index: match.index });
   }
   return mentions;
 }
@@ -324,10 +566,22 @@ function extractItem(text) {
 }
 
 // Nigerian mobile numbers: local "0803..." (11 digits) or international
-// "+234803..." / "234803...". Normalized to E.164 (+234...) so the same
-// customer is recognized across messages regardless of which format the
-// merchant happened to type.
-const PHONE_RE = /(?:\+?234|0)([789]\d{9})\b/;
+// "+234803..." / "234803..." / "08034..." (Nigerian domestic shorthand,
+// normalized to E.164) — OR any other country's number typed in full
+// E.164 form with a leading "+" (e.g. "+233241234567", "+254712345678")
+// — recognized regardless of which country the merchant or their
+// customer is in, not just Nigeria. A bare digit run with no "+" and no
+// Nigerian-style leading 0 is deliberately NOT treated as a phone
+// number here — unlike an explicit "+"-prefixed number, it would be
+// genuinely ambiguous with a large money amount without knowing the
+// country, so it's left alone rather than guessed at.
+const PHONE_RE = /\+\d{8,15}\b|(?:\+?234|0)([789]\d{9})\b/;
+
+/** Normalizes a PHONE_RE match to E.164 — group 1 only exists for the Nigerian-shorthand branch; the full match is already E.164 for the "+..." branch. */
+function normalizePhoneMatch(match) {
+  if (!match) return null;
+  return match[1] ? `+234${match[1]}` : match[0];
+}
 
 // Verbs/fillers stripped when hunting for a bare item name (no
 // quantity/unit pattern matched at all — e.g. "sold rice 5000", just a
@@ -338,12 +592,12 @@ const BARE_ITEM_LEADING_NAME_RE = /^[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){0,2}\s+/
 const BARE_ITEM_LEADING_RE =
   /^(?:sold|sell|selling|sale of|bought|buy|purchase of|paid for|spent on|gave|received|owes?|owe)\s*/i;
 // The currency-symbol alternation here MUST list every prefix
-// MONEY_TOKEN recognizes (₦, $, ngn, usd) — otherwise a symbol that
-// isn't consumed as part of the stripped amount (e.g. "$150" when only
-// "₦"/"ngn" were listed) is left dangling and gets returned as if it
-// were the item name itself.
+// MONEY_TOKEN recognizes (₦, $, £, €, ngn, usd, gbp, eur) — otherwise a
+// symbol that isn't consumed as part of the stripped amount (e.g.
+// "£150" when only "₦"/"ngn" were listed) is left dangling and gets
+// returned as if it were part of the item name itself.
 const BARE_ITEM_TRAILING_RE =
-  /\s+(?:to|from|for)\s+[A-Z][\s\S]*$|\s*(?:\u20a6|\$|ngn|usd)?\s*[\d][\d,.]*\s*(?:k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\.?\s*[\s\S]*$/i;
+  /\s+(?:to|from|for)\s+[A-Z][\s\S]*$|\s*(?:\u20a6|\$|\u00a3|\u20ac|ngn|usd|gbp|eur)?\s*[\d][\d,.]*\s*(?:k|m|h|thousand|million|milli|hundred|naira|dollars?|usd|pounds?|gbp|euros?|eur)?\.?\s*[\s\S]*$/i;
 // After stripping verbs/names/amounts, a handful of bare leftover words
 // mean "there was no item at all" (e.g. "Chidi owes 2000" leaves
 // nothing product-like once "Chidi" and "owes" are both gone) — these
@@ -422,7 +676,7 @@ function parseLedgerMessage(rawMessage) {
   if (!entryType) return null;
 
   const phoneMatch = text.match(PHONE_RE);
-  const counterpartyPhone = phoneMatch ? `+234${phoneMatch[1]}` : null;
+  const counterpartyPhone = normalizePhoneMatch(phoneMatch);
   const phoneSpan = phoneMatch
     ? { start: phoneMatch.index, end: phoneMatch.index + phoneMatch[0].length }
     : null;
@@ -506,12 +760,24 @@ function parseLedgerMessage(rawMessage) {
       : displayItem.name
     : 'Transaction';
 
+  // Which EXPLICIT currency this entry was stated in, if any — a
+  // message mixing currencies within itself isn't something real
+  // merchant traffic does, so the first money mention's currency stands
+  // for the whole entry. null means no currency symbol/word was used at
+  // all (the overwhelming common case) — worker.js treats that as "this
+  // is in the merchant's own account currency," not a guess of NGN
+  // specifically; a NON-null value here is checked against the
+  // merchant's actual account currency, and only asked about if it
+  // genuinely doesn't match (see worker.js).
+  const currency = nonQuantityMentions[0]?.currency || null;
+
   return {
     entryType,
     description,
     counterpartyName,
     counterpartyPhone,
     items: displayItem ? [displayItem] : [],
+    currency,
     totalKobo,
     paidKobo,
     balanceKobo,
@@ -556,9 +822,12 @@ function parseReplyMessage(rawMessage, replyEntry) {
 
   // An explicit amount in the reply itself overrides "assume it's the
   // full outstanding balance" — e.g. "he paid 5k" against a ₦12,000 debt
-  // is a partial settlement, not a full one.
+  // is a partial settlement, not a full one. A foreign-currency amount
+  // here is a rare edge case but tagged the same way as everywhere
+  // else — worker.js converts it before writing, same as any other entry.
   const mentions = extractMoneyMentions(text);
   const paidKobo = mentions.length > 0 ? mentions[0].amountKobo : Number(replyEntry.balance_kobo);
+  const currency = mentions.length > 0 ? mentions[0].currency : 'NGN';
 
   return {
     entryType: 'DEBT_SETTLEMENT',
@@ -566,6 +835,7 @@ function parseReplyMessage(rawMessage, replyEntry) {
     counterpartyName: replyEntry.counterparty_name,
     counterpartyPhone: replyEntry.counterparty_phone || null,
     items: [],
+    currency,
     totalKobo: paidKobo,
     paidKobo,
     balanceKobo: 0,
@@ -589,7 +859,7 @@ function parseReplyMessage(rawMessage, replyEntry) {
 // future word the merchant uses ("cans", "rolls", "trays", "kegs",
 // "gallons"...) throws an error for no reason.
 const INVOICE_ITEM_LINE_RE =
-  /^(\d+)\s*(?:([a-zA-Z]+)\s+)?x\s*(.+?)\s*x\s*(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*$/i;
+  /^(\d+)\s*(?:([a-zA-Z]+)\s+)?x\s*(.+?)\s*x\s*(\u20a6\s*|\$\s*|\u00a3\s*|\u20ac\s*|ngn\s*|usd\s*|gbp\s*|eur\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd|pounds?|gbp|euros?|eur)?\b(?!\w)\s*$/i;
 
 // Fallback for a single-"x" line where the merchant wrote the quantity,
 // unit, and item name as one natural phrase instead of the strict
@@ -599,7 +869,7 @@ const INVOICE_ITEM_LINE_RE =
 // the item's display name, so literally any unit word (or none) works
 // without the parser needing to recognize it.
 const INVOICE_ITEM_LINE_FALLBACK_RE =
-  /^(\d+)\s+(.+?)\s*x\s*(?:\u20a6\s*|\$\s*|ngn\s*|usd\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd)?\b(?!\w)\s*$/i;
+  /^(\d+)\s+(.+?)\s*x\s*(\u20a6\s*|\$\s*|\u00a3\s*|\u20ac\s*|ngn\s*|usd\s*|gbp\s*|eur\s*)?([\d,]+(?:\.\d{1,2})?)\s*(k|m|h|thousand|million|milli|hundred|naira|dollars?|usd|pounds?|gbp|euros?|eur)?\b(?!\w)\s*$/i;
 
 function resolveMoney(numberPart, suffixRaw) {
   let value = parseFloat(numberPart.replace(/,/g, ''));
@@ -609,22 +879,31 @@ function resolveMoney(numberPart, suffixRaw) {
   return value;
 }
 
+/**
+ * Parses one invoice item line into its NGN-or-foreign face-value price.
+ * NOTE: when the detected currency isn't 'NGN', unitPriceKobo/totalKobo
+ * below are face-value-times-100 in THAT currency, not real Naira kobo —
+ * see the same note on parseMoneyToken above. worker.js converts every
+ * item's price to real NGN kobo (via utils/currency.js) right after this
+ * returns, before the item is added to the invoice.
+ */
 function parseInvoiceItemLine(rawMessage) {
   if (typeof rawMessage !== 'string') return null;
   const trimmed = rawMessage.trim();
 
   const strict = trimmed.match(INVOICE_ITEM_LINE_RE);
   if (strict) {
-    const [, quantityStr, unit, name, priceStr, suffixRaw] = strict;
+    const [, quantityStr, unit, name, prefixRaw, priceStr, suffixRaw] = strict;
     const quantity = Number(quantityStr);
-    const unitPriceNaira = resolveMoney(priceStr, suffixRaw);
-    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceNaira != null && unitPriceNaira > 0) {
+    const unitPriceFace = resolveMoney(priceStr, suffixRaw);
+    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceFace != null && unitPriceFace > 0) {
       return {
         name: name.trim(),
         unit: unit ? unit.toLowerCase() : null,
         quantity,
-        unitPriceKobo: Math.round(unitPriceNaira * 100),
-        totalKobo: Math.round(unitPriceNaira * 100) * quantity,
+        currency: resolveCurrencyCode(prefixRaw, suffixRaw),
+        unitPriceKobo: Math.round(unitPriceFace * 100),
+        totalKobo: Math.round(unitPriceFace * 100) * quantity,
       };
     }
   }
@@ -635,16 +914,17 @@ function parseInvoiceItemLine(rawMessage) {
   // free-text chunk.
   const fallback = trimmed.match(INVOICE_ITEM_LINE_FALLBACK_RE);
   if (fallback) {
-    const [, quantityStr, name, priceStr, suffixRaw] = fallback;
+    const [, quantityStr, name, prefixRaw, priceStr, suffixRaw] = fallback;
     const quantity = Number(quantityStr);
-    const unitPriceNaira = resolveMoney(priceStr, suffixRaw);
-    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceNaira != null && unitPriceNaira > 0) {
+    const unitPriceFace = resolveMoney(priceStr, suffixRaw);
+    if (name?.trim() && Number.isFinite(quantity) && quantity > 0 && unitPriceFace != null && unitPriceFace > 0) {
       return {
         name: name.trim(),
         unit: null,
         quantity,
-        unitPriceKobo: Math.round(unitPriceNaira * 100),
-        totalKobo: Math.round(unitPriceNaira * 100) * quantity,
+        currency: resolveCurrencyCode(prefixRaw, suffixRaw),
+        unitPriceKobo: Math.round(unitPriceFace * 100),
+        totalKobo: Math.round(unitPriceFace * 100) * quantity,
       };
     }
   }
@@ -692,9 +972,9 @@ function parseNewInvoiceTrigger(rawMessage) {
     // optional trailing group interacts unpredictably with names that
     // themselves contain digits.
     let customerPhone = null;
-    const phoneTrailMatch = nameRaw.match(/\s+(\+?234\d{10}|0[789]\d{9})$/);
+    const phoneTrailMatch = nameRaw.match(/\s+(\+\d{8,15}|0[789]\d{9})$/);
     if (phoneTrailMatch) {
-      customerPhone = phoneTrailMatch[1].startsWith('+234') ? phoneTrailMatch[1] : `+234${phoneTrailMatch[1].replace(/^0/, '')}`;
+      customerPhone = phoneTrailMatch[1].startsWith('+') ? phoneTrailMatch[1] : `+234${phoneTrailMatch[1].replace(/^0/, '')}`;
       nameRaw = nameRaw.slice(0, phoneTrailMatch.index).trim();
     }
     if (!nameRaw || nameRaw.length > 100) return null;
@@ -861,8 +1141,14 @@ module.exports = {
   detectCommand,
   parseInvoiceCommand,
   parseAddStockCommand,
+  isIncompleteAddStockCommand,
   parseClosingHourCommand,
+  isIncompleteClosingHourCommand,
+  parseSetCurrencyCommand,
+  isIncompleteSetCurrencyCommand,
   extractSelfIntroduction,
+  extractBusinessNameFromReply,
+  looksLikeCleanName,
   parseLedgerMessage,
   parseLedgerMessageScored,
   scoreRegexParse,

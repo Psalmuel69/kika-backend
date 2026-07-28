@@ -163,7 +163,7 @@ function validateAndFinalizeEntry(candidate, meta = {}) {
       ? candidate.counterpartyName.trim().slice(0, 80)
       : null;
   const counterpartyPhone =
-    typeof candidate.counterpartyPhone === 'string' && /^\+234\d{10}$/.test(candidate.counterpartyPhone.trim())
+    typeof candidate.counterpartyPhone === 'string' && /^\+\d{8,15}$/.test(candidate.counterpartyPhone.trim())
       ? candidate.counterpartyPhone.trim()
       : null;
 
@@ -186,6 +186,12 @@ function validateAndFinalizeEntry(candidate, meta = {}) {
     paidKobo,
     balanceKobo,
     expenseCategory: entryType === 'DEBIT' ? candidate.expenseCategory || null : null,
+    // The currency this entry is recorded in — worker.js sets this to
+    // the merchant's own default_currency before this validator ever
+    // runs (a stated amount in a DIFFERENT currency is caught earlier
+    // and the merchant is asked to clarify/restate in their own
+    // currency — see worker.js — so nothing reaches here mismatched).
+    currency: candidate.currency || 'NGN',
   };
 
   if (repairs.length) {

@@ -77,9 +77,19 @@ const RECORD_TRANSACTION_TOOL = {
           enum: [...EXPENSE_CATEGORIES, null],
           description: 'Only for entryType DEBIT: which fixed expense category this spend falls under. Null for CREDIT/DEBT/DEBT_SETTLEMENT.',
         },
-        totalNaira: { type: 'number', description: 'Total value of the transaction as the merchant stated it, in Naira (not kobo).' },
-        paidNaira: { type: 'number', description: 'Amount actually paid/received right now as stated, in Naira.' },
-        balanceNaira: { type: 'number', description: 'Amount still owed after this transaction as stated. 0 if fully settled. Do not invent a balance the merchant did not state or clearly imply.' },
+        currency: {
+          type: ['string', 'null'],
+          enum: ['NGN', 'USD', 'GBP', 'EUR'],
+          description:
+            "Which currency the merchant EXPLICITLY stated the amount in, if any — only set this when they clearly used a foreign currency's own symbol or word ('$500', '500 dollars', '£20', '€50 for supplies') or explicitly said '₦'/'naira'. Leave this null for the overwhelming common case of a bare number with no currency word at all — null means 'assume the merchant's own account currency', which is NOT the same as NGN for every merchant. Never guess a currency from an ambiguous bare number.",
+        },
+        totalNaira: {
+          type: 'number',
+          description:
+            "Total value of the transaction as the merchant stated it, as a face-value number in whatever `currency` you reported (do not convert it yourself — e.g. for \"$500\" this is 500 with currency='USD'). Field name is kept for historical reasons.",
+        },
+        paidNaira: { type: 'number', description: 'Amount actually paid/received right now as stated, as a face-value number in `currency`.' },
+        balanceNaira: { type: 'number', description: 'Amount still owed after this transaction as stated, as a face-value number in `currency`. 0 if fully settled. Do not invent a balance the merchant did not state or clearly imply.' },
         detectedLanguage: {
           type: 'string',
           enum: SUPPORTED_LANGUAGES,
@@ -152,6 +162,16 @@ function normalizeValidatedExtraction(data) {
     counterpartyName: data.counterpartyName || null,
     counterpartyPhone: data.counterpartyPhone || null,
     items,
+    // null means "the model didn't report an explicit foreign
+    // currency" — i.e. assume the merchant's own account currency, NOT
+    // NGN specifically (a Ghanaian/Kenyan/etc. merchant's AI-parsed
+    // entries would otherwise be wrongly flagged as a currency mismatch
+    // on every single one). worker.js checks a non-null value here
+    // against merchant.default_currency (see
+    // src/config/countryCurrency.js) and only asks the merchant to
+    // clarify on a genuine mismatch — see extractionSchema.js's
+    // `currency` field, which this passes through unchanged.
+    currency: data.currency || null,
     totalKobo: toKobo(data.totalNaira),
     paidKobo: toKobo(data.paidNaira),
     balanceKobo: toKobo(data.balanceNaira),
@@ -318,6 +338,11 @@ const RECORD_MULTIPLE_TRANSACTIONS_TOOL = {
               },
               itemQuantity: { type: ['number', 'null'] },
               itemUnit: { type: ['string', 'null'] },
+              currency: {
+                type: ['string', 'null'],
+                enum: ['NGN', 'USD', 'GBP', 'EUR'],
+                description: "Only set when the handwritten line clearly shows a foreign-currency symbol/word (e.g. '$', '£'); leave null otherwise (assume the merchant's own account currency) — see the single-message tool's currency field for the same rule.",
+              },
               totalNaira: { type: 'number' },
               paidNaira: { type: 'number' },
               balanceNaira: { type: 'number' },

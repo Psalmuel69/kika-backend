@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const { pool } = require('../config/db');
 const queries = require('../db/queries');
-const { formatNaira } = require('./receiptService');
+const { formatAmount } = require('../utils/currency');
 const loyaltyService = require('./loyaltyService');
 const logger = require('../utils/logger');
 
@@ -73,6 +73,7 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, 
       paidKobo: parsedEntry.paidKobo,
       balanceKobo: parsedEntry.balanceKobo,
       balanceAfterKobo,
+      currency: parsedEntry.currency,
       rawMessage,
       whatsappMessageId,
       replyToWhatsappMessageId,
@@ -171,6 +172,7 @@ async function recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsap
       paidKobo: parsedEntry.paidKobo,
       balanceKobo: 0,
       balanceAfterKobo: settlementResult.rollingBalanceKobo,
+      currency: parsedEntry.currency,
       rawMessage,
       whatsappMessageId,
       replyToWhatsappMessageId,
@@ -191,7 +193,7 @@ async function recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsap
   };
 }
 
-async function buildBalanceSummaryText(merchantId) {
+async function buildBalanceSummaryText(merchantId, currency = 'NGN') {
   const [balance, debt] = await Promise.all([
     queries.getRunningBalance(merchantId),
     queries.getOutstandingDebtTotal(merchantId),
@@ -202,12 +204,12 @@ async function buildBalanceSummaryText(merchantId) {
   return [
     '*Kika Balance Summary*',
     '',
-    `Total In:  ${formatNaira(balance.total_in_kobo)}`,
-    `Total Out: ${formatNaira(balance.total_out_kobo)}`,
-    `Net:       ${formatNaira(netKobo)}`,
+    `Total In:  ${formatAmount(balance.total_in_kobo, currency)}`,
+    `Total Out: ${formatAmount(balance.total_out_kobo, currency)}`,
+    `Net:       ${formatAmount(netKobo, currency)}`,
     '',
     Number(debt.total_kobo) > 0
-      ? `\u26a0\ufe0f Outstanding debt owed to you: ${formatNaira(debt.total_kobo)} across ${debt.entry_count} entr${debt.entry_count === '1' ? 'y' : 'ies'}`
+      ? `\u26a0\ufe0f Outstanding debt owed to you: ${formatAmount(debt.total_kobo, currency)} across ${debt.entry_count} entr${debt.entry_count === '1' ? 'y' : 'ies'}`
       : '\u2705 No outstanding debt on record.',
   ].join('\n');
 }
@@ -217,7 +219,7 @@ async function buildBalanceSummaryText(merchantId) {
  * the day's sales, expenses, new debt issued, and top-moving items. Named
  * for the moment many informal merchants close shop and reconcile the day.
  */
-async function buildDailySunsetReportText(merchantId, dayStart, dayEnd) {
+async function buildDailySunsetReportText(merchantId, dayStart, dayEnd, currency = 'NGN') {
   const summary = await queries.getPeriodSummary(merchantId, dayStart, dayEnd);
   const netKobo = Number(summary.sales_kobo) - Number(summary.expenses_kobo);
 
@@ -225,13 +227,13 @@ async function buildDailySunsetReportText(merchantId, dayStart, dayEnd) {
     '*Kika Daily Sunset Report*',
     dayStart.toLocaleDateString('en-NG', { dateStyle: 'medium' }),
     '',
-    `Sales:    ${formatNaira(summary.sales_kobo)}`,
-    `Expenses: ${formatNaira(summary.expenses_kobo)}`,
-    `Net:      ${formatNaira(netKobo)}`,
+    `Sales:    ${formatAmount(summary.sales_kobo, currency)}`,
+    `Expenses: ${formatAmount(summary.expenses_kobo, currency)}`,
+    `Net:      ${formatAmount(netKobo, currency)}`,
   ];
 
   if (Number(summary.new_debt_kobo) > 0) {
-    lines.push(`New debt issued today: ${formatNaira(summary.new_debt_kobo)}`);
+    lines.push(`New debt issued today: ${formatAmount(summary.new_debt_kobo, currency)}`);
   }
 
   if (summary.topItems.length > 0) {
@@ -252,7 +254,7 @@ async function buildDailySunsetReportText(merchantId, dayStart, dayEnd) {
  * top customers, top products, and debt standing. Sent automatically on
  * the 1st of each month, or on demand via the INSIGHTS command.
  */
-async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, prevMonthStart, prevMonthEnd) {
+async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, prevMonthStart, prevMonthEnd, currency = 'NGN') {
   const [current, previous, debt] = await Promise.all([
     queries.getPeriodSummary(merchantId, monthStart, monthEnd),
     queries.getPeriodSummary(merchantId, prevMonthStart, prevMonthEnd),
@@ -274,16 +276,16 @@ async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, 
     '*Kika Monthly Insights*',
     monthStart.toLocaleDateString('en-NG', { month: 'long', year: 'numeric' }),
     '',
-    `Total Sales:    ${formatNaira(current.sales_kobo)}`,
-    `Total Expenses: ${formatNaira(current.expenses_kobo)}`,
-    `Net:            ${formatNaira(currentSales - Number(current.expenses_kobo))}`,
+    `Total Sales:    ${formatAmount(current.sales_kobo, currency)}`,
+    `Total Expenses: ${formatAmount(current.expenses_kobo, currency)}`,
+    `Net:            ${formatAmount(currentSales - Number(current.expenses_kobo), currency)}`,
     trendLine,
   ];
 
   if (current.topCustomers.length > 0) {
     lines.push('', '*Top customers this month:*');
     current.topCustomers.forEach((c, i) => {
-      lines.push(`${i + 1}. ${c.counterparty_name} \u2014 ${formatNaira(c.total_value_kobo)}`);
+      lines.push(`${i + 1}. ${c.counterparty_name} \u2014 ${formatAmount(c.total_value_kobo, currency)}`);
     });
   }
 
@@ -295,7 +297,7 @@ async function buildMonthlyInsightsReportText(merchantId, monthStart, monthEnd, 
   }
 
   if (Number(debt.total_kobo) > 0) {
-    lines.push('', `\u26a0\ufe0f Total outstanding debt: ${formatNaira(debt.total_kobo)}`);
+    lines.push('', `\u26a0\ufe0f Total outstanding debt: ${formatAmount(debt.total_kobo, currency)}`);
   }
 
   return lines.join('\n');

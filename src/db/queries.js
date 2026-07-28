@@ -12,6 +12,7 @@
  */
 
 const { query, withTransaction } = require('../config/db');
+const { resolveByPhoneNumber } = require('../config/countryCurrency');
 
 // Every merchant read joins subscription_tiers so callers get `plan`
 // (the tier name, e.g. 'Free'/'Standard'/'Premium') plus pricing/feature
@@ -80,12 +81,23 @@ async function findOrCreateMerchantByWhatsappNumber(whatsappNumber, whatsappDisp
   // onboarding_state 'PENDING_CONSENT' via the columns' own DEFAULTs —
   // the very first thing they see is the consent prompt, before any
   // ledger functionality is available to them.
+  //
+  // default_currency is resolved ONCE here, from the calling code of
+  // the WhatsApp number they signed up with (see
+  // src/config/countryCurrency.js's offline lookup table — no
+  // exchange-rate API, no per-message cost) — a +233 number gets GHS,
+  // a +254 number gets KES, and so on, falling back to NGN (Kika's
+  // original market) for a number whose calling code isn't recognized.
+  // Every receipt, invoice, report, and reply for this merchant from
+  // here on formats amounts in this currency (see utils/currency.js).
+  const { currencyCode } = resolveByPhoneNumber(whatsappNumber);
+
   const created = await query(
-    `INSERT INTO merchants (whatsapp_number, whatsapp_display_name)
-     VALUES ($1, $2)
+    `INSERT INTO merchants (whatsapp_number, whatsapp_display_name, default_currency)
+     VALUES ($1, $2, $3)
      ON CONFLICT (whatsapp_number) DO UPDATE SET whatsapp_number = EXCLUDED.whatsapp_number
      RETURNING id`,
-    [whatsappNumber, whatsappDisplayName || null]
+    [whatsappNumber, whatsappDisplayName || null, currencyCode]
   );
   return getMerchantById(created.rows[0].id);
 }
@@ -148,6 +160,21 @@ async function setMerchantBusinessName(merchantId, businessName) {
      WHERE id = $1 RETURNING id`,
     [merchantId, businessName]
   );
+  return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
+}
+
+/**
+ * Overrides a merchant's default_currency (see
+ * src/config/countryCurrency.js) — the calling-code-based guess made at
+ * signup is a heuristic, not ground truth: a merchant using a relative's
+ * foreign-registered SIM, or genuinely operating across a border, needs
+ * a way to correct it rather than being permanently stuck with a wrong
+ * assumption. Does NOT touch any already-recorded ledger_entries.currency
+ * values (past entries keep whatever currency they were actually
+ * recorded in) — only affects new entries/receipts/reports going forward.
+ */
+async function setMerchantCurrency(merchantId, currencyCode) {
+  const res = await query('UPDATE merchants SET default_currency = $2 WHERE id = $1 RETURNING id', [merchantId, currencyCode]);
   return res.rows[0] ? getMerchantById(res.rows[0].id) : null;
 }
 
@@ -304,6 +331,35 @@ async function startInvoiceFlow(merchantId, customerName, customerPhone = null) 
   );
 }
 
+/**
+ * Starts the invoice flow at the AWAITING_PHONE stage — used when the
+ * "new invoice for <name>" trigger didn't include a phone number, so
+ * Kika asks for one before moving on to item collection (see
+ * worker.js's startInvoiceCreation / handleInvoicePhoneReply). The
+ * customer's phone can then be saved against their record and shown on
+ * the invoice's "Billed to" block.
+ */
+async function startInvoiceAwaitingPhone(merchantId, customerName) {
+  await query(
+    `UPDATE merchants
+     SET invoice_awaiting_stage = 'AWAITING_PHONE', invoice_customer_name = $2, invoice_customer_phone = NULL, invoice_pending_items = '[]'::jsonb
+     WHERE id = $1`,
+    [merchantId, customerName]
+  );
+}
+
+/**
+ * Resolves the AWAITING_PHONE stage — records the customer's phone (or
+ * leaves it null if the merchant replied SKIP) and moves on to item
+ * collection.
+ */
+async function setInvoiceCustomerPhoneAndStartItems(merchantId, customerPhone) {
+  await query(
+    `UPDATE merchants SET invoice_customer_phone = $2, invoice_awaiting_stage = 'ITEMS' WHERE id = $1`,
+    [merchantId, customerPhone]
+  );
+}
+
 async function addInvoicePendingItem(merchantId, item) {
   const res = await query(
     `UPDATE merchants
@@ -442,6 +498,11 @@ async function createLedgerEntry(client, entry) {
       entry.paidKobo,
       entry.balanceKobo,
       entry.balanceAfterKobo ?? null,
+      // The merchant's own currency (see src/config/countryCurrency.js
+      // and queries.findOrCreateMerchantByWhatsappNumber) — every entry
+      // that reaches this point is already confirmed to be in that
+      // currency; a mismatched foreign-currency amount is caught and
+      // asked about BEFORE an entry ever gets this far (see worker.js).
       entry.currency || 'NGN',
       entry.balanceKobo <= 0,
       entry.rawMessage || null,
@@ -1439,7 +1500,7 @@ async function listOpenLedgerDisputes(merchantId) {
 
 // --- Audit log -------------------------------------------------------------
 
-// Column lengths mirrored from schema.sql's audit_logs table — any
+// Column lengths mirrored from src/db/migrations/0001_baseline.sql's audit_logs table — any
 // caller can hand this an arbitrarily long string (a webhook's raw
 // endpoint URL with Paystack's own reference/trxref query params
 // appended can easily run past 150 characters, well past 100 for a
@@ -1509,6 +1570,7 @@ module.exports = {
   markConsentDeclined,
   restartConsentFlow,
   setMerchantBusinessName,
+  setMerchantCurrency,
   setMerchantBusinessType,
   setMerchantName,
   getMerchantTransactionCount,
@@ -1524,6 +1586,8 @@ module.exports = {
   setReceiptDecisionAwaiting,
   resolvePendingReceiptDecision,
   startInvoiceFlow,
+  startInvoiceAwaitingPhone,
+  setInvoiceCustomerPhoneAndStartItems,
   addInvoicePendingItem,
   setInvoiceAwaitingStage,
   clearInvoiceFlow,

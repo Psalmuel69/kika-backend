@@ -5,9 +5,11 @@ const fssync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const sharp = require('sharp');
+const PDFDocument = require('pdfkit');
 const { v4: uuidv4 } = require('uuid');
 const queries = require('../db/queries');
 const logger = require('../utils/logger');
+const { formatAmountWithCents } = require('../utils/currency');
 
 // --- Fonts -------------------------------------------------------------
 //
@@ -76,16 +78,29 @@ const FONT_NAIRA = `'DejaVu Sans', sans-serif`;
 
 /**
  * Renders a "₦12,345.00"-style amount string as two <tspan>s sharing one
- * baseline: the ₦ sign in FONT_NAIRA (the only bundled font guaranteed
- * to have that glyph) and the digits/commas in FONT_BODY (Fira Code, so
- * the numerals still match the rest of the receipt). Works the same
- * whether the enclosing <text> is left- or right/end-anchored, since
- * anchoring is computed against the full text run, not each tspan.
+ * baseline: the currency symbol in FONT_NAIRA (DejaVu Sans, bundled
+ * specifically for its broad symbol coverage — this never falls back to
+ * a tofu box regardless of what fonts the host OS has installed) and the
+ * digits/commas/decimal point in FONT_BODY (Fira Code, so the numerals
+ * still match the rest of the receipt). Works the same whether the
+ * enclosing <text> is left- or right/end-anchored, since anchoring is
+ * computed against the full text run, not each tspan.
+ *
+ * The symbol is EVERY leading non-digit character, not just the first
+ * one — a currency symbol is not always a single glyph like "₦"/"$"/"£":
+ * see src/config/countryCurrency.js, where over 60 of the 150+
+ * currencies it covers use a multi-character symbol ("Sh" for
+ * KES/TZS/UGX, "Fr" for XOF/XAF, "R$" for BRL, "S/." for PEN, and so
+ * on). Splitting on the first DIGIT (rather than assuming exactly one
+ * leading character) is what correctly keeps a symbol like "Sh" whole
+ * instead of rendering "S" in one font and leaking the "h" into the
+ * numeral run in a different font.
  */
 function amountMarkup(amountStr, { fontSize, weight = 700 }) {
   const str = String(amountStr);
-  const symbol = str.charAt(0);
-  const rest = str.slice(1);
+  const match = str.match(/^(\D*)([\s\S]*)$/);
+  const symbol = match ? match[1] : str.charAt(0);
+  const rest = match ? match[2] : str.slice(1);
   return `<tspan font-family="${FONT_NAIRA}" font-size="${fontSize}" font-weight="${weight}">${escapeXml(symbol)}</tspan><tspan font-family="${FONT_BODY}" font-size="${fontSize}" font-weight="${weight}">${escapeXml(rest)}</tspan>`;
 }
 
@@ -610,7 +625,7 @@ function verifyFontsRenderable() {
  * multi-entry receipt (see below) can apply the exact same per-entry
  * logic to each entry in a batch before merging them into one item list.
  */
-function resolveDisplayItemsForEntry(ledgerEntry) {
+function resolveDisplayItemsForEntry(ledgerEntry, currency = ledgerEntry.currency || 'NGN') {
   // Both the AI parser and the regex fallback are now responsible for
   // always populating a clean, receipt-safe item name (see
   // aiTransactionParser.js's RECORD_TRANSACTION_TOOL and
@@ -628,14 +643,14 @@ function resolveDisplayItemsForEntry(ledgerEntry) {
       ...it,
       priceLabel:
         it.total_kobo != null
-          ? formatNaira(it.total_kobo)
+          ? formatAmountWithCents(it.total_kobo, currency)
           : it.unit_price_kobo != null && it.quantity != null
-            ? formatNaira(Number(it.unit_price_kobo) * Number(it.quantity))
-            : formatNaira(ledgerEntry.total_kobo),
+            ? formatAmountWithCents(Number(it.unit_price_kobo) * Number(it.quantity), currency)
+            : formatAmountWithCents(ledgerEntry.total_kobo, currency),
     }));
   }
   if (ledgerEntry.entry_type !== 'DEBT_SETTLEMENT') {
-    return [{ name: 'Item', priceLabel: formatNaira(ledgerEntry.total_kobo) }];
+    return [{ name: 'Item', priceLabel: formatAmountWithCents(ledgerEntry.total_kobo, currency) }];
   }
   return [];
 }
@@ -668,7 +683,14 @@ async function generateReceipt({ merchant, ledgerEntry, ledgerEntries }) {
   const logoDataUri = await loadDataUri(merchant.logo_file_path);
   const kikaWordmarkDataUri = await getKikaWordmarkDataUri();
 
-  const items = entries.flatMap((e) => resolveDisplayItemsForEntry(e));
+  // Every entry in a batch is always the merchant's own account
+  // currency by this point (a mismatched foreign-currency amount is
+  // caught and asked about before an entry is ever created — see
+  // worker.js), so the first entry's currency stands for the whole
+  // receipt, combined or not.
+  const currency = primaryEntry.currency || 'NGN';
+
+  const items = entries.flatMap((e) => resolveDisplayItemsForEntry(e, currency));
 
   const totalKobo = entries.reduce((sum, e) => sum + Number(e.total_kobo), 0);
   const paidKobo = entries.reduce((sum, e) => sum + Number(e.paid_kobo), 0);
@@ -707,9 +729,9 @@ async function generateReceipt({ merchant, ledgerEntry, ledgerEntries }) {
     reference: primaryEntry.id.slice(0, 8).toUpperCase(),
     timestampLabel: latestCreatedAt.toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }),
     items,
-    totalLabel: formatNaira(totalKobo),
-    paidLabel: formatNaira(paidKobo),
-    outstandingLabel: outstandingKobo != null ? formatNaira(outstandingKobo) : null,
+    totalLabel: formatAmountWithCents(totalKobo, currency),
+    paidLabel: formatAmountWithCents(paidKobo, currency),
+    outstandingLabel: outstandingKobo != null ? formatAmountWithCents(outstandingKobo, currency) : null,
     logoDataUri,
     tier: merchant.plan,
     kikaWordmarkDataUri,
@@ -923,17 +945,34 @@ function buildInvoiceSvg({
   const TOTALS_ROW_HEIGHT = 46;
   const totalsBlockX = MARGIN_X + CONTENT_WIDTH * 0.5;
   const GAP_BEFORE_TOTALS_MIN = 40;
-  const GAP_ABOVE_TOTAL_DIVIDER = 22;
-  const GAP_ABOVE_DUE_DIVIDER = 26;
+  // Clearance ABOVE a divider line (below the previous row's text
+  // baseline, allowing for descenders) and BELOW it (above the next
+  // row's text, allowing for ascenders) — kept as two separate
+  // constants, rather than one "gap" folded into TOTALS_ROW_HEIGHT, so a
+  // divider always sits in genuinely empty space instead of ever
+  // overlapping a row's own text. (A previous version computed this as
+  // `GAP - TOTALS_ROW_HEIGHT`, which for GAP < TOTALS_ROW_HEIGHT moved
+  // the divider UP into the row above instead of down into a gap below
+  // it — the cause of the strikethrough-looking lines through "Tax
+  // (0%)" and "Total" on generated invoices.)
+  const DIVIDER_CLEARANCE_ABOVE = 18;
+  const DIVIDER_CLEARANCE_BELOW = 34;
   const GAP_AFTER_TOTALS = 60;
   const FOOTER_NOTE_SIZE = 24;
   const FOOTER_SUBNOTE_SIZE = 21;
   const FOOTER_LINE_HEIGHT = 34;
-  const GAP_BEFORE_FOOTER_DIVIDER = 50;
-  const GAP_AFTER_FOOTER_DIVIDER = 44;
+  // Extra breathing room before the final divider and the "Powered by
+  // Kika" watermark, so neither crowds the "Please arrange payment..."
+  // note above it.
+  const GAP_BEFORE_FOOTER_DIVIDER = 72;
+  const GAP_AFTER_FOOTER_DIVIDER = 56;
   const BOTTOM_PAD = 60;
 
-  const totalsRowsHeight = 2 * TOTALS_ROW_HEIGHT + GAP_ABOVE_TOTAL_DIVIDER + TOTALS_ROW_HEIGHT + GAP_ABOVE_DUE_DIVIDER + TOTALS_ROW_HEIGHT;
+  // Four stacked rows (Subtotal, Tax, Total, Amount due) plus the two
+  // divider gaps in between — computed from the exact same constants the
+  // layout loop below uses, so the card's total height can never drift
+  // out of sync with how far the cursor actually travels.
+  const totalsRowsHeight = TOTALS_ROW_HEIGHT * 4 + (DIVIDER_CLEARANCE_ABOVE + DIVIDER_CLEARANCE_BELOW) * 2;
   const footerBlockHeight =
     FOOTER_LINE_HEIGHT + FOOTER_LINE_HEIGHT + GAP_BEFORE_FOOTER_DIVIDER + GAP_AFTER_FOOTER_DIVIDER + FOOTER_LINE_HEIGHT + BOTTOM_PAD;
   const bottomBlockHeight = totalsRowsHeight + GAP_AFTER_TOTALS + footerBlockHeight;
@@ -955,13 +994,13 @@ function buildInvoiceSvg({
   let totalsSvg = '';
   totalsSvg += totalsRow('Subtotal', subtotalLabel);
   totalsSvg += totalsRow('Tax (0%)', taxLabel);
-  ty += GAP_ABOVE_TOTAL_DIVIDER - TOTALS_ROW_HEIGHT;
+  ty += DIVIDER_CLEARANCE_ABOVE;
   const dividerAboveTotalY = ty;
-  ty += TOTALS_ROW_HEIGHT - (GAP_ABOVE_TOTAL_DIVIDER - TOTALS_ROW_HEIGHT);
+  ty += DIVIDER_CLEARANCE_BELOW;
   totalsSvg += totalsRow('Total', totalLabel, { weight: 700, color: T.ink });
-  ty += GAP_ABOVE_DUE_DIVIDER - TOTALS_ROW_HEIGHT;
+  ty += DIVIDER_CLEARANCE_ABOVE;
   const dividerAboveDueY = ty;
-  ty += TOTALS_ROW_HEIGHT - (GAP_ABOVE_DUE_DIVIDER - TOTALS_ROW_HEIGHT);
+  ty += DIVIDER_CLEARANCE_BELOW;
   totalsSvg += totalsRow('Amount due', totalLabel, { weight: 700, color: T.accent, valueSize: 30 });
 
   const footerTopY = ty + GAP_AFTER_TOTALS - TOTALS_ROW_HEIGHT;
@@ -999,6 +1038,71 @@ function buildInvoiceSvg({
 }
 
 /**
+ * Builds the invoice SVG for a given merchant/items — the shared source
+ * of truth behind BOTH generateInvoiceCard (image) and generateInvoicePdf
+ * (PDF) below, so the two formats are always visually identical and a
+ * fix to the layout (e.g. the totals-block spacing) only ever needs to
+ * happen in one place.
+ */
+async function buildInvoiceSvgForMerchant({ merchant, invoiceNumber, customerName, customerPhone, items, totalKobo, dueInDays = 14 }) {
+  // Logo badge is a Standard/Premium perk (see buildInvoiceSvg — Free
+  // tier shows no substitute mark here, unlike the receipt's watermark
+  // which brands every tier). Loading it unconditionally is harmless;
+  // buildInvoiceSvg itself gates on tier before ever using it.
+  const logoDataUri = await loadDataUri(merchant.logo_file_path);
+
+  const subtotalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
+
+  // An invoice is a document handed to the CUSTOMER, not a ledger
+  // entry — a merchant is free to bill any given customer in any
+  // currency that suits them (see ledgerParser.parseInvoiceItemLine's
+  // currency tagging), unlike an ordinary sale/expense, which is always
+  // recorded in the merchant's own account currency. Each item shows in
+  // whatever currency IT was stated in; the invoice-level totals use the
+  // first item's currency (invoices are expected to be single-currency
+  // in practice), falling back to the merchant's own account currency
+  // when nothing was stated explicitly.
+  const invoiceCurrency = items[0]?.currency || merchant.default_currency || 'NGN';
+
+  const displayItems = items.map((it) => {
+    const itemCurrency = it.currency || merchant.default_currency || 'NGN';
+    return {
+      name: it.name,
+      // "3 sacks @ ₦1,500/unit" — real per-unit context on its own line,
+      // rather than folded into the item name — since Qty/Rate now have
+      // their own dedicated columns (see buildInvoiceSvg).
+      descriptionLabel:
+        it.quantity != null && it.unitPriceKobo != null
+          ? `${it.quantity}${it.unit ? ` ${it.unit}` : ''} @ ${formatAmountWithCents(it.unitPriceKobo, itemCurrency)}/unit`
+          : null,
+      qtyLabel: it.quantity != null ? String(it.quantity) : '1',
+      rateLabel: it.unitPriceKobo != null ? formatAmountWithCents(it.unitPriceKobo, itemCurrency) : formatAmountWithCents(it.totalKobo, itemCurrency),
+      lineTotalLabel: formatAmountWithCents(it.totalKobo, itemCurrency),
+    };
+  });
+
+  const now = new Date();
+  const dueDate = new Date(now.getTime() + dueInDays * 24 * 3600 * 1000);
+  const dateFmt = { dateStyle: 'medium' };
+
+  return buildInvoiceSvg({
+    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name || 'Merchant',
+    businessPhone: merchant.whatsapp_number,
+    invoiceNumber: `${String(invoiceNumber).padStart(4, '0')}`,
+    issuedAt: now.toLocaleDateString('en-NG', dateFmt),
+    dueAt: dueDate.toLocaleDateString('en-NG', dateFmt),
+    customerName,
+    customerPhone,
+    logoDataUri,
+    tier: merchant.plan,
+    items: displayItems,
+    subtotalLabel: formatAmountWithCents(subtotalKobo, invoiceCurrency),
+    taxLabel: formatAmountWithCents(0, invoiceCurrency),
+    totalLabel: formatAmountWithCents(totalKobo, invoiceCurrency),
+  });
+}
+
+/**
  * Renders an invoice card — its own visual template (see buildInvoiceSvg
  * above), distinct from the receipt card: an invoice represents money
  * NOT yet collected, billed to a named customer, with Qty/Rate/Line
@@ -1020,47 +1124,7 @@ async function generateInvoiceCard({ merchant, invoiceNumber, customerName, cust
   const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
   await fs.mkdir(storageDir, { recursive: true });
 
-  // Logo badge is a Standard/Premium perk (see buildInvoiceSvg — Free
-  // tier shows no substitute mark here, unlike the receipt's watermark
-  // which brands every tier). Loading it unconditionally is harmless;
-  // buildInvoiceSvg itself gates on tier before ever using it.
-  const logoDataUri = await loadDataUri(merchant.logo_file_path);
-
-  const subtotalKobo = items.reduce((sum, it) => sum + Number(it.totalKobo), 0);
-
-  const displayItems = items.map((it) => ({
-    name: it.name,
-    // "3 sacks @ ₦1,500/unit" — real per-unit context on its own line,
-    // rather than folded into the item name — since Qty/Rate now have
-    // their own dedicated columns (see buildInvoiceSvg).
-    descriptionLabel:
-      it.quantity != null && it.unitPriceKobo != null
-        ? `${it.quantity}${it.unit ? ` ${it.unit}` : ''} @ ${formatNaira(it.unitPriceKobo)}/unit`
-        : null,
-    qtyLabel: it.quantity != null ? String(it.quantity) : '1',
-    rateLabel: it.unitPriceKobo != null ? formatNaira(it.unitPriceKobo) : formatNaira(it.totalKobo),
-    lineTotalLabel: formatNaira(it.totalKobo),
-  }));
-
-  const now = new Date();
-  const dueDate = new Date(now.getTime() + dueInDays * 24 * 3600 * 1000);
-  const dateFmt = { dateStyle: 'medium' };
-
-  const svg = buildInvoiceSvg({
-    businessName: merchant.business_name || merchant.whatsapp_display_name || merchant.display_name || 'Merchant',
-    businessPhone: merchant.whatsapp_number,
-    invoiceNumber: `${String(invoiceNumber).padStart(4, '0')}`,
-    issuedAt: now.toLocaleDateString('en-NG', dateFmt),
-    dueAt: dueDate.toLocaleDateString('en-NG', dateFmt),
-    customerName,
-    customerPhone,
-    logoDataUri,
-    tier: merchant.plan,
-    items: displayItems,
-    subtotalLabel: formatNaira(subtotalKobo),
-    taxLabel: formatNaira(0),
-    totalLabel: formatNaira(totalKobo),
-  });
+  const svg = await buildInvoiceSvgForMerchant({ merchant, invoiceNumber, customerName, customerPhone, items, totalKobo, dueInDays });
 
   const publicToken = crypto.randomBytes(24).toString('hex');
   const fileName = `${uuidv4()}.png`;
@@ -1086,4 +1150,63 @@ async function generateInvoiceCard({ merchant, invoiceNumber, customerName, cust
   return { url: safeUrl, receiptId: record.id, expiresAt };
 }
 
-module.exports = { generateReceipt, generateInvoiceCard, formatNaira };
+// 1 CSS/SVG pixel = 0.75 PDF points (72 points-per-inch \u00f7 96
+// pixels-per-inch, the standard CSS reference) \u2014 converts the SVG's
+// pixel canvas to PDF points 1:1, so the PDF page matches the rendered
+// image exactly (no extra whitespace, no cropping).
+const PDF_POINTS_PER_PIXEL = 0.75;
+
+/**
+ * Same invoice, as a single-page PDF instead of a PNG \u2014 same
+ * buildInvoiceSvgForMerchant source, rasterized once, then embedded as a
+ * full-page image in a PDF via pdfkit. One visual source of truth for
+ * both formats (see buildInvoiceSvgForMerchant's own comment): a layout
+ * fix only ever needs to happen in the SVG builder, never twice.
+ */
+async function generateInvoicePdf({ merchant, invoiceNumber, customerName, customerPhone, items, totalKobo, dueInDays = 14 }) {
+  verifyFontsRenderable();
+
+  const storageDir = process.env.RECEIPT_STORAGE_DIR || path.join(process.cwd(), 'public', 'receipts');
+  await fs.mkdir(storageDir, { recursive: true });
+
+  const svg = await buildInvoiceSvgForMerchant({ merchant, invoiceNumber, customerName, customerPhone, items, totalKobo, dueInDays });
+
+  const pngBuffer = await sharp(Buffer.from(svg)).png({ quality: 92 }).toBuffer();
+  const meta = await sharp(pngBuffer).metadata();
+  const pageWidth = meta.width * PDF_POINTS_PER_PIXEL;
+  const pageHeight = meta.height * PDF_POINTS_PER_PIXEL;
+
+  const publicToken = crypto.randomBytes(24).toString('hex');
+  const fileName = `${uuidv4()}.pdf`;
+  const filePath = path.join(storageDir, fileName);
+
+  await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: [pageWidth, pageHeight], margin: 0 });
+    const stream = fssync.createWriteStream(filePath);
+    doc.pipe(stream);
+    doc.image(pngBuffer, 0, 0, { width: pageWidth, height: pageHeight });
+    doc.end();
+    stream.on('finish', resolve);
+    stream.on('error', reject);
+  });
+
+  const ttlHours = Number(process.env.RECEIPT_URL_TTL_HOURS || 72);
+  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
+
+  const record = await queries.createReceiptRecord({
+    merchantId: merchant.id,
+    ledgerEntryId: null,
+    filePath,
+    publicToken,
+    expiresAt,
+  });
+
+  const baseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const safeUrl = `${baseUrl}/api/v1/receipts/${publicToken}.pdf`;
+
+  logger.info({ merchantId: merchant.id, invoiceNumber }, 'Invoice PDF generated');
+
+  return { url: safeUrl, receiptId: record.id, expiresAt };
+}
+
+module.exports = { generateReceipt, generateInvoiceCard, generateInvoicePdf, formatNaira };
