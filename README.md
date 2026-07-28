@@ -799,7 +799,8 @@ is equivalent to root on the VM, not just a read-only dashboard.
 ```bash
 npm install
 cp .env.example .env        # point DATABASE_URL/REDIS_URL at cloud or local
-npm run migrate               # applies schema.sql
+npm run migrate                # applies versioned migrations (src/db/migrations/) — safe to re-run
+npm test                        # runs the test suite (src/services' parsing/accounting/currency logic)
 npm run dev                    # API on :8080
 npm run worker                  # in a second terminal
 ```
