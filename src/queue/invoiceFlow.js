@@ -17,6 +17,7 @@ const queries = require('../db/queries');
 const receiptService = require('../services/receiptService');
 const whatsappService = require('../services/whatsappService');
 const ledgerParser = require('../services/ledgerParser');
+const invoiceItemExtractionService = require('../services/invoiceItemExtractionService');
 const engagementService = require('../services/engagementService');
 const logger = require('../utils/logger');
 const { formatAmount } = require('../utils/currency');
@@ -155,11 +156,21 @@ async function handleInvoiceItemsReply(merchant, whatsappNumber, rawMessage) {
     return;
   }
 
-  const item = ledgerParser.parseInvoiceItemLine(rawMessage);
+  let item = ledgerParser.parseInvoiceItemLine(rawMessage);
+  if (!item) {
+    // Doesn't match the standard "qty x name x price" template — rather
+    // than immediately rejecting it, give the AI one chance to
+    // recognize a genuine item description phrased differently (e.g.
+    // "3 bags of rice, 15k each"). The model is explicitly told to
+    // decline rather than guess when the message isn't really an item
+    // at all, so this never turns an unrelated message into a
+    // fabricated line item — see invoiceItemExtractionService.js.
+    item = await invoiceItemExtractionService.extractInvoiceItemWithAI(rawMessage);
+  }
   if (!item) {
     await whatsappService.sendTextMessage(
       whatsappNumber,
-      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (Quantity + item, then price PER ITEM), or type *done* when finished.'
+      'Didn\u2019t catch that \u2014 add items like "2 x iPhone charger x 4500" or "3 bags rice x 15k" (Quantity + item, then price PER ITEM), or type *done* when finished. Type HELP if you\u2019re not sure of the format.'
     );
     return;
   }

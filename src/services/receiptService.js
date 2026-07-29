@@ -889,12 +889,31 @@ function buildInvoiceSvg({
   // Column right-edges (Qty/Rate/Line total are right-aligned within
   // their own column, matching the reference); Service name + its
   // description line occupy the remaining left-hand space.
-  const totalColRightX = CARD_WIDTH - MARGIN_X;
-  const rateColRightX = totalColRightX - 190;
-  const qtyColRightX = rateColRightX - 170;
-  const serviceMaxWidth = qtyColRightX - 90 - MARGIN_X;
-
+  //
+  // Column WIDTHS are sized to the widest content they'll actually hold
+  // in THIS invoice (including the header label itself), not a fixed
+  // guess — a previous fixed-gap version sized Rate/Line total for
+  // "typical" amounts and ran them into each other whenever a real
+  // invoice had wider figures (e.g. "$200,000.00"; more digits, or a
+  // bold line-total weight, both need more room than a flat guess
+  // budgeted for). Fira Code is monospace, so estimateTextWidth's
+  // per-glyph estimate is exact — computing real column widths from it
+  // is reliable, not just "usually wide enough."
   const HEADER_SIZE = 22;
+  const ITEM_NAME_SIZE = 28;
+  const COLUMN_GAP = 32; // clear visual gap between adjacent right-aligned columns, regardless of content width
+  const qtyLabels = items.map((it) => it.qtyLabel).filter((v) => v != null);
+  const rateLabels = items.map((it) => it.rateLabel).filter(Boolean);
+  const totalLabels = items.map((it) => it.lineTotalLabel).filter(Boolean);
+
+  const qtyColWidth = Math.max(estimateTextWidth('QTY', HEADER_SIZE), ...qtyLabels.map((l) => estimateTextWidth(l, ITEM_NAME_SIZE)), 0);
+  const rateColWidth = Math.max(estimateTextWidth('RATE', HEADER_SIZE), ...rateLabels.map((l) => estimateTextWidth(l, ITEM_NAME_SIZE)), 0);
+  const totalColWidth = Math.max(estimateTextWidth('LINE TOTAL', HEADER_SIZE), ...totalLabels.map((l) => estimateTextWidth(l, ITEM_NAME_SIZE)), 0);
+
+  const totalColRightX = CARD_WIDTH - MARGIN_X;
+  const rateColRightX = totalColRightX - totalColWidth - COLUMN_GAP;
+  const qtyColRightX = rateColRightX - rateColWidth - COLUMN_GAP;
+  const serviceMaxWidth = qtyColRightX - qtyColWidth - COLUMN_GAP - MARGIN_X;
   const headerY = y + HEADER_SIZE;
   const headerSvg = `
   <text x="${MARGIN_X}" y="${headerY}" font-family="${FONT_BODY}" font-size="${HEADER_SIZE}" font-weight="700" fill="${T.inkMuted}">SERVICE</text>
@@ -905,7 +924,6 @@ function buildInvoiceSvg({
   const dividerAfterHeaderY = y;
   y += 40;
 
-  const ITEM_NAME_SIZE = 28;
   const ITEM_DESC_SIZE = 22;
   const ITEM_ROW_GAP = 34;
 

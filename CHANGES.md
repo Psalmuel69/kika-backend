@@ -4,6 +4,50 @@ This document summarizes everything changed in this session, organized by
 theme, for review purposes. Nothing here is meant to replace reading the
 actual diffs — it's a map, not a substitute.
 
+## 0. Latest round: reported bugs + Premium gating + AI fallback + help-guide referrals
+
+- **PDF generation bug, root-caused**: `generateInvoicePdf` was working
+  correctly the whole time — the actual bug was a missing `.pdf` route in
+  `receipts.routes.js` (only `.png` existed), so the generated PDF's URL
+  404'd when WhatsApp tried to fetch it. Added the route (shared handler
+  with `.png`, since the file on disk always has the real extension
+  either way).
+- **Invoice column collision, root-caused**: `buildInvoiceSvg`'s
+  Qty/Rate/Line-Total columns used a FIXED pixel gap (190px) sized for
+  "typical" amounts — a real invoice with wider figures (e.g.
+  `$200,000.00`) only had ~5px of actual clearance once glyph widths
+  were accounted for, causing the visible collision. Rewrote column
+  positioning to compute widths dynamically from each invoice's actual
+  content (reusing the file's existing monospace width estimator),
+  guaranteeing a real gap regardless of amount size. Covered by two new
+  regression tests, including one reconstructing the exact reported
+  numbers.
+- **Multi-currency logging is now Premium-gated**: both `SET CURRENCY`
+  and stating an amount in a currency other than the account's default
+  during ordinary logging now require Premium — a non-Premium merchant
+  gets a clear upsell message instead of being processed. A Premium
+  merchant's entry is recorded directly in the currency they actually
+  stated (genuine multi-currency bookkeeping), rather than being asked
+  to restate it. Invoices remain free-currency for every tier (they
+  don't touch the merchant's own accounting). The logbook-scan pipeline
+  (already Premium-only) was updated to match, including fixing its
+  "Total Inflows" summary to aggregate per-currency instead of summing
+  raw kobo across what could now be different currencies.
+- **AI fallback for invoice items**: a free-form invoice-item reply that
+  doesn't match the standard "quantity x name x price" template now
+  gets one AI extraction attempt (`invoiceItemExtractionService.js`)
+  before falling back to "didn't catch that" — the model is explicitly
+  instructed to decline rather than guess when a message isn't really
+  an item at all, so this never fabricates a line item from an
+  unrelated message.
+- **"Refer to HELP, don't claim false success"**: the system prompt's
+  existing "never claim you recorded something you didn't" rule was
+  broadened to cover any action (invoices, stock, settings — not just
+  ordinary entries) and now explicitly requires pointing to HELP when
+  the model can't confidently tell what the merchant wants, rather than
+  guessing at the action. The AI-call-failure fallback message and the
+  new invoice-item fallback message both now point to HELP too.
+
 ## 1. Multi-country / multi-currency support
 
 - **`src/config/countryCurrency.js`** (new) — an offline, static lookup
@@ -140,8 +184,6 @@ Flagged clearly rather than rushed:
   and `businessContextService.js` still hardcode ₦ — lower-traffic
   surfaces (Premium-only digest, hosted full report, CSV export,
   internal AI context) not yet threaded with the merchant's currency.
-- No allowlist for a merchant who genuinely operates in two currencies
-  (every mismatch currently prompts a clarification, every time).
 - `formatAmount`'s "format to a string, then re-split the string by
   regex to pick a font" design is still fragile in principle, even
   though the concrete bug it caused is fixed and now tested.
@@ -157,3 +199,9 @@ Flagged clearly rather than rushed:
   from any country is recognized, but a bare local-format number from a
   country other than Nigeria (e.g. Ghana's own "0" + 9-digit shorthand)
   is not specifically pattern-matched.
+- Free-form AI fallback currently covers invoice items specifically
+  (see section 0 above) and ordinary ledger entries (which already had
+  AI escalation before this session). It has not been extended to
+  every other structured command (ADD STOCK, CLOSING HOUR, etc.) — those
+  still ask the merchant to retry in the stated format rather than
+  attempting an AI-assisted extraction.

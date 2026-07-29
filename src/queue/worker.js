@@ -83,6 +83,17 @@ function buildTimeAwareGreeting(merchant) {
 const ENTRY_ACTION_WORD = { CREDIT: 'sale', DEBT: 'credit sale', DEBIT: 'expense', DEBT_SETTLEMENT: 'payment' };
 
 /**
+ * True if a merchant's active plan is Premium — the tier gate for
+ * multi-currency logging/SET CURRENCY, logbook photo scanning, and
+ * other Premium-only capabilities. Case-insensitive since `plan` comes
+ * from the subscription_tiers.name column, whose exact casing isn't
+ * guaranteed at every call site.
+ */
+function isPremiumMerchant(merchant) {
+  return String(merchant.plan || '').toUpperCase() === 'PREMIUM';
+}
+
+/**
  * Describes the item(s) for one ledger entry the way a person would say
  * it out loud — "2 bags of rice", "3 cartons of indomie", or just
  * "Fuel" when there's no quantity/unit at all. Entries always have a
@@ -991,9 +1002,19 @@ const ledgerWorker = new Worker(
     // code (see src/config/countryCurrency.js). That guess is a
     // heuristic, not ground truth, so this exists as an explicit
     // correction path rather than leaving a merchant permanently stuck
-    // with a wrong assumption.
+    // with a wrong assumption — but changing/using a non-default
+    // currency at all is a Premium capability (see isPremiumMerchant),
+    // same as logging entries in a currency other than the account's
+    // own (handled further down this pipeline).
     const setCurrencyParsed = ledgerParser.parseSetCurrencyCommand(rawMessage);
     if (setCurrencyParsed) {
+      if (!isPremiumMerchant(merchant)) {
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          "Setting a different account currency is a Premium feature. Reply UPGRADE to see the plans, or type HELP to see what's available on your current plan."
+        );
+        return;
+      }
       await queries.setMerchantCurrency(merchantId, setCurrencyParsed.currencyCode);
       const symbol = getCurrencySymbol(setCurrencyParsed.currencyCode);
       await whatsappService.sendTextMessage(
@@ -1125,25 +1146,23 @@ const ledgerWorker = new Worker(
         return;
       }
 
-      let totalInflowKobo = 0;
+      // Per-currency, not a single sum — Premium multi-currency scanning
+      // (see above) means these entries can genuinely be in different
+      // currencies; summing raw kobo across currencies would produce a
+      // meaningless number (₦-kobo + $-kobo is not a real amount of
+      // either currency).
+      const inflowKoboByCurrency = {};
       let debtCount = 0;
       let rejectedLines = 0;
       const itemLines = [];
       for (const candidate of transactions) {
-        // A scanned line stated in a currency other than the
-        // merchant's own account currency is skipped, same as a
-        // misread line — see the currency-mismatch note on the
-        // single-message path above (this is the batch-scan
-        // equivalent: asking for clarification on every mismatched
-        // line in a whole page of scanned entries would be far more
-        // disruptive than just asking the merchant to type that one in
-        // manually).
-        if (candidate.currency && candidate.currency !== merchant.default_currency) {
-          rejectedLines += 1;
-          logger.warn({ candidateCurrency: candidate.currency, merchantCurrency: merchant.default_currency }, 'Scanned logbook line currency mismatch — skipped');
-          continue;
-        }
-        candidate.currency = merchant.default_currency;
+        // Logbook photo scanning is already a Premium-only feature (see
+        // the gate above this block), and logging in a currency other
+        // than the account default is the same Premium capability as
+        // the single-message path — so a scanned line stated in a
+        // different currency is recorded exactly as stated, not skipped
+        // or forced into the account default.
+        if (!candidate.currency) candidate.currency = merchant.default_currency;
 
         // Same trust boundary as the single-message path: every AI-read
         // line passes the deterministic accounting engine or is skipped
@@ -1164,9 +1183,11 @@ const ledgerWorker = new Worker(
           }
           return queries.createLedgerEntry(client, { merchantId, ...t, balanceAfterKobo, rawMessage: '[logbook scan]' });
         });
-        if (t.entryType === 'CREDIT') totalInflowKobo += t.paidKobo;
+        if (t.entryType === 'CREDIT') {
+          inflowKoboByCurrency[t.currency] = (inflowKoboByCurrency[t.currency] || 0) + t.paidKobo;
+        }
         if (t.entryType === 'DEBT') debtCount += 1;
-        itemLines.push(`\u2022 ${t.description} \u2014 ${formatAmount(t.totalKobo, merchant.default_currency)}`);
+        itemLines.push(`\u2022 ${t.description} \u2014 ${formatAmount(t.totalKobo, t.currency)}`);
       }
 
       if (itemLines.length === 0) {
@@ -1177,9 +1198,17 @@ const ledgerWorker = new Worker(
       await connection.set(`kika:lastscan:${merchantId}`, JSON.stringify(itemLines), 'EX', 3600);
       await auditLogService.logEvent({ merchantId, actorType: 'MERCHANT', actorId: whatsappNumber, action: 'logbook_scan.completed', metadata: { recorded: itemLines.length, rejected: rejectedLines } });
 
+      const inflowCurrencies = Object.keys(inflowKoboByCurrency);
+      const totalInflowsLine =
+        inflowCurrencies.length === 0
+          ? `Total Inflows: ${formatAmount(0, merchant.default_currency)}`
+          : inflowCurrencies.length === 1
+            ? `Total Inflows: ${formatAmount(inflowKoboByCurrency[inflowCurrencies[0]], inflowCurrencies[0])}`
+            : `Total Inflows:\n${inflowCurrencies.map((cur) => `  ${formatAmount(inflowKoboByCurrency[cur], cur)}`).join('\n')}`;
+
       await whatsappService.sendTextMessage(
         whatsappNumber,
-        `Scan complete! Kika AI recorded *${itemLines.length} transaction${itemLines.length === 1 ? '' : 's'}* from your paper log sheet.${rejectedLines > 0 ? `\n(${rejectedLines} line${rejectedLines === 1 ? '' : 's'} couldn't be read clearly enough to record safely \u2014 you can type ${rejectedLines === 1 ? 'it' : 'them'} in manually.)` : ''}\n\n*Quick Summary:*\nTotal Inflows: ${formatAmount(totalInflowKobo, merchant.default_currency)}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
+        `Scan complete! Kika AI recorded *${itemLines.length} transaction${itemLines.length === 1 ? '' : 's'}* from your paper log sheet.${rejectedLines > 0 ? `\n(${rejectedLines} line${rejectedLines === 1 ? '' : 's'} couldn't be read clearly enough to record safely \u2014 you can type ${rejectedLines === 1 ? 'it' : 'them'} in manually.)` : ''}\n\n*Quick Summary:*\n${totalInflowsLine}\nDebts Logged: ${debtCount} profile${debtCount === 1 ? '' : 's'} updated.\n\nTo review the individual breakdown lines, reply with: *REVIEW SCAN*`
       );
       return;
     }
@@ -1299,27 +1328,37 @@ const ledgerWorker = new Worker(
       return;
     }
 
-    // --- Currency-mismatch check: a merchant explicitly stating an
-    // amount in a currency OTHER than their own account currency (e.g.
-    // "$500" from a merchant whose account is set up in Naira) is asked
-    // to restate it in their own currency, rather than Kika guessing at
-    // a conversion — this is a rare case (see
-    // src/config/countryCurrency.js for how the merchant's own currency
-    // was determined at signup, and ledgerParser.js's
+    // --- Currency check: a merchant explicitly stating an amount in a
+    // currency OTHER than their own account currency (e.g. "$500" from
+    // a merchant whose account is set up in Naira) — this is a rare
+    // case (see src/config/countryCurrency.js for how the merchant's own
+    // currency was determined at signup, and ledgerParser.js's
     // resolveCurrencyCode for how a stated currency is detected).
     // `parsed.currency` is null for the overwhelming common case (no
     // currency symbol/word used at all), which just means "this is
-    // already in the merchant's own currency" — nothing to check, and
-    // nothing is recorded here either way until it's confirmed to match.
+    // already in the merchant's own currency" — nothing to check.
+    //
+    // Logging in a currency other than the account's default is a
+    // Premium capability (same as SET CURRENCY above) — a non-Premium
+    // merchant is told so rather than silently guessing or converting.
+    // A Premium merchant's entry is recorded directly in the currency
+    // they actually stated (genuine multi-currency bookkeeping, not a
+    // mismatch needing correction) — never converted to the account
+    // default, and never blocked on a clarifying question.
     if (parsed.currency && parsed.currency !== merchant.default_currency) {
-      const merchantSymbol = getCurrencySymbol(merchant.default_currency);
-      await whatsappService.sendTextMessage(
-        whatsappNumber,
-        `That looks like it's in ${parsed.currency}, but your Kika account is set up in ${merchant.default_currency} (${merchantSymbol}) \u2014 could you resend the amount in ${merchant.default_currency} instead?`
-      );
-      return;
+      if (!isPremiumMerchant(merchant)) {
+        const merchantSymbol = getCurrencySymbol(merchant.default_currency);
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `Logging an entry in a different currency (${parsed.currency}) is a Premium feature \u2014 your account is set up in ${merchant.default_currency} (${merchantSymbol}). Reply UPGRADE to see the plans, or resend this amount in ${merchant.default_currency} to log it now.`
+        );
+        return;
+      }
+      // Premium: keep parsed.currency exactly as stated — this entry is
+      // genuinely recorded in that currency, not the account default.
+    } else {
+      parsed.currency = merchant.default_currency;
     }
-    parsed.currency = merchant.default_currency;
 
     // --- Stage 5: the deterministic accounting engine. EVERY candidate —
     // regex or Gemini — has its money math recomputed and business rules

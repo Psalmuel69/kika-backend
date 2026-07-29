@@ -42,26 +42,30 @@ function sendFileOrGone(req, res, resolvedPath, notFoundLabel) {
 }
 
 /**
- * Serves a receipt PNG by its random 48-hex-char public token — never by
- * database ID or filesystem path, so there is no sequential ID to
- * enumerate and no user-controlled path segment reaches the filesystem.
+ * Serves a receipt/invoice by its random 48-hex-char public token —
+ * never by database ID or filesystem path, so there is no sequential ID
+ * to enumerate and no user-controlled path segment reaches the
+ * filesystem. Shared by both the .png (sales/debt receipts, and
+ * image-format invoices) and .pdf (PDF-format invoices — see
+ * receiptService.generateInvoicePdf) routes below: the actual file on
+ * disk always has the real matching extension regardless of which route
+ * served it, so res.sendFile sets the correct Content-Type either way.
  */
-router.get(
-  '/receipts/:token.png',
-  receiptFetchLimiter,
-  [param('token').isHexadecimal().isLength({ min: 48, max: 48 })],
-  validate,
-  asyncHandler(async (req, res) => {
-    const receipt = await queries.getReceiptByToken(req.params.token);
-    if (!receipt) return res.status(404).json({ error: 'Receipt not found or expired' });
+async function handleReceiptTokenRequest(req, res) {
+  const receipt = await queries.getReceiptByToken(req.params.token);
+  if (!receipt) return res.status(404).json({ error: 'Receipt not found or expired' });
 
-    const resolvedPath = resolveSafePath(receipt.file_path);
-    if (!resolvedPath) return res.status(400).json({ error: 'Invalid receipt path' });
+  const resolvedPath = resolveSafePath(receipt.file_path);
+  if (!resolvedPath) return res.status(400).json({ error: 'Invalid receipt path' });
 
-    res.set('Cache-Control', 'private, max-age=3600');
-    return sendFileOrGone(req, res, resolvedPath, 'Receipt');
-  })
-);
+  res.set('Cache-Control', 'private, max-age=3600');
+  return sendFileOrGone(req, res, resolvedPath, 'Receipt');
+}
+
+const tokenParamValidation = [param('token').isHexadecimal().isLength({ min: 48, max: 48 })];
+
+router.get('/receipts/:token.png', receiptFetchLimiter, tokenParamValidation, validate, asyncHandler(handleReceiptTokenRequest));
+router.get('/receipts/:token.pdf', receiptFetchLimiter, tokenParamValidation, validate, asyncHandler(handleReceiptTokenRequest));
 
 /**
  * Serves a Monthly Digest card PNG — same unguessable-token model as
