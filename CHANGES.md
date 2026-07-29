@@ -4,7 +4,50 @@ This document summarizes everything changed in this session, organized by
 theme, for review purposes. Nothing here is meant to replace reading the
 actual diffs — it's a map, not a substitute.
 
-## -1. Latest round: multi-transaction data loss, voice notes, email-collection timing
+## -2. Latest round: the multi-transaction feature was silently only saving entry #1
+
+The multi-transaction extraction added in the previous round (see
+section -1 below) correctly identified every transaction in a message,
+said so out loud ("Found 7 separate transactions..."), but only the
+FIRST one was ever actually written to the database — the receipt and
+the final confirmation both only ever reflected one entry.
+
+Root cause: `ledger_entries` had a plain `UNIQUE` index on
+`whatsapp_message_id` alone, built back when "one inbound WhatsApp
+message -> at most one ledger entry" was always true (its purpose is to
+block a genuine duplicate webhook delivery from double-logging a
+transaction). Once one message could legitimately produce several
+entries, the second entry's insert violated that constraint and threw —
+crashing the whole job. The job queue automatically retried it, and on
+retry, the very first check in the pipeline ("has this message already
+produced an entry?") found the one entry that succeeded before the
+crash and gave up on the entire message, silently, before ever
+attempting entries 2 onward again.
+
+Fixed via a new migration
+(`src/db/migrations/0002_multi_transaction_message_sequence.sql`):
+added a `message_sequence_index` column (0 for an ordinary
+single-transaction message, 0..N-1 for a split message) and made the
+uniqueness constraint composite — `(whatsapp_message_id,
+message_sequence_index)` — so it still fully blocks a genuine duplicate
+delivery of the same message while allowing several legitimate entries
+from one message. Threaded through `queries.createLedgerEntry` ->
+`ledgerService.recordLedgerEntryAndReceipt`/`recordDebtSettlement` ->
+`worker.js`'s `commitParsedEntry` and the multi-transaction commit loop.
+Also wrapped each individual commit in the multi-transaction loop in
+its own try/catch, so a transient failure on ONE transaction can never
+crash the whole batch (which would trigger the same
+already-partially-exists retry problem for a different reason). Two new
+regression tests prove the fix, including one that directly verifies
+`createLedgerEntry` receives a distinct sequence index for every entry
+in a batch sharing one inbound message.
+
+The Premium logbook-photo-scan feature was checked and confirmed
+unaffected — it never sets `whatsapp_message_id` on its entries (they're
+NULL, which the unique index explicitly exempts), so it was never
+subject to this bug.
+
+## -1. Earlier round: multi-transaction data loss, voice notes, email-collection timing
 
 - **Multi-transaction extraction (severe bug, now fixed)**: a free-form
   message describing SEVERAL distinct transactions (e.g. a whole day

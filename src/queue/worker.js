@@ -579,7 +579,17 @@ async function handlePendingSameCustomerReply(merchant, whatsappNumber, rawMessa
  * ENTRY_ACK_TEXT below), wires up the outbound wamid for future
  * reply-context resolution, and surfaces any operational alerts.
  */
-async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source }) {
+async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source, messageSequenceIndex = 0 }) {
+  // 0 for an ordinary single-transaction message (the overwhelming
+  // common case); 0..N-1 when this entry is one of SEVERAL split out
+  // of one multi-transaction message — see the 'ai-multi' commit loop
+  // below, and migration 0002 for why this exists: without a distinct
+  // index per entry, two entries sharing the same inbound
+  // whatsapp_message_id would collide with the unique index meant to
+  // catch a genuine duplicate webhook delivery, not a legitimate
+  // second (or third, ...) entry from one message.
+  entry.messageSequenceIndex = messageSequenceIndex;
+
   // The AI path classifies DEBIT expenses itself; the regex path never
   // does — backfill via the same keyword/AI classifier either way.
   if (entry.entryType === 'DEBIT' && !entry.expenseCategory) {
@@ -1363,7 +1373,7 @@ const ledgerWorker = new Worker(
           `Found ${total} separate transactions in that \u2014 logging them one by one.`
         );
 
-        for (const candidate of aiResult.parsedMultiple) {
+        for (const [index, candidate] of aiResult.parsedMultiple.entries()) {
           if (!resolveEntryCurrencyOrBlock(candidate, merchant)) {
             blockedByCurrency = true;
             continue; // told about this once, collectively, after the loop
@@ -1374,17 +1384,43 @@ const ledgerWorker = new Worker(
             logger.warn({ jobId: job.id, reason: verdict.reason }, 'One transaction in a multi-transaction message was rejected — skipped');
             continue;
           }
-          await commitParsedEntry({
-            job,
-            merchant,
-            whatsappNumber,
-            entry: verdict.entry,
-            rawMessage,
-            whatsappMessageId,
-            replyToWhatsappMessageId,
-            source: 'ai-multi',
-          });
-          committed += 1;
+          try {
+            await commitParsedEntry({
+              job,
+              merchant,
+              whatsappNumber,
+              entry: verdict.entry,
+              rawMessage,
+              whatsappMessageId,
+              replyToWhatsappMessageId,
+              source: 'ai-multi',
+              // Every entry split out of this ONE inbound message needs
+              // its own sequence index (0, 1, 2, ...) — otherwise the
+              // second entry onward would all share the same
+              // whatsapp_message_id and collide with the unique index
+              // meant to catch a genuine duplicate webhook delivery, not
+              // a legitimate second/third/... entry from the same
+              // message. This was the exact root cause of only the FIRST
+              // of several transactions ever being recorded: the second
+              // insert's constraint violation crashed the job, and the
+              // automatic retry then saw entry #1 already existed and
+              // gave up on the whole message, silently, before ever
+              // attempting entries 2+ again. See migration 0002.
+              messageSequenceIndex: index,
+            });
+            committed += 1;
+          } catch (err) {
+            // A failure writing ONE entry (a transient DB blip, a
+            // WhatsApp send failure, anything) must never crash the
+            // whole loop — that would throw out of this job entirely,
+            // triggering a retry that (per the duplicate-message guard
+            // at the top of this function) would see the entries that
+            // DID succeed and abandon the retry before ever giving the
+            // remaining ones another chance. Every entry gets its own
+            // independent shot; one failing is reported, not fatal.
+            rejectedByValidator += 1;
+            logger.error({ jobId: job.id, err: err.message, index }, 'Failed to commit one transaction from a multi-transaction message — skipped, continuing with the rest');
+          }
         }
 
         if (committed === 0) {

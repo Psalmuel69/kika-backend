@@ -78,6 +78,11 @@ async function recordLedgerEntryAndReceipt({ merchant, parsedEntry, rawMessage, 
       whatsappMessageId,
       replyToWhatsappMessageId,
       expenseCategory: parsedEntry.expenseCategory || null,
+      // 0 for an ordinary single-transaction message; 0..N-1 when this
+      // entry is one of SEVERAL split out of one multi-transaction
+      // message (see worker.js) — see migration 0002 for why this
+      // exists on createLedgerEntry.
+      messageSequenceIndex: parsedEntry.messageSequenceIndex ?? 0,
     });
     // COMMIT happens automatically here as withTransaction's callback
     // resolves; the lock acquired above is held for the entire block
@@ -176,6 +181,7 @@ async function recordDebtSettlement({ merchant, parsedEntry, rawMessage, whatsap
       rawMessage,
       whatsappMessageId,
       replyToWhatsappMessageId,
+      messageSequenceIndex: parsedEntry.messageSequenceIndex ?? 0,
     });
 
     return { settlementResult, ledgerEntry };

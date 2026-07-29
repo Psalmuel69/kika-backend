@@ -484,8 +484,8 @@ async function createLedgerEntry(client, entry) {
     `INSERT INTO ledger_entries
        (merchant_id, entry_type, counterparty_name, counterparty_phone, description, items,
         total_kobo, paid_kobo, balance_kobo, balance_after_kobo, currency, is_settled, raw_message,
-        whatsapp_message_id, reply_to_whatsapp_message_id, expense_category)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        whatsapp_message_id, reply_to_whatsapp_message_id, expense_category, message_sequence_index)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      RETURNING *`,
     [
       entry.merchantId,
@@ -509,6 +509,14 @@ async function createLedgerEntry(client, entry) {
       entry.whatsappMessageId || null,
       entry.replyToWhatsappMessageId || null,
       entry.expenseCategory || null,
+      // 0 for an ordinary single-transaction message (the overwhelming
+      // common case); 0..N-1 when one message legitimately splits into
+      // several transactions (see worker.js's multi-transaction commit
+      // loop) — see migration 0002 for why this exists: without it,
+      // the second+ entry sharing the same whatsapp_message_id would
+      // collide with the very index meant to catch a genuine duplicate
+      // webhook delivery, not a legitimate second entry from one message.
+      entry.messageSequenceIndex ?? 0,
     ]
   );
   return res.rows[0];
