@@ -4,7 +4,51 @@ This document summarizes everything changed in this session, organized by
 theme, for review purposes. Nothing here is meant to replace reading the
 actual diffs — it's a map, not a substitute.
 
-## 0. Latest round: reported bugs + Premium gating + AI fallback + help-guide referrals
+## -1. Latest round: multi-transaction data loss, voice notes, email-collection timing
+
+- **Multi-transaction extraction (severe bug, now fixed)**: a free-form
+  message describing SEVERAL distinct transactions (e.g. a whole day
+  recapped in one message — several expenses, several sales) was
+  silently recording only ONE of them and dropping the rest, with no
+  indication anything was missed. Root cause: the AI escalation path
+  could only ever call a tool that proposes a single transaction, and
+  the system prompt explicitly instructed the model to pick just one
+  when several were described. Fixed by:
+  - Giving the model a genuine choice between `record_transaction`
+    (one) and `record_multiple_transactions` (several) on every text
+    message escalation, not just the existing Premium photo-scan
+    feature.
+  - Rewriting the system prompt section that was actively causing this
+    (see `src/config/aiPersona.js`), replacing "a message can only be
+    ONE entry type" with explicit guidance on recognizing and splitting
+    multiple transactions.
+  - `worker.js` now validates and commits every extracted transaction
+    independently (same `entryValidator`/currency-gate/`commitParsedEntry`
+    machinery as a single entry — no relaxed trust boundary), with a
+    clear "Found N transactions, logging them one by one" message and
+    honest reporting of anything skipped, never silent data loss.
+  - Also fixed the underlying "item name became a fragment of the raw
+    sentence" quality bug (e.g. "Just Received" as an item name) via
+    explicit system-prompt guidance on description/item-name quality.
+  - Two new regression tests reconstruct the exact reported scenarios
+    end to end (schema validation → normalization → entryValidator),
+    confirming every transaction now survives.
+  - Also fixed a stale currency-handling paragraph in the system prompt
+    that still described the abandoned live-exchange-rate-conversion
+    approach from earlier in this session, instead of the current
+    calling-code-based default-currency design.
+- **Voice notes gated to Standard/Premium**: checked before the (paid,
+  per-call) transcription API is ever invoked — a Free-tier merchant's
+  audio now gets a plain upsell message instead of being transcribed.
+- **Email-collection nudge timing**: previously fired synchronously,
+  immediately after a logging session's receipt Yes/No resolved — no
+  pause at all, reading as Kika talking over itself. Now scheduled as a
+  genuinely delayed BullMQ job (~1 minute later, on the same queue/
+  worker already running), with the actual NPS/email-milestone
+  condition re-checked fresh when the delayed job fires rather than
+  trusting a stale snapshot from a minute earlier.
+
+## 0. Previous round: reported bugs + Premium gating + AI fallback + help-guide referrals
 
 - **PDF generation bug, root-caused**: `generateInvoicePdf` was working
   correctly the whole time — the actual bug was a missing `.pdf` route in
@@ -205,3 +249,10 @@ Flagged clearly rather than rushed:
   every other structured command (ADD STOCK, CLOSING HOUR, etc.) — those
   still ask the merchant to retry in the stated format rather than
   attempting an AI-assisted extraction.
+- The multi-transaction extraction path (see section -1 above) has no
+  per-transaction confidence gate — it inherits the same trust boundary
+  as the existing Premium logbook-scan feature (schema validation +
+  entryValidator, no confidence score to threshold against), rather
+  than the single-transaction path's explicit confidence check. Worth
+  revisiting if false-positive transaction splitting turns out to be a
+  real problem in practice.

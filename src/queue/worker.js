@@ -3,6 +3,7 @@
 require('dotenv').config();
 const { Worker } = require('bullmq');
 const { connection } = require('../config/redis');
+const { ledgerQueue } = require('./queues');
 const logger = require('../utils/logger');
 const queries = require('../db/queries');
 const ledgerParser = require('../services/ledgerParser');
@@ -91,6 +92,28 @@ const ENTRY_ACTION_WORD = { CREDIT: 'sale', DEBT: 'credit sale', DEBIT: 'expense
  */
 function isPremiumMerchant(merchant) {
   return String(merchant.plan || '').toUpperCase() === 'PREMIUM';
+}
+
+/**
+ * Resolves (and mutates in place) a candidate entry's currency against
+ * the merchant's own account currency — shared by both the single- and
+ * multi-transaction paths below. Returns true if the entry is fine to
+ * proceed (currency resolved, possibly to a stated foreign currency for
+ * a Premium merchant), or false if it was blocked (a non-Premium
+ * merchant tried to log in a different currency — the caller is
+ * responsible for telling them so and NOT proceeding with this entry).
+ * See the Premium-gating note where this used to live inline for the
+ * full reasoning.
+ */
+function resolveEntryCurrencyOrBlock(parsedEntry, merchant) {
+  if (parsedEntry.currency && parsedEntry.currency !== merchant.default_currency) {
+    if (!isPremiumMerchant(merchant)) return false;
+    // Premium: keep parsedEntry.currency exactly as stated — this entry
+    // is genuinely recorded in that currency, not the account default.
+    return true;
+  }
+  parsedEntry.currency = merchant.default_currency;
+  return true;
 }
 
 /**
@@ -210,15 +233,36 @@ async function askReceiptDecision(merchant, whatsappNumber) {
 
 /**
  * Engagement nudges (NPS survey, weekly email-collection nudge) are
- * checked here — once the receipt decision for a logging session has
- * fully resolved — rather than per entry or alongside the receipt
- * question itself. Firing one here would stack awkwardly with the
- * receipt Y/N prompt (whose button the merchant might tap only after
- * answering an NPS question first, or vice versa); waiting until this
- * flow is completely done keeps exactly one open question at a time.
+ * never sent immediately back-to-back with the receipt decision that
+ * just resolved — that reads as Kika talking over itself (a receipt
+ * image or "no problem" message, instantly followed by an unrelated
+ * survey/email ask). Instead, this schedules the actual check-and-send
+ * (sendEngagementNudgeIfDue below) as a delayed job on the SAME queue
+ * this worker already processes, firing ~1 minute later — enough of a
+ * pause to feel like a separate, deliberate follow-up rather than a
+ * pile-on. The condition itself (has this merchant hit an NPS trigger,
+ * or the weekly email-collection milestone?) is evaluated fresh WHEN
+ * THE DELAYED JOB FIRES, not now — merchant state a minute from now
+ * (did they reply to something else first? did their onboarding state
+ * change?) is what actually matters, not a stale snapshot taken here.
+ */
+const ENGAGEMENT_NUDGE_DELAY_MS = 60 * 1000;
+
+async function scheduleEngagementNudge(merchant, whatsappNumber) {
+  try {
+    await ledgerQueue.add('engagement-nudge', { merchantId: merchant.id, whatsappNumber }, { delay: ENGAGEMENT_NUDGE_DELAY_MS });
+  } catch (err) {
+    logger.error({ err: err.message, merchantId: merchant.id }, 'Failed to schedule engagement nudge (non-fatal)');
+  }
+}
+
+/**
+ * The actual NPS/email-milestone check-and-send — runs once, from the
+ * 'engagement-nudge' delayed job (see the job-type branch in the
+ * ledgerWorker processor below and scheduleEngagementNudge above).
  * Plain deterministic checks (engagementService.js), not AI-assisted.
  */
-async function maybeSendEngagementNudge(merchant, whatsappNumber) {
+async function sendEngagementNudgeIfDue(merchant, whatsappNumber) {
   try {
     const npsTriggerReason = await engagementService.checkNpsTrigger(merchant);
     if (npsTriggerReason) {
@@ -244,7 +288,7 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
     await queries.resolvePendingReceiptDecision(merchant.id, pending.map((e) => e.id));
     await queries.setReceiptDecisionAwaiting(merchant.id, false);
     await whatsappService.sendTextMessage(whatsappNumber, 'No problem \u2014 no receipt sent. Keep logging whenever you\'re ready!');
-    await maybeSendEngagementNudge(merchant, whatsappNumber);
+    await scheduleEngagementNudge(merchant, whatsappNumber);
     return;
   }
 
@@ -264,7 +308,7 @@ async function handleReceiptDecisionReply(merchant, whatsappNumber, rawMessage) 
     // in the confirmation message sent before this Yes/No question (see
     // askReceiptDecision), so the receipt itself doesn't need to repeat it.
     await whatsappService.sendReceiptImage(whatsappNumber, receipt.url, 'Here\u2019s your receipt!');
-    await maybeSendEngagementNudge(merchant, whatsappNumber);
+    await scheduleEngagementNudge(merchant, whatsappNumber);
     return;
   }
 
@@ -614,6 +658,18 @@ const ledgerWorker = new Worker(
   async (job) => {
     logger.info({ jobId: job.id, data: job.data }, 'WORKER_RECEIVED_JOB');
 
+    // The delayed engagement-nudge job (see scheduleEngagementNudge) is
+    // not an inbound WhatsApp message at all — it's a self-scheduled
+    // follow-up firing ~1 minute after a receipt decision resolved.
+    // Handled entirely separately from the message pipeline below.
+    if (job.name === 'engagement-nudge') {
+      const { merchantId, whatsappNumber } = job.data;
+      const merchant = await queries.getMerchantById(merchantId);
+      if (!merchant) return;
+      await sendEngagementNudgeIfDue(merchant, whatsappNumber);
+      return;
+    }
+
     const { merchantId, whatsappNumber, whatsappMessageId, replyToWhatsappMessageId } = job.data;
     const merchant = await queries.getMerchantById(merchantId);
     if (!merchant) return;
@@ -647,6 +703,18 @@ const ledgerWorker = new Worker(
     const replyEntry = replyToWhatsappMessageId
       ? await queries.getLedgerEntryByOutboundMessageId(merchantId, replyToWhatsappMessageId)
       : null;
+
+    // Voice notes are a Standard/Premium capability (same posture as
+    // logbook photo scanning) — checked BEFORE transcribing, so a Free
+    // merchant's audio never even reaches the (paid, per-call)
+    // transcription API.
+    if (job.data.mediaType === 'audio' && !isPremiumMerchant(merchant) && String(merchant.plan || '').toUpperCase() !== 'STANDARD') {
+      await whatsappService.sendTextMessage(
+        whatsappNumber,
+        "Voice notes are available on Standard and Premium plans \u2014 reply UPGRADE to see them, or just type your entry instead for now."
+      );
+      return;
+    }
 
     const { text: rawMessage, imageBase64, mediaError } = await resolveInboundContent(job);
 
@@ -1275,6 +1343,76 @@ const ledgerWorker = new Worker(
       logger.info({ jobId: job.id, regexConfidence: regexScored?.confidence ?? null }, 'WORKER_STARTING_AI_CALL');
       const aiResult = await aiTransactionParser.parseWithAI(merchant, rawMessage, { imageBase64, replyEntry });
 
+      // --- A message describing SEVERAL distinct transactions at once
+      // (e.g. a whole day recapped in one message) is handled entirely
+      // here, separately from the single-entry pipeline below — every
+      // transaction the model found is validated and committed on its
+      // own, using the exact same entryValidator/currency-gate/
+      // commitParsedEntry machinery as a single entry, so nothing about
+      // trust or bookkeeping correctness is relaxed for this path. The
+      // point of this branch is specifically to stop the OLD behavior
+      // of silently keeping only one transaction and dropping the rest.
+      if (aiResult.parsedMultiple) {
+        const total = aiResult.parsedMultiple.length;
+        let committed = 0;
+        let blockedByCurrency = false;
+        let rejectedByValidator = 0;
+
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `Found ${total} separate transactions in that \u2014 logging them one by one.`
+        );
+
+        for (const candidate of aiResult.parsedMultiple) {
+          if (!resolveEntryCurrencyOrBlock(candidate, merchant)) {
+            blockedByCurrency = true;
+            continue; // told about this once, collectively, after the loop
+          }
+          const verdict = entryValidator.validateAndFinalizeEntry(candidate, { source: 'ai-multi' });
+          if (!verdict.ok) {
+            rejectedByValidator += 1;
+            logger.warn({ jobId: job.id, reason: verdict.reason }, 'One transaction in a multi-transaction message was rejected — skipped');
+            continue;
+          }
+          await commitParsedEntry({
+            job,
+            merchant,
+            whatsappNumber,
+            entry: verdict.entry,
+            rawMessage,
+            whatsappMessageId,
+            replyToWhatsappMessageId,
+            source: 'ai-multi',
+          });
+          committed += 1;
+        }
+
+        if (committed === 0) {
+          await whatsappService.sendTextMessage(
+            whatsappNumber,
+            "I found what looked like several transactions in that, but couldn't confidently record any of them. Could you send them one at a time instead? Type HELP if you're not sure of the format."
+          );
+          return;
+        }
+
+        const skippedNotes = [];
+        if (blockedByCurrency) {
+          const merchantSymbol = getCurrencySymbol(merchant.default_currency);
+          skippedNotes.push(
+            `One or more of those were in a different currency, which is a Premium feature \u2014 your account is set up in ${merchant.default_currency} (${merchantSymbol}). Reply UPGRADE to see the plans.`
+          );
+        }
+        if (rejectedByValidator > 0) {
+          skippedNotes.push(
+            `${rejectedByValidator} of them didn't have clear enough numbers to record safely \u2014 you can resend ${rejectedByValidator === 1 ? 'it' : 'them'} one at a time.`
+          );
+        }
+        if (skippedNotes.length > 0) {
+          await whatsappService.sendTextMessage(whatsappNumber, skippedNotes.join('\n'));
+        }
+        return;
+      }
+
       if (aiResult.parsed) {
         parsed = aiResult.parsed;
         source = 'ai';
@@ -1345,19 +1483,13 @@ const ledgerWorker = new Worker(
     // they actually stated (genuine multi-currency bookkeeping, not a
     // mismatch needing correction) — never converted to the account
     // default, and never blocked on a clarifying question.
-    if (parsed.currency && parsed.currency !== merchant.default_currency) {
-      if (!isPremiumMerchant(merchant)) {
-        const merchantSymbol = getCurrencySymbol(merchant.default_currency);
-        await whatsappService.sendTextMessage(
-          whatsappNumber,
-          `Logging an entry in a different currency (${parsed.currency}) is a Premium feature \u2014 your account is set up in ${merchant.default_currency} (${merchantSymbol}). Reply UPGRADE to see the plans, or resend this amount in ${merchant.default_currency} to log it now.`
-        );
-        return;
-      }
-      // Premium: keep parsed.currency exactly as stated — this entry is
-      // genuinely recorded in that currency, not the account default.
-    } else {
-      parsed.currency = merchant.default_currency;
+    if (!resolveEntryCurrencyOrBlock(parsed, merchant)) {
+      const merchantSymbol = getCurrencySymbol(merchant.default_currency);
+      await whatsappService.sendTextMessage(
+        whatsappNumber,
+        `Logging an entry in a different currency (${parsed.currency}) is a Premium feature \u2014 your account is set up in ${merchant.default_currency} (${merchantSymbol}). Reply UPGRADE to see the plans, or resend this amount in ${merchant.default_currency} to log it now.`
+      );
+      return;
     }
 
     // --- Stage 5: the deterministic accounting engine. EVERY candidate —

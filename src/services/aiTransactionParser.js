@@ -207,13 +207,46 @@ async function extractStructured({ merchant, rawText, imageBase64, replyEntry, t
 
     const systemPrompt = `${KIKA_SYSTEM_PROMPT}\n\n${businessContext}`;
 
+    // Both tools are offered together — a merchant describing several
+    // distinct transactions in ONE free-form message ("bought fuel
+    // 10k, then transport 2.5k, afternoon sold 3 wrappers 48k...") is
+    // exactly as common and legitimate as one describing a single
+    // transaction, and forcing every message through a tool that can
+    // only ever propose ONE entry silently drops every transaction
+    // after the first. See the "Splitting a message into multiple
+    // transactions" section of the system prompt for how the model is
+    // told to choose between them.
     const { toolCall, text } = await openaiService.chatCompletion({
       systemPrompt,
       userText: rawText,
       imageBase64,
-      tools: [tool],
+      tools: [tool, RECORD_MULTIPLE_TRANSACTIONS_TOOL],
       conversationHistory: history,
     });
+
+    if (toolCall?.name === RECORD_MULTIPLE_TRANSACTIONS_TOOL.function.name) {
+      const validation = validateExtraction(ExtractedScanBatchSchema, toolCall.arguments);
+      if (!validation.ok) {
+        logger.warn({ issues: validation.issues }, 'Multi-transaction extraction failed schema validation — rejected');
+        return { status: 'invalid', issues: validation.issues };
+      }
+      // No per-item confidence gate here (the batch schema doesn't
+      // carry one — same trust boundary as the logbook-scan feature,
+      // which uses this identical tool/schema): each individual
+      // transaction still passes through entryValidator's deterministic
+      // checks before anything is written, same as the single-entry path.
+      const transactions = validation.data.transactions.map((t) => normalizeValidatedExtraction({ ...t, detectedLanguage: 'English' })).filter(Boolean);
+      if (transactions.length === 0) {
+        return { status: 'invalid', issues: [{ message: 'record_multiple_transactions called with an empty/unusable list' }] };
+      }
+      if (transactions.length === 1) {
+        // Genuinely just one transaction — collapse to the ordinary
+        // single-entry result shape rather than introducing a
+        // one-element-array special case for every caller downstream.
+        return { status: 'extracted', data: { ...validation.data.transactions[0], detectedLanguage: 'English', confidence: 1 }, confidence: 1, detectedLanguage: 'English' };
+      }
+      return { status: 'extracted_multiple', transactions, detectedLanguage: 'English' };
+    }
 
     if (toolCall?.name === tool.function.name) {
       const validation = validateExtraction(schema, toolCall.arguments);
@@ -256,6 +289,7 @@ async function extractStructured({ merchant, rawText, imageBase64, replyEntry, t
  *
  * Return shapes (kept close to the historical contract):
  *   { parsed: {...}, detectedLanguage }               — candidate entry extracted
+ *   { parsedMultiple: [{...}, ...], detectedLanguage } — SEVERAL distinct transactions in one message
  *   { parsed: null, conversationalReply, ... }         — in-persona reply/question
  *   { parsed: null, lowConfidence: true, clarify, .. } — extraction too uncertain
  *   { parsed: null, error: true }                      — provider call failed
@@ -269,6 +303,19 @@ async function parseWithAI(merchant, rawText, { imageBase64, replyEntry } = {}) 
     tool: RECORD_TRANSACTION_TOOL,
     schema: ExtractedTransactionSchema,
   });
+
+  if (result.status === 'extracted_multiple') {
+    const parsedMultiple = await Promise.all(
+      result.transactions.map(async (parsed) => {
+        if (parsed.entryType === 'DEBIT' && !parsed.expenseCategory) {
+          parsed.expenseCategory = await categorizationService.categorizeExpense(parsed.description, parsed.items?.[0]?.name);
+        }
+        return parsed;
+      })
+    );
+    await conversationMemory.clearHistory(merchant.id);
+    return { parsedMultiple, detectedLanguage: result.detectedLanguage };
+  }
 
   if (result.status === 'extracted') {
     const parsed = normalizeValidatedExtraction(result.data);
@@ -320,7 +367,7 @@ const RECORD_MULTIPLE_TRANSACTIONS_TOOL = {
   function: {
     name: 'record_multiple_transactions',
     description:
-      'Call this with EVERY distinct transaction line visible in the photographed logbook page — each row or entry the merchant wrote down is a separate item in the array.',
+      'Call this instead of record_transaction whenever there is MORE THAN ONE distinct transaction to report — every separate transaction line on a photographed logbook page, OR every separate sale/expense/debt/payment described together in one free-form message (e.g. a merchant recapping their whole day in one message). Each distinct transaction is its own item in the array. Do not call this for a message that only describes ONE transaction — use record_transaction for that.',
     parameters: {
       type: 'object',
       properties: {
@@ -341,7 +388,7 @@ const RECORD_MULTIPLE_TRANSACTIONS_TOOL = {
               currency: {
                 type: ['string', 'null'],
                 enum: ['NGN', 'USD', 'GBP', 'EUR'],
-                description: "Only set when the handwritten line clearly shows a foreign-currency symbol/word (e.g. '$', '£'); leave null otherwise (assume the merchant's own account currency) — see the single-message tool's currency field for the same rule.",
+                description: "Only set when this specific transaction clearly shows a foreign-currency symbol/word (e.g. '$', '£'); leave null otherwise (assume the merchant's own account currency) — see the single-transaction tool's currency field for the same rule.",
               },
               totalNaira: { type: 'number' },
               paidNaira: { type: 'number' },
