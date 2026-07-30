@@ -579,7 +579,18 @@ async function handlePendingSameCustomerReply(merchant, whatsappNumber, rawMessa
  * ENTRY_ACK_TEXT below), wires up the outbound wamid for future
  * reply-context resolution, and surfaces any operational alerts.
  */
-async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMessage, whatsappMessageId, replyToWhatsappMessageId, source, messageSequenceIndex = 0 }) {
+async function commitParsedEntry({
+  job,
+  merchant,
+  whatsappNumber,
+  entry,
+  rawMessage,
+  whatsappMessageId,
+  replyToWhatsappMessageId,
+  source,
+  messageSequenceIndex = 0,
+  sendAck = true,
+}) {
   // 0 for an ordinary single-transaction message (the overwhelming
   // common case); 0..N-1 when this entry is one of SEVERAL split out
   // of one multi-transaction message — see the 'ai-multi' commit loop
@@ -620,41 +631,39 @@ async function commitParsedEntry({ job, merchant, whatsappNumber, entry, rawMess
     replyToWhatsappMessageId,
   });
 
-  // Per-entry acknowledgment — evaluated three options here: (1) send
-  // nothing after the first entry in a run and only speak again at
-  // DONE, (2) the invoice-flow pattern of a short constant text after
-  // EVERY entry, (3) same as (1). Went with (2), for a reason that's
-  // not just tone: reply-context resolution (see
-  // getLedgerEntryByOutboundMessageId / businessContextService's
-  // "Reply context" block) depends on THIS message's outbound wamid
-  // being attached to THIS specific entry, so a merchant tapping
-  // "Reply" on entry #2 of a five-in-a-row batch resolves back to
-  // entry #2, not whichever entry happened to be last. Option (1) would
-  // only ever produce one outbound message per batch, silently breaking
-  // reply-context for every entry after the first. Sending the same
-  // short line every time isn't the noisy "full description per entry"
-  // problem this used to avoid with a bare checkmark — it's one stable,
-  // constant prompt (not a repeated narrative), and the full "here's
-  // what you logged" description is still deferred to the ONE
-  // consolidated summary at DONE (buildBatchConfirmationText below).
-  const ENTRY_ACK_TEXT = 'Noted \u2014 log another, or type DONE when finished.';
-  logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
-  const sendResult = await whatsappService.sendTextMessage(whatsappNumber, ENTRY_ACK_TEXT);
+  // sendAck=false is for the multi-transaction batch commit loop
+  // (several entries split out of ONE message) — sending this same ack
+  // once per entry there produced a wall of identical "Noted..."
+  // messages for a single message that split into many transactions,
+  // which reads as broken, not helpful. That caller sends ONE
+  // consolidated summary of everything it committed instead (see the
+  // 'ai-multi' loop below) — reply-context (see the long comment this
+  // replaced) simply isn't preserved per-sub-transaction in that case;
+  // a merchant replying to one line of their own multi-transaction
+  // recap is a vanishingly rare need compared to the UX cost of seven
+  // repeated messages.
+  if (sendAck) {
+    const ENTRY_ACK_TEXT = 'Noted \u2014 log another, or type DONE when finished.';
+    logger.info({ jobId: job.id }, 'WORKER_SENDING_WHATSAPP_REPLY');
+    const sendResult = await whatsappService.sendTextMessage(whatsappNumber, ENTRY_ACK_TEXT);
 
-  const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
-  if (ledgerEntry?.id && outboundMessageId) {
-    await queries.setLedgerEntryOutboundMessageId(ledgerEntry.id, outboundMessageId);
+    const outboundMessageId = whatsappService.extractOutboundMessageId(sendResult);
+    if (ledgerEntry?.id && outboundMessageId) {
+      await queries.setLedgerEntryOutboundMessageId(ledgerEntry.id, outboundMessageId);
+    }
+
+    // Low-stock warnings and loyalty milestones are urgent/operational,
+    // not part of the "here's what you logged" narrative — they still
+    // surface immediately rather than waiting for DONE.
+    for (const alert of lowStockAlerts || []) {
+      await whatsappService.sendTextMessage(whatsappNumber, alert);
+    }
+    if (loyaltyMilestoneText) {
+      await whatsappService.sendTextMessage(whatsappNumber, loyaltyMilestoneText.trim());
+    }
   }
 
-  // Low-stock warnings and loyalty milestones are urgent/operational,
-  // not part of the "here's what you logged" narrative — they still
-  // surface immediately rather than waiting for DONE.
-  for (const alert of lowStockAlerts || []) {
-    await whatsappService.sendTextMessage(whatsappNumber, alert);
-  }
-  if (loyaltyMilestoneText) {
-    await whatsappService.sendTextMessage(whatsappNumber, loyaltyMilestoneText.trim());
-  }
+  return { ledgerEntry, loyaltyMilestoneText, lowStockAlerts };
 }
 
 /**
@@ -1364,14 +1373,10 @@ const ledgerWorker = new Worker(
       // of silently keeping only one transaction and dropping the rest.
       if (aiResult.parsedMultiple) {
         const total = aiResult.parsedMultiple.length;
-        let committed = 0;
+        const committedLines = [];
+        const deferredAlerts = [];
         let blockedByCurrency = false;
         let rejectedByValidator = 0;
-
-        await whatsappService.sendTextMessage(
-          whatsappNumber,
-          `Found ${total} separate transactions in that \u2014 logging them one by one.`
-        );
 
         for (const [index, candidate] of aiResult.parsedMultiple.entries()) {
           if (!resolveEntryCurrencyOrBlock(candidate, merchant)) {
@@ -1385,7 +1390,12 @@ const ledgerWorker = new Worker(
             continue;
           }
           try {
-            await commitParsedEntry({
+            // sendAck: false — see commitParsedEntry's own comment on
+            // this flag. A single consolidated summary (built from
+            // committedLines below) replaces what would otherwise be N
+            // identical "Noted — log another..." messages in a row for
+            // ONE message that happened to split into N transactions.
+            const { ledgerEntry, loyaltyMilestoneText, lowStockAlerts } = await commitParsedEntry({
               job,
               merchant,
               whatsappNumber,
@@ -1407,8 +1417,12 @@ const ledgerWorker = new Worker(
               // gave up on the whole message, silently, before ever
               // attempting entries 2+ again. See migration 0002.
               messageSequenceIndex: index,
+              sendAck: false,
             });
-            committed += 1;
+            const label = describeEntryItems(verdict.entry) || verdict.entry.description;
+            committedLines.push(`\u2022 ${label} \u2014 ${formatAmount(ledgerEntry.total_kobo, verdict.entry.currency)}`);
+            deferredAlerts.push(...(lowStockAlerts || []));
+            if (loyaltyMilestoneText) deferredAlerts.push(loyaltyMilestoneText.trim());
           } catch (err) {
             // A failure writing ONE entry (a transient DB blip, a
             // WhatsApp send failure, anything) must never crash the
@@ -1423,12 +1437,25 @@ const ledgerWorker = new Worker(
           }
         }
 
-        if (committed === 0) {
+        if (committedLines.length === 0) {
           await whatsappService.sendTextMessage(
             whatsappNumber,
             "I found what looked like several transactions in that, but couldn't confidently record any of them. Could you send them one at a time instead? Type HELP if you're not sure of the format."
           );
           return;
+        }
+
+        const summaryHeader =
+          committedLines.length === total
+            ? `Found ${total} separate transactions in that \u2014 logged them all:`
+            : `Found ${total} separate transactions in that \u2014 logged ${committedLines.length} of them:`;
+        await whatsappService.sendTextMessage(
+          whatsappNumber,
+          `${summaryHeader}\n${committedLines.join('\n')}\n\nLog another, or type DONE when finished.`
+        );
+
+        for (const alert of deferredAlerts) {
+          await whatsappService.sendTextMessage(whatsappNumber, alert);
         }
 
         const skippedNotes = [];

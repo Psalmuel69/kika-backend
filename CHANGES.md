@@ -4,7 +4,35 @@ This document summarizes everything changed in this session, organized by
 theme, for review purposes. Nothing here is meant to replace reading the
 actual diffs — it's a map, not a substitute.
 
-## -2. Latest round: the multi-transaction feature was silently only saving entry #1
+## -3. Latest round: multi-transaction UX (7 repeated acks, duplicate "Sale" labels)
+
+The database fix in section -2 below worked — all N transactions from
+one message are now correctly written to the database. Two follow-on
+UX problems surfaced once that was true:
+
+- **Seven near-identical "Noted — log another, or type DONE when
+  finished." messages in a row** for one message that split into seven
+  transactions — each entry's commit was sending its own ack (a
+  deliberate choice for the ORIGINAL use case of several separate
+  messages, to preserve per-entry reply-context), but for one message
+  splitting into many, this reads as broken, not helpful. Fixed:
+  `commitParsedEntry` now takes a `sendAck` flag; the multi-transaction
+  commit loop passes `sendAck: false` and instead builds ONE
+  consolidated summary ("Found 7 separate transactions in that — logged
+  them all: • Sale via transfer — ₦45,000 • ... Log another, or type
+  DONE when finished."), sent once. Loyalty milestones and low-stock
+  alerts collected across the batch are still surfaced, just after the
+  one summary rather than interleaved with per-entry acks.
+- **Every transaction with no item/customer mentioned showing up as a
+  bare, identical "Sale"** (three separate customer payments all
+  labeled "Sale" on the receipt, with no way to tell them apart) — added
+  explicit system-prompt guidance: when a payment method is the only
+  distinguishing detail given ("₦45,000 transfer, ₦12,000 POS, ₦8,000
+  cash"), use it ("Sale via transfer", "Sale via POS", "Sale via cash")
+  rather than repeating an identical generic label for genuinely
+  different transactions.
+
+## -2. Earlier round: the multi-transaction feature was silently only saving entry #1
 
 The multi-transaction extraction added in the previous round (see
 section -1 below) correctly identified every transaction in a message,
